@@ -47,8 +47,9 @@ export type AppPreferences = {
 	/** FunASR model when engine is funasr/auto. */
 	funasrModel: FunAsrModel;
 	/**
-	 * When true (default), TTS is sped up to match video cue timing (lip sync).
-	 * When false, long Khmer speech may extend cues past the original video window.
+	 * When true (default), long Khmer TTS extends the cue window to fit natural speech
+	 * (no per-line speed-up — keeps pitch/tempo balanced). When false, same extend behavior
+	 * for overrun (speech is never rate-warped per cue anymore).
 	 */
 	ttsLipSync: boolean;
 };

@@ -1,4 +1,5 @@
 import type { SubtitleCue } from '$lib/types/project';
+import { cueAudioEndMs } from '$lib/utils/tts-fit';
 
 /** SRT timestamp: HH:MM:SS,mmm */
 export function formatSrtTimestamp(ms: number): string {
@@ -19,7 +20,7 @@ function cueText(cue: SubtitleCue): string {
 /**
  * Build a UTF-8 SRT document from project cues.
  * Prefers Khmer translation; falls back to source text.
- * Skips cues with empty text.
+ * End time follows TTS play-through so burn-in doesn’t linger in dead air.
  */
 export function cuesToSrt(cues: SubtitleCue[]): string {
 	const sorted = [...cues].sort((a, b) => a.startMs - b.startMs || a.index - b.index);
@@ -30,7 +31,7 @@ export function cuesToSrt(cues: SubtitleCue[]): string {
 		const text = cueText(cue);
 		if (!text) continue;
 		const start = Math.max(0, Math.round(cue.startMs));
-		const end = Math.max(start + 1, Math.round(cue.endMs));
+		const end = Math.max(start + 1, Math.round(cueAudioEndMs(cue)));
 		n += 1;
 		blocks.push(`${n}\n${formatSrtTimestamp(start)} --> ${formatSrtTimestamp(end)}\n${text}`);
 	}

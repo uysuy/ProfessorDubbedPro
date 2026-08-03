@@ -2,7 +2,10 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Progress } from '$lib/components/ui/progress/index.js';
 	import { Separator } from '$lib/components/ui/separator/index.js';
+	import { Slider } from '$lib/components/ui/slider/index.js';
 	import { projectStore } from '$lib/stores/project.svelte';
+	import { dndStore } from '$lib/stores/dnd.svelte';
+	import { tempoStore } from '$lib/stores/tempo.svelte';
 	import { transcriptionStore } from '$lib/stores/transcription.svelte';
 	import { translationStore } from '$lib/stores/translation.svelte';
 	import {
@@ -13,37 +16,45 @@
 	import { translateProviderLabel } from '$lib/utils/translate';
 	import VideoPreview from '$lib/components/studio/VideoPreview.svelte';
 	import {
-		Film,
+		ClipboardPaste,
+		Gauge,
 		Languages,
 		LoaderCircle,
 		Mic2,
 		PanelLeftClose,
 		Scissors,
 		Subtitles,
-		WandSparkles,
 		X
 	} from '@lucide/svelte';
 
 	const videoTools = [
 		{ id: 'trim', label: 'Trim', icon: Scissors },
-		{ id: 'crop', label: 'Crop', icon: Film },
+		{ id: 'tempo', label: 'Tempo', icon: Gauge },
 		{ id: 'subs', label: 'Extract Subs', icon: Subtitles }
 	] as const;
 
 	const dubTools = [
 		{ id: 'translate', label: 'Translate', icon: Languages },
-		{ id: 'align', label: 'Align', icon: WandSparkles },
+		{ id: 'script', label: 'Paste Script', icon: ClipboardPaste },
 		{ id: 'voice', label: 'Clone Tone', icon: Mic2 }
-	];
+	] as const;
 
 	let resizing = $state(false);
 	let startY = 0;
 	let startHeight = 0;
+	let scriptDraft = $state('');
+	let scriptFeedback = $state<string | null>(null);
 
 	const translatorEngine = $derived(translateProviderLabel(translationStore.provider));
 	const qualityLabel = $derived(
 		preferencesStore.translationQuality === 'high' ? 'High Quality' : 'Fast'
 	);
+	const estimatedDurationMs = $derived(
+		projectStore.current.durationMs > 0 && tempoStore.tempoFactor > 0
+			? Math.round(projectStore.current.durationMs / tempoStore.tempoFactor)
+			: 0
+	);
+	const fitToDubPlan = $derived(tempoStore.fitToDubPlan);
 
 	function onResizePointerDown(e: PointerEvent & { currentTarget: HTMLElement }) {
 		e.preventDefault();
@@ -85,6 +96,36 @@
 
 	function setQuality(q: TranslationQuality) {
 		preferencesStore.setTranslationQuality(q);
+	}
+
+	function formatEstDuration(ms: number): string {
+		if (ms <= 0) return '—';
+		const totalSec = Math.round(ms / 1000);
+		const m = Math.floor(totalSec / 60);
+		const s = totalSec % 60;
+		return `${m}:${String(s).padStart(2, '0')}`;
+	}
+
+	function applyPastedScript() {
+		if (!projectStore.current.cues.length) {
+			scriptFeedback = 'Extract subtitles first, then paste Khmer lines.';
+			dndStore.flash(scriptFeedback);
+			return;
+		}
+		const result = projectStore.applyScriptTranslations(scriptDraft);
+		if (result.applied === 0) {
+			scriptFeedback = 'No lines found. Paste one Khmer line per cue.';
+			dndStore.flash(scriptFeedback);
+			return;
+		}
+		const bits = [`Applied ${result.applied} line${result.applied === 1 ? '' : 's'}`];
+		if (result.createdCues > 0) {
+			bits.push(`created ${result.createdCues} cue${result.createdCues === 1 ? '' : 's'} for extra lines`);
+		}
+		if (result.unfilledCues > 0) bits.push(`${result.unfilledCues} cue(s) unchanged`);
+		scriptFeedback = bits.join(' · ');
+		dndStore.flash(`${scriptFeedback} — Generate TTS, then Fit video to dub if needed`);
+		projectStore.setDubTool('script');
 	}
 </script>
 
@@ -143,19 +184,187 @@
 						class="tool-chip justify-start gap-2 {projectStore.activeVideoTool === tool.id
 							? 'tool-chip-active'
 							: ''}"
-						disabled={transcriptionStore.isTranscribing && tool.id !== 'subs'}
+						disabled={(transcriptionStore.isTranscribing && tool.id !== 'subs') ||
+							(tempoStore.isRemastering && tool.id !== 'tempo')}
 						onclick={() => onVideoToolClick(tool.id)}
 					>
 						{#if tool.id === 'subs' && transcriptionStore.isTranscribing}
+							<LoaderCircle class="size-3.5 animate-spin" />
+						{:else if tool.id === 'tempo' && tempoStore.isRemastering}
 							<LoaderCircle class="size-3.5 animate-spin" />
 						{:else}
 							<tool.icon class="size-3.5" />
 						{/if}
 						{tool.id === 'subs' && transcriptionStore.isTranscribing
 							? 'Extracting…'
-							: tool.label}
+							: tool.id === 'tempo' && tempoStore.isRemastering
+								? 'Remastering…'
+								: tool.label}
 					</button>
 				{/each}
+			</div>
+
+			<!-- Always show Tempo controls (not only when the chip is selected). -->
+			<div
+				class="mt-2 space-y-2 rounded-md border border-border/70 bg-card/80 p-2.5 shadow-[var(--elevation-panel)]"
+			>
+				<div class="flex items-center justify-between gap-2">
+					<p class="text-[11px] font-semibold text-foreground">Tempo (pitch-safe)</p>
+					<span class="font-mono text-[11px] font-medium text-primary"
+						>{tempoStore.tempoFactor.toFixed(2)}×</span
+					>
+				</div>
+				<Button
+					size="sm"
+					variant="secondary"
+					class="w-full"
+					disabled={tempoStore.isRemastering ||
+						!fitToDubPlan ||
+						fitToDubPlan.alreadyFits ||
+						fitToDubPlan.tooExtreme ||
+						(!projectStore.videoPath && !projectStore.videoFile)}
+					onclick={() => {
+						projectStore.setVideoTool('tempo');
+						void tempoStore.fitToDub();
+					}}
+				>
+					{#if tempoStore.isRemastering}
+						<LoaderCircle class="size-3.5 animate-spin" />
+						Fitting…
+					{:else if fitToDubPlan && !fitToDubPlan.alreadyFits}
+						Fit video to dub ({fitToDubPlan.tempo.toFixed(2)}×)
+					{:else}
+						Fit video to dub
+					{/if}
+				</Button>
+				<p class="text-[10px] leading-snug text-muted-foreground">
+					{#if !projectStore.videoPath && !projectStore.videoFile}
+						Open a video first.
+					{:else if !projectStore.current.cues.length}
+						Generate / load subtitles & TTS first.
+					{:else if fitToDubPlan?.alreadyFits}
+						Dub already fits the video media
+						{#if tempoStore.mediaDurationMs > 0}
+							<span class="font-mono"> ({formatEstDuration(tempoStore.mediaDurationMs)})</span>
+						{/if}.
+					{:else if fitToDubPlan?.tooExtreme}
+						Dub is too long to stretch (need &lt; 2× video). Shorten Khmer lines.
+					{:else if fitToDubPlan}
+						Stretches picture to cover Khmer TTS
+						<span class="font-mono">
+							({formatEstDuration(fitToDubPlan.videoMs)} → {formatEstDuration(fitToDubPlan.contentMs)})</span
+						>
+						— keeps speech natural; cue times & TTS stay put.
+					{:else}
+						Waiting for video length / cues…
+					{/if}
+				</p>
+				<Button
+					size="sm"
+					variant="outline"
+					class="w-full"
+					disabled={!projectStore.current.cues.some((c) => c.assignedAudio?.durationMs)}
+					onclick={() => {
+						const { pulledMs, changed } = projectStore.tightenCueGaps({
+							maxGapMs: 100,
+							hangPadMs: 40
+						});
+						if (!changed) {
+							dndStore.flash('Gaps already tight');
+							return;
+						}
+						dndStore.flash(
+							`Tightened ${changed} cue${changed === 1 ? '' : 's'} · removed ~${Math.round(pulledMs / 1000)}s silence`
+						);
+					}}
+				>
+					Tighten silent gaps
+				</Button>
+				<p class="text-[10px] leading-snug text-muted-foreground">
+					Packs Khmer TTS back-to-back (~0.1s breath). Use after Generate if long ASR pauses remain.
+				</p>
+				<Button
+					size="sm"
+					class="w-full"
+					disabled={tempoStore.isRemastering ||
+						Math.abs(tempoStore.tempoFactor - 1) < 0.001 ||
+						(!projectStore.videoPath && !projectStore.videoFile)}
+					onclick={() => {
+						projectStore.setVideoTool('tempo');
+						void tempoStore.apply();
+					}}
+				>
+					{#if tempoStore.isRemastering}
+						<LoaderCircle class="size-3.5 animate-spin" />
+						Remastering…
+					{:else}
+						Apply pitch-safe slowdown
+					{/if}
+				</Button>
+				<Slider
+					type="single"
+					value={tempoStore.tempoFactor}
+					min={0.5}
+					max={1}
+					step={0.01}
+					disabled={tempoStore.isRemastering}
+					onValueChange={(v) => tempoStore.setTempoFactor(v)}
+					aria-label="Pitch-safe tempo factor"
+				/>
+				<div class="flex flex-wrap gap-1">
+					{#each tempoStore.presets as preset}
+						<button
+							type="button"
+							class="rounded border border-border/60 px-1.5 py-0.5 font-mono text-[10px] transition-colors
+								{Math.abs(tempoStore.tempoFactor - preset) < 0.001
+								? 'border-primary/50 bg-primary/10 text-primary'
+								: 'text-muted-foreground hover:text-foreground'}"
+							disabled={tempoStore.isRemastering}
+							onclick={() => tempoStore.setTempoFactor(preset)}
+						>
+							{preset.toFixed(2)}×
+						</button>
+					{/each}
+				</div>
+				<p class="text-[10px] leading-snug text-muted-foreground">
+					Manual apply also stretches subtitle times. Prefer
+					<span class="font-medium text-foreground/80"> Fit video to dub </span>
+					when Khmer TTS is already longer than the video.
+					{#if estimatedDurationMs > 0}
+						<span class="font-mono"> Est. → {formatEstDuration(estimatedDurationMs)}</span>
+					{/if}
+				</p>
+				{#if tempoStore.isRemastering || tempoStore.error}
+					<div class="space-y-1.5">
+						<div class="flex items-start justify-between gap-2">
+							<p
+								class="min-w-0 flex-1 text-[11px] font-medium leading-snug"
+								class:text-destructive={Boolean(tempoStore.error) && !tempoStore.isRemastering}
+								class:text-primary={tempoStore.isRemastering}
+							>
+								{tempoStore.isRemastering
+									? tempoStore.message || 'Remastering…'
+									: tempoStore.error}
+							</p>
+							{#if tempoStore.isRemastering}
+								<Button
+									variant="ghost"
+									size="icon-xs"
+									aria-label="Cancel tempo remaster"
+									onclick={() => tempoStore.cancel()}
+								>
+									<X class="size-3.5" />
+								</Button>
+							{/if}
+						</div>
+						{#if tempoStore.isRemastering}
+							<Progress value={tempoStore.progress} max={100} class="h-1.5" />
+							<p class="font-mono text-[10px] text-muted-foreground">
+								{tempoStore.progress}% · FFmpeg (pitch-safe)
+							</p>
+						{/if}
+					</div>
+				{/if}
 			</div>
 
 			{#if transcriptionStore.isTranscribing || transcriptionStore.error}
@@ -267,6 +476,40 @@
 					{/if}
 				</div>
 			{/if}
+
+			<!-- Paste Khmer script → match cues in order (skip auto Translate). -->
+			<div
+				class="mt-2 space-y-2 rounded-md border border-border/70 bg-card/80 p-2.5 shadow-[var(--elevation-panel)]"
+			>
+				<div class="flex items-center justify-between gap-2">
+					<p class="text-[11px] font-semibold text-foreground">Paste Khmer script</p>
+					<span class="font-mono text-[10px] text-muted-foreground"
+						>{projectStore.current.cues.length} cues</span
+					>
+				</div>
+				<textarea
+					class="script-paste-area min-h-[7.5rem] w-full resize-y rounded-md border border-border/70 bg-background px-2 py-1.5 font-khmer text-[12px] leading-relaxed text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40"
+					placeholder={"One Khmer line per subtitle cue…\n\nស្រីកំណាន់…\nប្រាក់បៀវត្ស…"}
+					bind:value={scriptDraft}
+					spellcheck="false"
+				></textarea>
+				<p class="text-[10px] leading-snug text-muted-foreground">
+					One line → one cue (timeline order). Extra lines create new cues after the last ASR
+					window. Clears old TTS — Generate, then Fit video to dub if Khmer runs past the picture.
+				</p>
+				<Button
+					size="sm"
+					class="w-full"
+					disabled={!scriptDraft.trim() || !projectStore.current.cues.length}
+					onclick={applyPastedScript}
+				>
+					<ClipboardPaste class="size-3.5" />
+					Apply to cues in order
+				</Button>
+				{#if scriptFeedback}
+					<p class="text-[10px] font-medium text-primary">{scriptFeedback}</p>
+				{/if}
+			</div>
 		</section>
 	</div>
 </aside>

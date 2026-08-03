@@ -24,6 +24,8 @@ export type TtsSynthesizeResult = {
 	/** Edge / provider voice name used. */
 	providerVoice: string;
 	byteLength: number;
+	/** Audio duration in ms when known (from Rust probe / estimate). */
+	durationMs?: number;
 };
 
 export interface TtsEngine {

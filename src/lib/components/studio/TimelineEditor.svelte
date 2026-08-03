@@ -23,7 +23,7 @@
 		deltaXToMs
 	} from '$lib/utils/timeline';
 	import { resamplePeaks } from '$lib/utils/audio-waveform';
-	import { Pause, Play, Scan, ZoomIn, ZoomOut } from '@lucide/svelte';
+	import { Pause, Play, Scan, Volume2, VolumeX, ZoomIn, ZoomOut } from '@lucide/svelte';
 	import { dndStore, MIME_TTS_AUDIO } from '$lib/stores/dnd.svelte';
 	import { onDestroy } from 'svelte';
 
@@ -1179,7 +1179,56 @@
 							<span class="timeline-track-swatch" style="background: {track.color};"></span>
 							<div class="min-w-0 flex-1">
 								<p class="timeline-track-name">{track.name}</p>
-								<p class="timeline-track-role">{track.role}</p>
+								{#if track.kind === 'original'}
+									<div class="timeline-original-mixer">
+										<button
+											type="button"
+											class="timeline-mute-btn"
+											class:timeline-mute-btn-active={projectStore.originalAudioMuted ||
+												projectStore.originalAudioGain < 0.005}
+											aria-label={projectStore.originalAudioMuted
+												? 'Unmute original audio'
+												: 'Mute original audio'}
+											aria-pressed={projectStore.originalAudioMuted}
+											title={projectStore.originalAudioMuted ? 'Unmute' : 'Mute'}
+											onclick={(e) => {
+												e.stopPropagation();
+												projectStore.toggleOriginalAudioMute();
+											}}
+										>
+											{#if projectStore.originalAudioMuted || projectStore.originalAudioGain < 0.005}
+												<VolumeX class="size-3" />
+											{:else}
+												<Volume2 class="size-3" />
+											{/if}
+										</button>
+										<Slider
+											type="single"
+											class="timeline-original-fader min-w-0 flex-1"
+											value={Math.round(projectStore.originalAudioGain * 100)}
+											min={0}
+											max={100}
+											step={1}
+											disabled={projectStore.originalAudioMuted}
+											onValueChange={(v) => {
+												const n = typeof v === 'number' ? v : Number(v);
+												if (!Number.isFinite(n)) return;
+												projectStore.setOriginalAudioGain(n / 100);
+												if (projectStore.originalAudioMuted && n > 0) {
+													projectStore.setOriginalAudioMuted(false);
+												}
+											}}
+											aria-label="Original audio volume"
+										/>
+										<span class="timeline-original-pct font-mono">
+											{projectStore.originalAudioMuted
+												? 'M'
+												: `${Math.round(projectStore.originalAudioGain * 100)}`}
+										</span>
+									</div>
+								{:else}
+									<p class="timeline-track-role">{track.role}</p>
+								{/if}
 							</div>
 						</div>
 
@@ -1469,7 +1518,11 @@
 									<div
 										data-clip
 										class="timeline-clip timeline-clip-original pointer-events-none absolute overflow-hidden rounded-md border"
-										style="left: 0; width: {Math.max(1, originalWidthPx)}px;"
+										class:timeline-clip-original-dimmed={projectStore.originalAudioMuted ||
+											projectStore.originalAudioGain < 0.05}
+										style="left: 0; width: {Math.max(1, originalWidthPx)}px; opacity: {projectStore.originalAudioMuted
+											? 0.28
+											: Math.max(0.35, 0.35 + projectStore.originalAudioGain * 0.65)};"
 										title={originalAudio.label || 'Original Audio'}
 									>
 										<Waveform peaks={displayPeaks} color={track.color} class="opacity-90" />
@@ -1678,6 +1731,75 @@
 		text-transform: uppercase;
 		color: var(--muted-foreground);
 		line-height: 1.2;
+	}
+
+	.timeline-original-mixer {
+		display: flex;
+		align-items: center;
+		gap: 0.28rem;
+		margin-top: 0.28rem;
+		min-width: 0;
+	}
+
+	.timeline-mute-btn {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+		width: 1.35rem;
+		height: 1.35rem;
+		border-radius: 0.3rem;
+		border: 1px solid color-mix(in oklab, var(--border) 80%, transparent);
+		background: color-mix(in oklab, var(--muted) 35%, transparent);
+		color: var(--muted-foreground);
+		cursor: pointer;
+		transition:
+			color 120ms var(--motion-ease),
+			background 120ms var(--motion-ease),
+			border-color 120ms var(--motion-ease);
+	}
+
+	.timeline-mute-btn:hover {
+		color: var(--foreground);
+		border-color: color-mix(in oklab, var(--border) 60%, var(--foreground) 20%);
+	}
+
+	.timeline-mute-btn-active {
+		color: var(--destructive);
+		border-color: color-mix(in oklab, var(--destructive) 45%, var(--border));
+		background: color-mix(in oklab, var(--destructive) 12%, transparent);
+	}
+
+	.timeline-original-pct {
+		flex-shrink: 0;
+		min-width: 1.6rem;
+		text-align: right;
+		font-size: 9px;
+		font-weight: 600;
+		color: var(--muted-foreground);
+		line-height: 1;
+	}
+
+	:global(.timeline-original-fader) {
+		height: 1.1rem;
+	}
+
+	:global(.timeline-original-fader [data-slot='slider-track']) {
+		height: 0.22rem;
+	}
+
+	:global(.timeline-original-fader [data-slot='slider-thumb']) {
+		width: 0.65rem;
+		height: 0.65rem;
+	}
+
+	.timeline-clip-original-dimmed {
+		filter: grayscale(0.35);
+	}
+
+	.timeline-track-row[data-track-kind='original'] .timeline-track-header {
+		align-items: flex-start;
+		padding-block: 0.55rem;
 	}
 
 	.timeline-track-lane {

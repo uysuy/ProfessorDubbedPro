@@ -15,6 +15,10 @@ export type ProjectSessionState = {
 	pitch?: number;
 	speed?: number;
 	volume?: number;
+	/** Original Audio track gain 0–1 (preview video volume). */
+	originalAudioGain?: number;
+	/** When true, source video audio is silenced. */
+	originalAudioMuted?: boolean;
 };
 
 /** On-disk project document (.dubproj / .json). */
@@ -51,7 +55,9 @@ export function buildProjectDocument(
 					voiceId: session.voiceId,
 					pitch: session.pitch,
 					speed: session.speed,
-					volume: session.volume
+					volume: session.volume,
+					originalAudioGain: session.originalAudioGain,
+					originalAudioMuted: session.originalAudioMuted
 				}
 			: undefined
 	};
@@ -204,7 +210,14 @@ export function parseProjectDocument(raw: unknown): ProjectFileDocument | null {
 					speed: Number.isFinite(Number(raw.session.speed)) ? Number(raw.session.speed) : undefined,
 					volume: Number.isFinite(Number(raw.session.volume))
 						? Number(raw.session.volume)
-						: undefined
+						: undefined,
+					originalAudioGain: Number.isFinite(Number(raw.session.originalAudioGain))
+						? Math.max(0, Math.min(1, Number(raw.session.originalAudioGain)))
+						: undefined,
+					originalAudioMuted:
+						typeof raw.session.originalAudioMuted === 'boolean'
+							? raw.session.originalAudioMuted
+							: undefined
 				}
 			: undefined;
 		return {

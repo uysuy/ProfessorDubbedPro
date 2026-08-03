@@ -1,6 +1,6 @@
 [package]
 name = "professor-dubbed-pro"
-version = "0.1.0"
+version = "0.2.0"
 description = "ProfessorDubbedPro — professional video dubbing studio"
 authors = ["ProfessorDubbedPro"]
 edition = "2021"

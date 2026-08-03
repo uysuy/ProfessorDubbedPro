@@ -73,6 +73,13 @@
 			<Label class="text-[10px] font-semibold tracking-[0.12em] text-foreground/75 uppercase"
 				>Prosody</Label
 			>
+			<p class="text-[10px] leading-snug text-muted-foreground">
+				Applies to
+				<span class="font-medium text-foreground/80">
+					{selectedCount > 0 ? `${selectedCount} selected` : 'all cues'}
+				</span>
+				and is used when you Generate.
+			</p>
 
 			<div class="space-y-2 rounded-md border border-border/55 bg-muted/35 p-2">
 				<div class="space-y-1">
@@ -126,6 +133,20 @@
 					/>
 				</div>
 			</div>
+			<Button
+				size="sm"
+				variant="outline"
+				class="w-full"
+				disabled={!projectStore.current.cues.length}
+				onclick={() => {
+					const n = projectStore.stampProsodyToCues();
+					dndStore.flash(
+						n === 1 ? 'Prosody applied to 1 cue' : `Prosody applied to ${n} cues`
+					);
+				}}
+			>
+				Apply Prosody to {selectedCount > 0 ? 'selected' : 'all'}
+			</Button>
 		</section>
 
 		{#if busy}

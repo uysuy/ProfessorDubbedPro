@@ -36,6 +36,8 @@ pub struct SynthesizeSpeechResult {
 	pub voice: String,
 	pub byte_length: usize,
 	pub engine: String,
+	/// Measured / estimated MP3 duration in milliseconds.
+	pub duration_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,14 +147,29 @@ fn resolve_voice_name(requested: &str) -> String {
 	}
 }
 
+#[allow(dead_code)]
+fn contains_cjk(text: &str) -> bool {
+	text.chars().any(|c| {
+		let u = c as u32;
+		(0x4E00..=0x9FFF).contains(&u) // CJK Unified
+			|| (0x3400..=0x4DBF).contains(&u)
+			|| (0xF900..=0xFAFF).contains(&u)
+	})
+}
+
 fn empty_audio_message(text: &str, voice: &str) -> String {
 	if contains_khmer(text) && !is_khmer_voice(voice) {
 		return "Edge-TTS returned empty audio: Khmer text needs a Khmer voice (Sreymom / Piseth). Set target language to Khmer.".to_string();
 	}
+	if is_khmer_voice(voice) && !contains_khmer(text) {
+		return "Edge-TTS returned empty/blank audio: this cue has no Khmer text. Paste your Khmer script or Translate first (Chinese on a Khmer voice is silent).".to_string();
+	}
 	if contains_khmer(text) {
 		return "Edge-TTS returned empty audio for this Khmer text. Try again in a moment.".to_string();
 	}
-	"Edge-TTS returned empty audio. Check that the text language matches the selected voice.".to_string()
+	format!(
+		"Edge-TTS returned empty audio for voice `{voice}`. Check that text language matches the voice."
+	)
 }
 
 fn display_name_from_short(short: &str) -> String {
@@ -247,6 +264,10 @@ fn synthesize_blocking(
 	if contains_khmer(text) && !is_khmer_voice(voice_requested) {
 		return Err(empty_audio_message(text, voice_requested));
 	}
+	// Khmer voices often emit silent/blank audio for Chinese (or non-Khmer) cues.
+	if is_khmer_voice(voice_requested) && !contains_khmer(text) {
+		return Err(empty_audio_message(text, voice_requested));
+	}
 
 	let voice_name = resolve_voice_name(voice_requested);
 	let safe_text = escape_xml(text);
@@ -264,7 +285,8 @@ fn synthesize_blocking(
 		.map_err(|e| map_network_error(&e.to_string()))?;
 
 	let bytes = audio.audio_bytes;
-	if bytes.is_empty() {
+	// Tiny payloads are effectively silent (headers only / near-empty frames).
+	if bytes.len() < 512 {
 		return Err(empty_audio_message(text, &voice_name));
 	}
 
@@ -277,12 +299,57 @@ fn synthesize_blocking(
 	let path = dir.join(file_name);
 	fs::write(&path, &bytes).map_err(|e| format!("Could not write TTS file: {e}"))?;
 
+	let duration_ms = probe_mp3_duration_ms(app, &path)
+		.unwrap_or_else(|| estimate_mp3_duration_ms(bytes.len()));
+
 	Ok(SynthesizeSpeechResult {
 		file_path: path.to_string_lossy().to_string(),
 		voice: voice_requested.to_string(),
 		byte_length: bytes.len(),
 		engine: "edge-tts".to_string(),
+		duration_ms,
 	})
+}
+
+/// Edge config uses `audio-24khz-48kbitrate-mono-mp3` (≈48 kbps CBR).
+fn estimate_mp3_duration_ms(byte_length: usize) -> u64 {
+	let ms = (byte_length as u64)
+		.saturating_mul(8)
+		.saturating_mul(1000)
+		/ 48_000;
+	ms.max(200)
+}
+
+fn probe_mp3_duration_ms(app: &AppHandle, path: &std::path::Path) -> Option<u64> {
+	let ffmpeg = crate::export::find_ffmpeg(app).ok()?;
+	let output = std::process::Command::new(&ffmpeg)
+		.args([
+			"-hide_banner",
+			"-i",
+			&crate::export::ffmpeg_path_arg(path),
+		])
+		.output()
+		.ok()?;
+	let log = String::from_utf8_lossy(&output.stderr);
+	for line in log.lines() {
+		let line = line.trim();
+		let Some(rest) = line.strip_prefix("Duration:") else {
+			continue;
+		};
+		let token = rest.split(',').next()?.trim();
+		let parts: Vec<&str> = token.split(':').collect();
+		if parts.len() != 3 {
+			continue;
+		}
+		let h: f64 = parts[0].parse().ok()?;
+		let m: f64 = parts[1].parse().ok()?;
+		let s: f64 = parts[2].parse().ok()?;
+		let ms = ((h * 3600.0 + m * 60.0 + s) * 1000.0).round();
+		if ms.is_finite() && ms > 0.0 {
+			return Some(ms as u64);
+		}
+	}
+	None
 }
 
 /// List Edge Read Aloud voices (optionally filtered by locale prefix, e.g. `km`).

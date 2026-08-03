@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
-	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { detectPlatform, isTauriRuntime, type DesktopPlatform } from '$lib/utils/platform';
 	import { Minus, Square, X } from '@lucide/svelte';
 
@@ -8,16 +7,27 @@
 	let maximized = $state(false);
 	let hovered = $state<'min' | 'max' | 'close' | null>(null);
 
-	const appWindow = isTauriRuntime() ? getCurrentWindow() : null;
 	let unlistenResize: (() => void) | null = null;
+
+	async function getWin() {
+		if (!isTauriRuntime()) return null;
+		const { getCurrentWindow } = await import('@tauri-apps/api/window');
+		return getCurrentWindow();
+	}
 
 	onMount(async () => {
 		platform = detectPlatform();
-		if (!appWindow) return;
+		if (!isTauriRuntime()) return;
 		try {
-			maximized = await appWindow.isMaximized();
-			unlistenResize = await appWindow.onResized(async () => {
-				maximized = await appWindow.isMaximized();
+			const win = await getWin();
+			if (!win) return;
+			maximized = await win.isMaximized();
+			unlistenResize = await win.onResized(async () => {
+				try {
+					maximized = await win.isMaximized();
+				} catch {
+					/* ignore */
+				}
 			});
 		} catch {
 			/* ignore */
@@ -27,16 +37,40 @@
 	onDestroy(() => unlistenResize?.());
 
 	async function minimize() {
-		await appWindow?.minimize();
+		try {
+			await (await getWin())?.minimize();
+		} catch (err) {
+			console.error('minimize failed', err);
+		}
 	}
 
 	async function toggleMaximize() {
-		await appWindow?.toggleMaximize();
-		maximized = (await appWindow?.isMaximized()) ?? false;
+		try {
+			const win = await getWin();
+			if (!win) return;
+			await win.toggleMaximize();
+			maximized = await win.isMaximized();
+		} catch (err) {
+			console.error('maximize failed', err);
+		}
 	}
 
 	async function close() {
-		await appWindow?.close();
+		try {
+			const win = await getWin();
+			if (win) {
+				await win.close();
+				return;
+			}
+		} catch (err) {
+			console.error('window.close failed', err);
+		}
+		// Last resort when not running under Tauri / close unavailable.
+		try {
+			window.close();
+		} catch {
+			/* ignore */
+		}
 	}
 </script>
 

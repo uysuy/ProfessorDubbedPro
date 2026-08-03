@@ -40,6 +40,15 @@ async function stageVideoFile(file: File): Promise<string> {
 	}
 }
 
+export type ExportDubClip = {
+	path: string;
+	startMs: number;
+	/** Linear 0–1 */
+	volume: number;
+	/** TTS clip length ms — keeps mix from chopping the end. */
+	durationMs?: number;
+};
+
 export type RunExportOptions = {
 	mode: ExportMode;
 	cues: SubtitleCue[];
@@ -48,6 +57,10 @@ export type RunExportOptions = {
 	videoPath?: string | null;
 	/** In-memory source file used to stage when no path is available. */
 	videoFile?: File | null;
+	/** Original Audio fader (0 = muted). Default 1. */
+	originalAudioGain?: number;
+	/** Generated TTS clips to mix into the exported video. */
+	dubClips?: ExportDubClip[];
 	onStatus?: (message: string) => void;
 };
 
@@ -114,11 +127,27 @@ export async function runProjectExport(opts: RunExportOptions): Promise<ExportPr
 				stagedPath = await stageVideoFile(opts.videoFile);
 				videoPath = stagedPath;
 			}
-			opts.onStatus?.(
-				opts.mode === 'videoBurnedIn'
-					? 'Burning subtitles into video (FFmpeg)…'
-					: 'Muxing soft subtitles with FFmpeg…'
-			);
+			const gain = Number.isFinite(opts.originalAudioGain) ? Number(opts.originalAudioGain) : 1;
+			const clips = opts.dubClips ?? [];
+			if (clips.length) {
+				opts.onStatus?.(
+					gain < 0.02
+						? `Mixing ${clips.length} TTS clip(s) (original muted)…`
+						: `Mixing ${clips.length} TTS clip(s) with original audio…`
+				);
+			} else if (gain < 0.02) {
+				opts.onStatus?.('Exporting with original audio muted…');
+			} else if (opts.mode === 'videoBurnedIn') {
+				opts.onStatus?.('Burning subtitles into video (FFmpeg)…');
+			} else {
+				opts.onStatus?.('Muxing soft subtitles with FFmpeg…');
+			}
+
+			if (gain < 0.02 && clips.length === 0) {
+				throw new Error(
+					'Original Audio is muted and there is no TTS to mix.\nGenerate Selected Audio first, or unmute Original Audio before export.'
+				);
+			}
 		} else {
 			opts.onStatus?.('Writing SRT…');
 		}
@@ -128,7 +157,19 @@ export async function runProjectExport(opts: RunExportOptions): Promise<ExportPr
 				mode: opts.mode,
 				srtContent,
 				outputPath,
-				videoPath
+				videoPath,
+				originalAudioGain: Number.isFinite(opts.originalAudioGain)
+					? opts.originalAudioGain
+					: 1,
+				dubClips: (opts.dubClips ?? []).map((c) => ({
+					path: c.path,
+					startMs: Math.max(0, Math.round(c.startMs)),
+					volume: Math.max(0, Math.min(1, c.volume)),
+					durationMs:
+						typeof c.durationMs === 'number' && c.durationMs > 0
+							? Math.round(c.durationMs)
+							: undefined
+				}))
 			}
 		});
 

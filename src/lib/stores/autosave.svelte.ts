@@ -99,16 +99,19 @@ async function attachCloseHandler() {
 	try {
 		const { getCurrentWindow } = await import('@tauri-apps/api/window');
 		const win = getCurrentWindow();
+		// Keep flush short — a hung await here blocks the X button forever.
 		unlistenClose = await win.onCloseRequested(async () => {
 			if (closing) return;
 			closing = true;
-			try {
-				if (enabled) {
-					await projectStore.flushAutosave({ reason: 'close' });
-				}
-			} catch {
-				/* still close */
-			}
+			const flush = (async () => {
+				if (!enabled) return;
+				await projectStore.flushAutosave({ reason: 'close' });
+			})();
+			await Promise.race([
+				flush.catch(() => undefined),
+				new Promise<void>((resolve) => setTimeout(resolve, 1500))
+			]);
+			// Do not call preventDefault — allow the window to close after flush.
 		});
 	} catch {
 		/* browser / unavailable */

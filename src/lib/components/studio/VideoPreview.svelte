@@ -4,6 +4,7 @@
 	import * as Select from '$lib/components/ui/select/index.js';
 	import * as Tooltip from '$lib/components/ui/tooltip/index.js';
 	import { playback, projectStore } from '$lib/stores/project.svelte';
+	import { tempoStore } from '$lib/stores/tempo.svelte';
 	import { getVisualPlayheadMs, setVisualPlayheadMs, consumeMediaSeekMs } from '$lib/stores/playback-clock';
 	import { classifyMediaFile, dndStore, isFileDrag } from '$lib/stores/dnd.svelte';
 	import { usesKhmerScript, normalizeDubLanguage } from '$lib/stores/preferences.svelte';
@@ -43,8 +44,8 @@
 
 	const ttsMixer = new TtsPlaybackMixer();
 	let ttsResolverReady = false;
-	/** Remember base video volume so we can duck under TTS without fighting the user. */
-	let baseVideoVolume = 1;
+	/** User Original Audio fader (0 when muted) — TTS ducking multiplies this. */
+	const baseVideoVolume = $derived(projectStore.originalAudioEffectiveGain);
 
 	async function ensureTtsResolver() {
 		if (ttsResolverReady || !isTauriRuntime()) return;
@@ -89,10 +90,33 @@
 		}
 	}
 
+	/** Apply fader immediately when mute/gain changes (including while paused). */
+	$effect(() => {
+		const gain = baseVideoVolume;
+		const el = videoEl;
+		if (!el) return;
+		untrack(() => {
+			const playing = playback.isPlaying;
+			const ms = playback.playheadMs;
+			const hasTts =
+				playing &&
+				projectStore.current.cues.some((c) => {
+					if (!c.assignedAudio || !(c.assignedAudio.url || c.assignedAudio.filePath)) {
+						return false;
+					}
+					return ms >= c.startMs && ms < cueAudioEndMs(c);
+				});
+			const target = hasTts ? gain * 0.28 : gain;
+			el.volume = Math.max(0, Math.min(1, target));
+		});
+	});
+
 	const src = $derived(projectStore.videoUrl);
 	const durationMs = $derived(
 		mediaDurationMs > 0 ? mediaDurationMs : projectStore.current.durationMs
 	);
+	const dubOverhangSec = $derived(Math.round(tempoStore.dubOverhangMs / 1000));
+	const showSyncBanner = $derived(tempoStore.dubOverhangMs > 800);
 	/** Coarse clock for paused UI / empty-state (not updated every frame). */
 	let transportMs = $state(0);
 	const showHours = $derived(durationMs >= 3600_000);
@@ -785,6 +809,35 @@
 				{videoName}
 			</span>
 		{/if}
+
+		{#if showSyncBanner}
+			<div class="sync-banner" role="status">
+				<p>
+					Khmer TTS runs ~{dubOverhangSec}s past the video — preview stops at the picture end.
+				</p>
+				<Button
+					size="sm"
+					variant="secondary"
+					class="shrink-0"
+					disabled={tempoStore.isRemastering ||
+						!tempoStore.fitToDubPlan ||
+						tempoStore.fitToDubPlan.alreadyFits ||
+						tempoStore.fitToDubPlan.tooExtreme}
+					onclick={() => {
+						projectStore.setVideoTool('tempo');
+						void tempoStore.fitToDub();
+					}}
+				>
+					{#if tempoStore.isRemastering}
+						Fitting…
+					{:else if tempoStore.fitToDubPlan && !tempoStore.fitToDubPlan.alreadyFits}
+						Fit video to dub ({tempoStore.fitToDubPlan.tempo.toFixed(2)}×)
+					{:else}
+						Fit video to dub
+					{/if}
+				</Button>
+			</div>
+		{/if}
 	</div>
 
 	<!-- Transport / controls -->
@@ -886,7 +939,12 @@
 					value={playbackRate}
 					onValueChange={setSpeed}
 				>
-					<Select.Trigger size="sm" class="h-7 min-w-[4.25rem] px-2 text-xs" aria-label="Playback speed">
+					<Select.Trigger
+						size="sm"
+						class="h-7 min-w-[4.25rem] px-2 text-xs"
+						aria-label="Preview playback speed (changes pitch)"
+						title="Preview only — changes pitch. Use Video Tools → Tempo for pitch-safe remaster."
+					>
 						{playbackRate}×
 					</Select.Trigger>
 					<Select.Content align="start">
@@ -1042,8 +1100,37 @@
 		font-weight: 500;
 		line-height: 1.45;
 		color: white;
-		text-shadow: 0 1px 2px oklch(0 0 0 / 55%);
+		text-shadow: none;
 		backdrop-filter: blur(2px);
+		/* Prefer Noto shaping — same family used for burn-in export */
+		font-family: var(--font-khmer);
+	}
+
+	.sync-banner {
+		pointer-events: auto;
+		position: absolute;
+		inset-inline: 0.5rem;
+		top: 0.5rem;
+		z-index: 30;
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.5rem;
+		border-radius: 0.45rem;
+		border: 1px solid color-mix(in oklab, var(--primary) 35%, var(--border));
+		background: color-mix(in oklab, var(--card) 92%, var(--primary));
+		padding: 0.45rem 0.55rem;
+		box-shadow: var(--elevation-float);
+		transform: translateZ(0);
+	}
+
+	.sync-banner p {
+		margin: 0;
+		flex: 1 1 10rem;
+		font-size: 0.6875rem;
+		line-height: 1.35;
+		color: var(--foreground);
 	}
 
 	:global(:root:not(.dark)) .video-subtitle-text {

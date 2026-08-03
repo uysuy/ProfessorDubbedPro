@@ -7,6 +7,7 @@
 	import { ScrollArea } from '$lib/components/ui/scroll-area/index.js';
 	import * as Tooltip from '$lib/components/ui/tooltip/index.js';
 	import { playback, projectStore } from '$lib/stores/project.svelte';
+	import { tempoStore } from '$lib/stores/tempo.svelte';
 	import { voicesStore } from '$lib/stores/voices.svelte';
 	import { setVisualPlayheadMs } from '$lib/stores/playback-clock';
 	import {
@@ -173,7 +174,15 @@
 		const n = await projectStore.generateCues([cue.id]);
 		if (n > 0) {
 			flashRows([cue.id]);
-			dndStore.flash(`Edge-TTS · cue #${cue.index}`);
+			const overhang = tempoStore.dubOverhangMs;
+			if (overhang > 800) {
+				dndStore.flash(
+					`Edge-TTS · cue #${cue.index} — Khmer runs ~${Math.round(overhang / 1000)}s past video. Click Fit video to dub.`
+				);
+				projectStore.setVideoTool('tempo');
+			} else {
+				dndStore.flash(`Edge-TTS · cue #${cue.index}`);
+			}
 		} else if (projectStore.generateError) {
 			dndStore.flash(projectStore.generateError);
 		}
@@ -198,7 +207,19 @@
 		const n = await projectStore.generateCues(ids);
 		if (n > 0) {
 			flashRows(ids);
-			dndStore.flash(n === 1 ? 'Edge-TTS audio generated' : `Edge-TTS audio generated ×${n}`);
+			const overhang = tempoStore.dubOverhangMs;
+			if (overhang > 800) {
+				dndStore.flash(
+					`TTS ×${n} done · gaps tightened — Khmer runs ~${Math.round(overhang / 1000)}s past video. Click Fit video to dub.`
+				);
+				projectStore.setVideoTool('tempo');
+			} else {
+				dndStore.flash(
+					n === 1
+						? 'Edge-TTS generated · gaps tightened'
+						: `Edge-TTS ×${n} · gaps tightened`
+				);
+			}
 		} else if (projectStore.generateError) {
 			dndStore.flash(projectStore.generateError);
 		}

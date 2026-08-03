@@ -107,14 +107,14 @@
 		data-tauri-drag-region="false"
 		data-no-drag
 	>
-		<span
-			class="relative flex size-7 items-center justify-center overflow-hidden rounded-md bg-[linear-gradient(145deg,oklch(0.74_0.17_292),oklch(0.52_0.2_275))] text-[10px] font-bold tracking-wide text-white shadow-[0_0_18px_oklch(0.7_0.18_292/30%)]"
-		>
-			<span
-				class="absolute inset-0 bg-[radial-gradient(circle_at_30%_25%,oklch(1_0_0/35%),transparent_55%)]"
-			></span>
-			<span class="relative">PD</span>
-		</span>
+		<img
+			src="/app-icon.png"
+			alt=""
+			width="28"
+			height="28"
+			class="size-7 rounded-md shadow-[0_0_14px_oklch(0.62_0.12_200/25%)] ring-1 ring-border/60"
+			draggable="false"
+		/>
 		<span class="hidden flex-col leading-none sm:flex">
 			<span
 				class="text-[13px] font-semibold tracking-wide text-foreground transition-colors group-hover:text-primary"

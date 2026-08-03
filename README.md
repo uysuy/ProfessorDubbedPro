@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square" alt="MIT" /></a>
+  <img src="https://img.shields.io/badge/version-0.2.0-3b82f6?style=flat-square" alt="v0.2.0" />
   <img src="https://img.shields.io/badge/free%20for%20everyone-0ea5e9?style=flat-square" alt="Free" />
   <img src="https://img.shields.io/badge/platform-Windows-64748b?style=flat-square" alt="Windows" />
   <img src="https://img.shields.io/badge/Tauri%202%20%2B%20SvelteKit-38bdf8?style=flat-square" alt="Stack" />
@@ -19,6 +20,7 @@
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
   <a href="#studio-preview">Screenshots</a> ·
+  <a href="#changelog">Changelog</a> ·
   <a href="#architecture">Architecture</a> ·
   <a href="#contributing">Contribute</a>
 </p>
@@ -65,12 +67,34 @@ Real app UI — works on GitHub.com and the GitHub mobile app (images scale to y
 
 - **Extract Subs** — local ASR from the audio track (FunASR SenseVoice for Chinese · Whisper.cpp fallback)
 - **Translate ZH → KM** — Fast (Azure / Google) or High Quality (DeepSeek / Qwen / Gemini) with slang glossary
-- **Generate TTS** — Edge Read Aloud Khmer voices; mild lip-sync speed (listenable, not chipmunk)
+- **Paste Khmer script** — one line per cue; extra lines create new cues (skips auto-translate)
+- **Generate TTS** — Edge Read Aloud Khmer voices; natural pace (no chipmunk lip-sync)
+- **Tighten silent gaps** — packs TTS back-to-back (~0.1s breath); drops long Chinese ASR dead air
+- **Tempo / Fit video to dub** — pitch-safe slowdown; stretch picture to cover longer Khmer speech
+- **Original Audio mixer** — mute / volume fader on the timeline (preview + export mix)
 - **Studio** — timeline, preview, subtitle table, project save
-- **Export** — `.srt`, soft-sub video, or burn-in subtitled video (FFmpeg)
+- **Export** — `.srt`, soft-sub video, or burn-in with **Noto Sans Khmer** (preview-matched box + shaping) and TTS + original mix
 
-> **v0.1 status:** Extract → Translate → TTS → edit → subtitle export works.  
-> Full **mixed dubbed master** (replace original dialogue with Khmer audio) is on the roadmap.
+> **v0.2** — Dubbed audio mix export, tempo fit, gap packing, and Khmer burn-in quality.  
+> See [Changelog](#changelog).
+
+---
+
+## Changelog
+
+### v0.2.0 — 2026-08-04
+
+- **Export dubbed master** — mix Edge TTS with original audio (respect mute / gain); no more “subs only + untouched Chinese track”
+- **Khmer burn-in** — bundled Noto Sans Khmer + ASS box style (matches preview); fixes broken shaping / dotted circles
+- **TTS gap packing** — after Generate, cues pack tightly (~100 ms breath); **Tighten silent gaps** button for existing projects
+- **Fit video to dub** — pitch-safe remaster stretches the picture when Khmer runs past the source length
+- **Paste Script** — apply Khmer lines in cue order; create cues for leftover lines
+- **Prosody** — session pitch / speed / volume stamped onto cues before Generate
+- **Preview sync banner** — prompts Fit when TTS overhangs the video
+
+### v0.1.0
+
+- Initial open-source release: Extract → Translate → Edge TTS → edit → SRT / subtitled video
 
 ---
 
@@ -213,10 +237,12 @@ Use `pnpm tauri:dev` for the full studio.
 
 1. **Open / drop** a Chinese video  
 2. **Extract Subs** — spoken audio only  
-3. **Translate** — Fast draft, or High Quality + LLM key  
-4. **Generate** Edge-TTS for selected cues  
-5. **Edit** on the table / timeline  
-6. **Export** SRT or subtitled video  
+3. **Translate** *or* **Paste Khmer script** (one line per cue)  
+4. **Generate** Edge-TTS for selected / all cues (gaps auto-tighten)  
+5. **Tighten silent gaps** if an older project still has long pauses  
+6. **Fit video to dub** when Khmer speech runs past the picture  
+7. **Edit** on the table / timeline · mix Original Audio if needed  
+8. **Export** SRT, soft subs, or burn-in dubbed video  
 
 Settings and API keys live in **Project settings / Settings** (local on your machine).
 
@@ -266,10 +292,11 @@ ProfessorDubbedPro/
 ├── docs/                 # Banner, icon, screenshots
 ├── src/                  # SvelteKit UI
 │   ├── lib/components/   # layout · studio · ui
-│   ├── lib/stores/       # project · prefs · ASR · translate
+│   ├── lib/stores/       # project · prefs · tempo · ASR · translate
 │   └── routes/
 ├── src-tauri/            # Tauri + Rust
-│   ├── src/              # transcribe · translate · tts · export
+│   ├── src/              # transcribe · translate · tts · export · tempo
+│   ├── resources/fonts/  # Noto Sans Khmer (burn-in)
 │   ├── binaries/         # FFmpeg (downloaded)
 │   └── models/           # Whisper (downloaded)
 ├── scripts/              # ensure-* + FunASR Python
@@ -285,8 +312,8 @@ PRs and issues welcome — especially:
 
 - ZH→KM glossary / translation quality  
 - macOS / Linux packaging  
-- Dubbed-master audio mix export  
 - Noisy short-video ASR  
+- Optional demucs / BGM separation  
 
 Keep changes focused; match existing TypeScript / Rust style.
 

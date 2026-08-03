@@ -66,6 +66,7 @@ type RustResult = {
 	voice: string;
 	byteLength: number;
 	engine: string;
+	durationMs?: number;
 };
 
 function friendlyMessage(raw: string): TtsError {
@@ -125,7 +126,11 @@ export const edgeTtsEngine: TtsEngine = {
 				engine: 'edge-tts',
 				filePath: result.filePath,
 				providerVoice: result.voice || voice || DEFAULT_EDGE_VOICE_ID,
-				byteLength: result.byteLength
+				byteLength: result.byteLength,
+				durationMs:
+					typeof result.durationMs === 'number' && result.durationMs > 0
+						? Math.round(result.durationMs)
+						: undefined
 			};
 		} catch (err) {
 			if (err instanceof TtsError) throw err;

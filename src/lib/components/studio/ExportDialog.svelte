@@ -26,9 +26,34 @@
 			(c) => (c.translation?.trim() || c.source?.trim()).length > 0
 		).length
 	);
+	const ttsClipCount = $derived(
+		projectStore.current.cues.filter((c) => Boolean(c.assignedAudio?.filePath?.trim())).length
+	);
+	const originalGain = $derived(projectStore.originalAudioEffectiveGain);
 	const hasVideo = $derived(Boolean(projectStore.videoUrl));
 	const needsVideo = $derived(mode === 'videoSoftSubs' || mode === 'videoBurnedIn');
 	const canExport = $derived(exportableCount > 0 && !busy && (mode === 'srt' || hasVideo));
+
+	function collectDubClips() {
+		return projectStore.current.cues
+			.filter((c) => Boolean(c.assignedAudio?.filePath?.trim()))
+			.map((c) => {
+				const audioDur = c.assignedAudio?.durationMs;
+				const span = Math.max(200, c.endMs - c.startMs);
+				return {
+					path: c.assignedAudio!.filePath!.trim(),
+					startMs: c.startMs,
+					volume: Math.max(
+						0,
+						Math.min(1, (Number.isFinite(c.volume) ? c.volume : projectStore.volume) / 100)
+					),
+					durationMs:
+						typeof audioDur === 'number' && audioDur > 0
+							? Math.round(audioDur)
+							: span
+				};
+			});
+	}
 
 	$effect(() => {
 		if (!open) {
@@ -53,6 +78,8 @@
 				projectName: projectStore.current.name,
 				videoPath: projectStore.videoPath,
 				videoFile: projectStore.videoFile,
+				originalAudioGain: projectStore.originalAudioEffectiveGain,
+				dubClips: collectDubClips(),
 				onStatus: (msg) => {
 					status = msg;
 				}
@@ -84,10 +111,29 @@
 		<Dialog.Header>
 			<Dialog.Title>Export</Dialog.Title>
 			<Dialog.Description>
-				Studio preview draws an overlay. Soft tracks stay hidden until a player enables them —
-				use burned-in for subtitles that always show.
+				Video export mixes your TTS dub and respects Original Audio mute/volume. Soft subtitle
+				tracks stay hidden until a player enables them — use burned-in for always-visible text.
 			</Dialog.Description>
 		</Dialog.Header>
+
+		{#if needsVideo}
+			<p class="rounded-md border border-border/60 bg-muted/25 px-2.5 py-2 text-[11px] text-muted-foreground">
+				Audio:
+				{#if originalGain < 0.02}
+					<span class="font-medium text-foreground">original muted</span>
+				{:else}
+					<span class="font-medium text-foreground"
+						>original {Math.round(originalGain * 100)}%</span
+					>
+				{/if}
+				·
+				{#if ttsClipCount > 0}
+					<span class="font-medium text-foreground">{ttsClipCount} TTS clip(s)</span>
+				{:else}
+					<span class="text-amber-700 dark:text-amber-400">no TTS yet — Generate first</span>
+				{/if}
+			</p>
+		{/if}
 
 		<div class="grid gap-2 py-1">
 			<button
