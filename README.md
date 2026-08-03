@@ -71,7 +71,7 @@ Optional sidecars:
 
 ```bash
 # 1. Clone
-git clone git@github.com:uysuy/ProfessorDubbedPro.git
+git clone https://github.com/uysuy/ProfessorDubbedPro.git
 cd ProfessorDubbedPro
 
 # 2. Install JS deps
