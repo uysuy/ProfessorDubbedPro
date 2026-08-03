@@ -53,11 +53,11 @@ Real app UI — works on GitHub.com and the GitHub mobile app (images scale to y
 
 ### Overview — preview, tools & subtitle table
 
-![ProfessorDubbedPro studio overview](docs/studio-overview.jpg)
+![ProfessorDubbedPro studio overview](docs/studio-overview.png)
 
 ### Timeline — subtitles, TTS audio & original mix
 
-![ProfessorDubbedPro timeline editor](docs/studio-timeline.jpg)
+![ProfessorDubbedPro timeline editor](docs/studio-timeline.png)
 
 ---
 
