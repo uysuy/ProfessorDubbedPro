@@ -1,0 +1,143 @@
+diff --git a/dist/internal/utils/style.js b/dist/internal/utils/style.js
+index fba01d421d11eb642bf91fa5abc3cee69d6d3604..2efe96c1e327edefdb05493ae83d01f434a4d509 100644
+--- a/dist/internal/utils/style.js
++++ b/dist/internal/utils/style.js	
+@@ -1,7 +1,6 @@
+-/* Global cursor state */
++/* Global cursor state — apply on <html> only (never `*{cursor}` which forces full-doc recalc). */
+ let currentState = null;
+-/* Global cursor element */
+-let element = null;
++let activeDoc = null;
+ /**
+  * Returns the cursor style for a given cursor state.
+  */
+@@ -25,11 +24,13 @@ export function getCursorStyle(state) {
+  * Resets the global cursor style to the default.
+  */
+ export function resetGlobalCursorStyle() {
+-    if (element === null)
++    if (currentState === null)
+         return;
+-    document.head.removeChild(element);
++    if (activeDoc) {
++        activeDoc.documentElement.style.cursor = "";
++        activeDoc = null;
++    }
+     currentState = null;
+-    element = null;
+ }
+ /**
+  * Sets the global cursor style to the given state.
+@@ -38,12 +39,8 @@ export function setGlobalCursorStyle(state, doc) {
+     if (currentState === state)
+         return;
+     currentState = state;
+-    const style = getCursorStyle(state);
+-    if (element === null) {
+-        element = doc.createElement("style");
+-        doc.head.appendChild(element);
+-    }
+-    element.innerHTML = `*{cursor: ${style}!important;}`;
++    activeDoc = doc;
++    doc.documentElement.style.cursor = getCursorStyle(state);
+ }
+ /**
+  * Computes the flexbox style for a pane given its layout and drag state.
+diff --git a/dist/paneforge.svelte.js b/dist/paneforge.svelte.js
+index 26c5fbf9e2d7de99e797f89e980e38fed338aad9..a2716693168e660434293aae5613804f96383386 100644
+--- a/dist/paneforge.svelte.js
++++ b/dist/paneforge.svelte.js	
+@@ -411,6 +411,8 @@ export class PaneResizerState {
+     #isDragging = $derived.by(() => this.#group.dragState?.dragHandleId === this.opts.id.current);
+     #isFocused = $state(false);
+     resizeHandler = null;
++    /** Sync attach/detach — $effect-based listeners miss the first moves after mousedown. */
++    #dragCleanup = null;
+     constructor(opts, group) {
+         this.opts = opts;
+         this.#group = group;
+@@ -419,48 +421,59 @@ export class PaneResizerState {
+         $effect(() => {
+             if (this.opts.disabled.current) {
+                 this.resizeHandler = null;
++                this.#detachDragListeners();
+             }
+             else {
+                 this.resizeHandler = this.#group.registerResizeHandle(this.opts.id.current);
+             }
+         });
+-        $effect(() => {
+-            const node = this.opts.ref.current;
+-            if (!node)
+-                return;
+-            const disabled = this.opts.disabled.current;
+-            const resizeHandler = this.resizeHandler;
+-            const isDragging = this.#isDragging;
+-            if (disabled || resizeHandler === null || !isDragging)
+-                return;
+-            const onMove = (e) => {
+-                resizeHandler(e);
+-            };
+-            const onMouseLeave = (e) => {
+-                resizeHandler(e);
+-            };
+-            const stopDraggingAndBlur = () => {
+-                node.blur();
+-                this.#group.stopDragging();
+-                this.opts.onDraggingChange.current(false);
+-            };
+-            const domBody = this.domContext.getDocument().body;
+-            const domWindow = this.domContext.getWindow();
+-            return executeCallbacks(on(domBody, "contextmenu", stopDraggingAndBlur), on(domBody, "mousemove", onMove), on(domBody, "touchmove", onMove, { passive: false }), on(domBody, "mouseleave", onMouseLeave), on(domWindow, "mouseup", stopDraggingAndBlur), on(domWindow, "touchend", stopDraggingAndBlur));
+-        });
+     }
++    #detachDragListeners = () => {
++        if (this.#dragCleanup == null)
++            return;
++        this.#dragCleanup();
++        this.#dragCleanup = null;
++    };
++    #attachDragListeners = () => {
++        this.#detachDragListeners();
++        const node = this.opts.ref.current;
++        const resizeHandler = this.resizeHandler;
++        if (!node || this.opts.disabled.current || resizeHandler === null)
++            return;
++        const onMove = (e) => {
++            resizeHandler(e);
++        };
++        const onMouseLeave = (e) => {
++            resizeHandler(e);
++        };
++        const stopDraggingAndBlur = () => {
++            node.blur();
++            this.#detachDragListeners();
++            this.#group.stopDragging();
++            this.opts.onDraggingChange.current(false);
++        };
++        const domBody = this.domContext.getDocument().body;
++        const domWindow = this.domContext.getWindow();
++        this.#dragCleanup = executeCallbacks(on(domBody, "contextmenu", stopDraggingAndBlur), on(domBody, "mousemove", onMove), on(domBody, "touchmove", onMove, { passive: false }), on(domBody, "mouseleave", onMouseLeave), on(domWindow, "mouseup", stopDraggingAndBlur), on(domWindow, "touchend", stopDraggingAndBlur));
++    };
+     #startDragging = (e) => {
+         e.preventDefault();
+         if (this.opts.disabled.current)
+             return;
++        // Eagerly create handler so the first drag works before $effect flushes.
++        if (this.resizeHandler === null) {
++            this.resizeHandler = this.#group.registerResizeHandle(this.opts.id.current);
++        }
+         this.#group.startDragging(this.opts.id.current, e);
+         this.opts.onDraggingChange.current(true);
++        this.#attachDragListeners();
+     };
+     #stopDraggingAndBlur = () => {
+         const node = this.opts.ref.current;
+         if (!node)
+             return;
+         node.blur();
++        this.#detachDragListeners();
+         this.#group.stopDragging();
+         this.opts.onDraggingChange.current(false);
+     };

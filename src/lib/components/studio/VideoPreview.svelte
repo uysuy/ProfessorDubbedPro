@@ -1,0 +1,1094 @@
+<script lang="ts">
+	import { onDestroy, untrack } from 'svelte';
+	import { Button } from '$lib/components/ui/button/index.js';
+	import * as Select from '$lib/components/ui/select/index.js';
+	import * as Tooltip from '$lib/components/ui/tooltip/index.js';
+	import { playback, projectStore } from '$lib/stores/project.svelte';
+	import { getVisualPlayheadMs, setVisualPlayheadMs, consumeMediaSeekMs } from '$lib/stores/playback-clock';
+	import { classifyMediaFile, dndStore, isFileDrag } from '$lib/stores/dnd.svelte';
+	import { usesKhmerScript, normalizeDubLanguage } from '$lib/stores/preferences.svelte';
+	import { formatClock, formatTimecode } from '$lib/utils/time';
+	import { TtsPlaybackMixer } from '$lib/utils/tts-playback';
+	import { cueAudioEndMs } from '$lib/utils/tts-fit';
+	import { isTauriRuntime } from '$lib/utils/platform';
+	import {
+		FolderOpen,
+		Maximize,
+		Minimize,
+		Pause,
+		Play,
+		Upload,
+		ZoomIn,
+		ZoomOut
+	} from '@lucide/svelte';
+
+	interface Props {
+		class?: string;
+	}
+
+	let { class: className = '' }: Props = $props();
+
+	const speeds = ['0.5', '0.75', '1', '1.25', '1.5', '2'] as const;
+
+	let shellEl: HTMLElement | undefined = $state();
+	let videoEl: HTMLVideoElement | undefined = $state();
+	let fileInput: HTMLInputElement | undefined = $state();
+	let playbackRate = $state('1');
+	let zoom = $state(1);
+	let isFullscreen = $state(false);
+	let mediaDurationMs = $state(0);
+	let isSeeking = $state(false);
+	let dropActive = $state(false);
+	let dropDepth = $state(0);
+
+	const ttsMixer = new TtsPlaybackMixer();
+	let ttsResolverReady = false;
+	/** Remember base video volume so we can duck under TTS without fighting the user. */
+	let baseVideoVolume = 1;
+
+	async function ensureTtsResolver() {
+		if (ttsResolverReady || !isTauriRuntime()) return;
+		ttsResolverReady = true;
+		try {
+			const { convertFileSrc } = await import('@tauri-apps/api/core');
+			ttsMixer.setUrlResolver((path) => {
+				try {
+					return convertFileSrc(path);
+				} catch {
+					return null;
+				}
+			});
+		} catch {
+			ttsResolverReady = false;
+		}
+	}
+
+	function syncTts(playheadMs: number, playing: boolean) {
+		void ensureTtsResolver();
+		ttsMixer.sync({
+			playheadMs,
+			isPlaying: playing,
+			playbackRate: rateValue(),
+			preferredCueId: playback.focusedCueId,
+			cues: projectStore.current.cues
+		});
+
+		if (videoEl) {
+			const hasTts =
+				playing &&
+				projectStore.current.cues.some((c) => {
+					if (!c.assignedAudio || !(c.assignedAudio.url || c.assignedAudio.filePath)) {
+						return false;
+					}
+					return playheadMs >= c.startMs && playheadMs < cueAudioEndMs(c);
+				});
+			const target = hasTts ? baseVideoVolume * 0.28 : baseVideoVolume;
+			if (Math.abs(videoEl.volume - target) > 0.02) {
+				videoEl.volume = Math.max(0, Math.min(1, target));
+			}
+		}
+	}
+
+	const src = $derived(projectStore.videoUrl);
+	const durationMs = $derived(
+		mediaDurationMs > 0 ? mediaDurationMs : projectStore.current.durationMs
+	);
+	/** Coarse clock for paused UI / empty-state (not updated every frame). */
+	let transportMs = $state(0);
+	const showHours = $derived(durationMs >= 3600_000);
+	const videoName = $derived(projectStore.videoAsset?.name ?? null);
+	/** Preview burn-in — driven by store playhead so scrub/pause always resolve. */
+	const overlaySubtitle = $derived.by(() => {
+		const ms = playback.playheadMs;
+		const cues = projectStore.current.cues;
+		const cue = cues.find((c) => ms >= c.startMs && ms < cueAudioEndMs(c));
+		if (!cue) return null;
+		const text = cue.translation?.trim() || cue.source?.trim();
+		return text ? text : null;
+	});
+	const overlayUsesKhmer = $derived(
+		usesKhmerScript(normalizeDubLanguage(projectStore.current.targetLanguage))
+	);
+
+	let raf = 0;
+	let lastTick = 0;
+	let playToken = 0;
+	let lastStorePushAt = 0;
+	let durationChecked = false;
+	let currentTimeEl: HTMLSpanElement | undefined = $state();
+	let durationTimeEl: HTMLSpanElement | undefined = $state();
+	let progressFillEl: HTMLDivElement | undefined = $state();
+	let scrubTrackEl: HTMLDivElement | undefined = $state();
+
+	function rateValue() {
+		const n = Number(playbackRate);
+		return Number.isFinite(n) && n > 0 ? n : 1;
+	}
+
+	function applyPlaybackRate(el: HTMLVideoElement | undefined = videoEl) {
+		if (!el) return;
+		const rate = rateValue();
+		try {
+			el.playbackRate = rate;
+			el.defaultPlaybackRate = rate;
+		} catch {
+			/* some engines throw on unsupported rates */
+		}
+	}
+
+	function videoDurationSec(): number {
+		const d = videoEl?.duration;
+		return typeof d === 'number' && Number.isFinite(d) && d > 0 ? d : 0;
+	}
+
+	function isNearEnd(el: HTMLVideoElement) {
+		const dur = el.duration;
+		if (el.ended) return true;
+		if (!Number.isFinite(dur) || dur <= 0) return false;
+		return el.currentTime >= dur - 0.05;
+	}
+
+	function ensureMediaDuration() {
+		if (!videoEl || durationChecked) return;
+		const sec = videoDurationSec();
+		if (!sec) return;
+		const ms = sec * 1000;
+		durationChecked = true;
+		if (Math.abs(ms - mediaDurationMs) > 250) mediaDurationMs = ms;
+		if (Math.abs(ms - projectStore.current.durationMs) > 500) {
+			projectStore.setDurationMs(ms);
+		}
+		if (durationTimeEl) {
+			durationTimeEl.textContent = formatClock(ms, ms >= 3600_000);
+		}
+	}
+
+	function paintTransport(ms: number) {
+		const dur = Math.max(durationMs, 1);
+		if (currentTimeEl) {
+			currentTimeEl.textContent = formatClock(ms, showHours);
+		}
+		if (progressFillEl) {
+			progressFillEl.style.width = `${Math.min(100, (ms / dur) * 100)}%`;
+		}
+	}
+
+	function publishClock(ms: number, now = performance.now(), forceStore = false) {
+		const safe = Math.max(0, ms);
+		setVisualPlayheadMs(safe);
+		// Paint timer/progress via DOM — never feed a Bits UI slider every frame
+		// (that re-triggered seek and made playback crawl).
+		paintTransport(safe);
+
+		if (forceStore || now - lastStorePushAt >= 100) {
+			lastStorePushAt = now;
+			transportMs = safe;
+			projectStore.setPlayhead(safe);
+		}
+	}
+
+	/** Freeze clock on the real media time (avoids snap-back from throttled store). */
+	function syncClockFromMedia(forceStore = true) {
+		if (videoEl && Number.isFinite(videoEl.currentTime) && !videoEl.ended) {
+			publishClock(videoEl.currentTime * 1000, performance.now(), forceStore);
+			return;
+		}
+		publishClock(getVisualPlayheadMs(), performance.now(), forceStore);
+	}
+
+	function pushPlayheadFromVideo(forceStore = false) {
+		if (!videoEl) return;
+		if (isSeeking) return;
+
+		const videoMs = videoEl.currentTime * 1000;
+		const requested = consumeMediaSeekMs();
+
+		// Honor an intentional scrub/jump once, then resume following the media clock.
+		if (requested != null && Number.isFinite(requested)) {
+			const dur = videoDurationSec();
+			if (dur) {
+				videoEl.currentTime = Math.min(dur, Math.max(0, requested / 1000));
+			}
+			publishClock(requested, performance.now(), true);
+			return;
+		}
+
+		// While playing, the <video> element is the source of truth.
+		publishClock(videoMs, performance.now(), forceStore);
+
+		if (playback.isPlaying && isNearEnd(videoEl)) {
+			finishPlayback();
+		}
+	}
+
+	/** Media finished — show Play and keep playhead at the end. */
+	function finishPlayback() {
+		projectStore.pausePlayback();
+		isSeeking = false;
+		if (!videoEl) return;
+		const sec = videoDurationSec();
+		const endMs = sec > 0 ? sec * 1000 : projectStore.current.durationMs;
+		publishClock(endMs, performance.now(), true);
+	}
+
+	function advanceDemo(now: number) {
+		if (!lastTick) lastTick = now;
+		const delta = (now - lastTick) * rateValue();
+		lastTick = now;
+		const next = getVisualPlayheadMs() + delta;
+		if (next >= durationMs) {
+			publishClock(durationMs, now, true);
+			projectStore.pausePlayback();
+			return;
+		}
+		publishClock(next, now);
+	}
+
+	function stopClock() {
+		if (raf) {
+			cancelAnimationFrame(raf);
+			raf = 0;
+		}
+		lastTick = 0;
+	}
+
+	function startClock(token: number) {
+		stopClock();
+		let lastPlayAttempt = 0;
+		const loop = (now: number) => {
+			if (token !== playToken || !playback.isPlaying) {
+				raf = 0;
+				return;
+			}
+
+			if (videoEl) {
+				applyPlaybackRate(videoEl);
+				if (videoEl.paused && !videoEl.ended) {
+					// Retry play, but not every frame — rapid play() spam stalls WebView2.
+					if (now - lastPlayAttempt > 280) {
+						lastPlayAttempt = now;
+						void videoEl.play().catch(() => {
+							if (token === playToken) projectStore.pausePlayback();
+						});
+					}
+				} else {
+					pushPlayheadFromVideo();
+				}
+				const ms = getVisualPlayheadMs();
+				projectStore.finishFocusedCueIfPast(ms);
+				if (!playback.isPlaying) {
+					ttsMixer.pauseAll();
+					if (videoEl) videoEl.volume = baseVideoVolume;
+					raf = 0;
+					return;
+				}
+				syncTts(ms, true);
+			} else {
+				advanceDemo(now);
+				const ms = getVisualPlayheadMs();
+				projectStore.finishFocusedCueIfPast(ms);
+				if (!playback.isPlaying) {
+					ttsMixer.pauseAll();
+					raf = 0;
+					return;
+				}
+				syncTts(ms, true);
+			}
+
+			raf = requestAnimationFrame(loop);
+		};
+		raf = requestAnimationFrame(loop);
+	}
+
+	async function startVideoPlayback(token: number) {
+		const el = videoEl;
+		if (!el) {
+			startClock(token);
+			return;
+		}
+
+		isSeeking = false;
+		durationChecked = false;
+		// Avoid tracking project/duration inside the play effect — use untracked reads.
+		untrack(() => ensureMediaDuration());
+		applyPlaybackRate(el);
+
+		// Apply any pending timeline scrub before starting.
+		const requested = consumeMediaSeekMs();
+		if (requested != null && Number.isFinite(requested)) {
+			applyVideoCurrentTime(requested);
+			publishClock(requested, performance.now(), true);
+		} else if (isNearEnd(el)) {
+			el.currentTime = 0;
+			publishClock(0, performance.now(), true);
+		}
+
+		try {
+			await el.play();
+		} catch {
+			if (token === playToken && playback.isPlaying) projectStore.pausePlayback();
+			return;
+		}
+
+		applyPlaybackRate(el);
+
+		if (token !== playToken || !playback.isPlaying) {
+			el.pause();
+			ttsMixer.pauseAll();
+			return;
+		}
+		publishClock(el.currentTime * 1000, performance.now(), true);
+		startClock(token);
+	}
+
+	$effect(() => {
+		const el = videoEl;
+		void playbackRate;
+		untrack(() => applyPlaybackRate(el));
+	});
+
+	/**
+	 * Play/pause orchestration.
+	 * CRITICAL: only depend on `isPlaying`. Any other reactive reads (videoEl, project,
+	 * duration, playhead) must be untracked — otherwise the effect re-runs mid-playback,
+	 * stops the rAF clock, and leaves the UI stuck on the Pause icon at 00:00.
+	 */
+	let lastPlaying = false;
+	$effect(() => {
+		const playing = playback.isPlaying;
+		if (playing === lastPlaying) return;
+		lastPlaying = playing;
+
+		untrack(() => {
+			const token = ++playToken;
+			stopClock();
+
+			if (!playing) {
+				try {
+					videoEl?.pause();
+				} catch {
+					/* ignore */
+				}
+				syncClockFromMedia(true);
+				ttsMixer.pauseAll();
+				if (videoEl) videoEl.volume = baseVideoVolume;
+				return;
+			}
+
+			void startVideoPlayback(token);
+		});
+	});
+
+	// Keep local transport in sync when scrubbing from timeline while paused.
+	$effect(() => {
+		const playing = playback.isPlaying;
+		const seeking = isSeeking;
+		if (playing || seeking) return;
+		const ms = playback.playheadMs;
+		untrack(() => {
+			transportMs = ms;
+			setVisualPlayheadMs(ms);
+			paintTransport(ms);
+			syncTts(ms, false);
+		});
+	});
+
+	// Reset local media duration when source changes.
+	$effect(() => {
+		void src;
+		untrack(() => {
+			mediaDurationMs = 0;
+			isSeeking = false;
+			durationChecked = false;
+			transportMs = 0;
+			lastStorePushAt = 0;
+			setVisualPlayheadMs(0);
+			paintTransport(0);
+			ttsMixer.pauseAll();
+			// If we were "playing" against a dead element, drop back to paused.
+			if (playback.isPlaying) projectStore.pausePlayback();
+			lastPlaying = false;
+		});
+	});
+
+	// Warm TTS buffers when clips appear (untracked — must not interrupt playback).
+	$effect(() => {
+		const clips = projectStore.current.cues.filter(
+			(c) => c.assignedAudio && (c.assignedAudio.url || c.assignedAudio.filePath)
+		);
+		if (!clips.length) return;
+		untrack(() => {
+			void ensureTtsResolver().then(() => ttsMixer.warmup(clips));
+		});
+	});
+
+	onDestroy(() => {
+		playToken += 1;
+		lastPlaying = false;
+		stopClock();
+		ttsMixer.dispose();
+	});
+
+	function togglePlay() {
+		isSeeking = false;
+		projectStore.togglePlayback();
+	}
+
+	function onVideoEnded() {
+		finishPlayback();
+	}
+
+	function onTimeUpdate() {
+		// While paused the store owns the playhead (timeline / transport seeks).
+		// Syncing from video here snaps the needle back to the end after `ended`.
+		if (!playback.isPlaying || isSeeking) return;
+		pushPlayheadFromVideo();
+	}
+
+	function onRateChange() {
+		if (!videoEl) return;
+		applyPlaybackRate(videoEl);
+	}
+
+	function onLoadedMetadata() {
+		if (!videoEl) return;
+		durationChecked = false;
+		ensureMediaDuration();
+		applyPlaybackRate(videoEl);
+		const ms = videoDurationSec() * 1000;
+		if (ms > 0) {
+			mediaDurationMs = ms;
+			projectStore.setDurationMs(ms);
+		}
+	}
+
+	/** Seek the media element; clears `ended` so scrubbing after finish works. */
+	function applyVideoCurrentTime(ms: number) {
+		if (!videoEl) return;
+		const dur = videoDurationSec();
+		if (!dur) return;
+		const t = Math.min(dur, Math.max(0, ms / 1000));
+		try {
+			// Leaving `ended` requires an accepted currentTime assignment.
+			if (videoEl.ended) videoEl.pause();
+			videoEl.currentTime = t;
+			// WebView2 sometimes ignores the first seek while ended — retry once.
+			if (videoEl.ended && t < dur - 0.05) {
+				requestAnimationFrame(() => {
+					if (!videoEl) return;
+					try {
+						videoEl.currentTime = t;
+					} catch {
+						/* ignore */
+					}
+				});
+			}
+		} catch {
+			/* ignore seek errors from some engines */
+		}
+	}
+
+	function seekTo(ms: number) {
+		const maxMs = Math.max(durationMs, projectStore.current.durationMs, 1);
+		const clamped = Math.max(0, Math.min(maxMs, ms));
+		setVisualPlayheadMs(clamped, { seekMedia: true });
+		publishClock(clamped, performance.now(), true);
+		applyVideoCurrentTime(clamped);
+		syncTts(clamped, playback.isPlaying);
+	}
+
+	/** Keep the HTML video element aligned when playhead is scrubbed (timeline / keys). */
+	$effect(() => {
+		const playing = playback.isPlaying;
+		const seeking = isSeeking;
+		const el = videoEl;
+		if (!el || seeking || playing) return;
+		const targetMs = playback.playheadMs;
+
+		untrack(() => {
+			const videoMs = el.currentTime * 1000;
+			const delta = targetMs - videoMs;
+			// Paused: ignore tiny lag; never yank the frame backward for throttle noise.
+			if (delta < 0 && delta >= -160) return;
+			if (Math.abs(delta) <= 40) return;
+			if (!videoDurationSec()) return;
+
+			applyVideoCurrentTime(targetMs);
+			setVisualPlayheadMs(targetMs);
+			paintTransport(targetMs);
+			syncTts(targetMs, false);
+		});
+	});
+
+	function msFromScrubPointer(clientX: number) {
+		if (!scrubTrackEl) return 0;
+		const rect = scrubTrackEl.getBoundingClientRect();
+		const t = rect.width > 0 ? (clientX - rect.left) / rect.width : 0;
+		return Math.max(0, Math.min(1, t)) * Math.max(durationMs, 1);
+	}
+
+	function onScrubPointerDown(e: PointerEvent & { currentTarget: HTMLElement }) {
+		e.preventDefault();
+		isSeeking = true;
+		e.currentTarget.setPointerCapture(e.pointerId);
+		seekTo(msFromScrubPointer(e.clientX));
+	}
+
+	function onScrubPointerMove(e: PointerEvent) {
+		if (!isSeeking) return;
+		seekTo(msFromScrubPointer(e.clientX));
+	}
+
+	function onScrubPointerUp(e: PointerEvent & { currentTarget: HTMLElement }) {
+		if (!isSeeking) return;
+		seekTo(msFromScrubPointer(e.clientX));
+		isSeeking = false;
+		try {
+			e.currentTarget.releasePointerCapture(e.pointerId);
+		} catch {
+			/* already released */
+		}
+	}
+
+	function setSpeed(v: string | undefined) {
+		if (!v) return;
+		playbackRate = v;
+		applyPlaybackRate(videoEl);
+	}
+
+	function zoomBy(delta: number) {
+		zoom = Math.min(3, Math.max(1, Number((zoom + delta).toFixed(2))));
+	}
+
+	async function toggleFullscreen() {
+		if (!shellEl) return;
+		try {
+			if (!document.fullscreenElement) {
+				await shellEl.requestFullscreen();
+				isFullscreen = true;
+			} else {
+				await document.exitFullscreen();
+				isFullscreen = false;
+			}
+		} catch {
+			isFullscreen = Boolean(document.fullscreenElement);
+		}
+	}
+
+	function onFullscreenChange() {
+		isFullscreen = document.fullscreenElement === shellEl;
+	}
+
+	function openFilePicker() {
+		void openVideoWithDialog();
+	}
+
+	async function openVideoWithDialog() {
+		if (isTauriRuntime()) {
+			try {
+				const { open } = await import('@tauri-apps/plugin-dialog');
+				const selected = await open({
+					title: 'Open video',
+					multiple: false,
+					filters: [
+						{
+							name: 'Video',
+							extensions: ['mp4', 'mov', 'mkv', 'webm', 'm4v', 'avi']
+						}
+					]
+				});
+				if (!selected || Array.isArray(selected)) return;
+				const ok = await projectStore.setVideoFromPath(selected);
+				if (ok) {
+					const name = selected.split(/[/\\]/).pop() || 'video';
+					dndStore.flash(`Loaded ${name}`);
+				} else {
+					dndStore.flash('Could not open video');
+				}
+				return;
+			} catch {
+				/* fall through to HTML file input */
+			}
+		}
+		fileInput?.click();
+	}
+
+	function loadVideoFile(file: File | undefined | null) {
+		if (!file) return;
+		if (classifyMediaFile(file) !== 'video') {
+			dndStore.flash('Please choose a video file');
+			return;
+		}
+		const ok = projectStore.setVideoFromFile(file);
+		if (ok) dndStore.flash(`Loaded ${file.name}`);
+	}
+
+	function onFileInputChange(e: Event) {
+		const input = e.currentTarget as HTMLInputElement;
+		loadVideoFile(input.files?.[0]);
+		input.value = '';
+	}
+
+	function onDragEnter(e: DragEvent) {
+		if (!isFileDrag(e)) return;
+		e.preventDefault();
+		e.stopPropagation();
+		dropDepth += 1;
+		dropActive = true;
+	}
+
+	function onDragLeave(e: DragEvent) {
+		if (!isFileDrag(e)) return;
+		e.preventDefault();
+		e.stopPropagation();
+		dropDepth = Math.max(0, dropDepth - 1);
+		if (dropDepth === 0) dropActive = false;
+	}
+
+	function onDragOver(e: DragEvent) {
+		if (!isFileDrag(e)) return;
+		e.preventDefault();
+		e.stopPropagation();
+		if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+		dropActive = true;
+	}
+
+	function onDrop(e: DragEvent) {
+		if (!isFileDrag(e)) return;
+		e.preventDefault();
+		e.stopPropagation();
+		dropDepth = 0;
+		dropActive = false;
+
+		const files = Array.from(e.dataTransfer?.files ?? []);
+		const video = files.find((f) => classifyMediaFile(f) === 'video');
+		if (!video) {
+			dndStore.flash('Drop a video file here');
+			return;
+		}
+		loadVideoFile(video);
+	}
+</script>
+
+<svelte:document onfullscreenchange={onFullscreenChange} />
+
+<input
+	bind:this={fileInput}
+	type="file"
+	accept="video/*,.mp4,.mov,.mkv,.webm,.m4v,.avi"
+	class="hidden"
+	onchange={onFileInputChange}
+/>
+
+<section
+	bind:this={shellEl}
+	class="video-preview flex min-h-0 flex-col overflow-hidden {className}"
+	data-slot="video-preview"
+>
+	<!-- Player stage -->
+	<div
+		class="video-preview-stage relative min-h-0 flex-1 overflow-hidden"
+		class:video-drop-active={dropActive}
+		ondragenter={onDragEnter}
+		ondragleave={onDragLeave}
+		ondragover={onDragOver}
+		ondrop={onDrop}
+		role="presentation"
+	>
+		<div class="absolute inset-0 flex items-center justify-center overflow-hidden p-2">
+			<div
+				class="video-preview-frame relative aspect-video h-full max-h-full w-full max-w-full overflow-hidden rounded-md transition-transform duration-200 ease-out"
+				style="transform: scale({zoom}); transform-origin: center center;"
+			>
+				{#if src}
+					<video
+						bind:this={videoEl}
+						class="size-full object-contain"
+						{src}
+						playsinline
+						preload="metadata"
+						onloadedmetadata={onLoadedMetadata}
+						ontimeupdate={onTimeUpdate}
+						onratechange={onRateChange}
+						onended={onVideoEnded}
+						onclick={togglePlay}
+					>
+						<track kind="captions" />
+					</video>
+				{:else}
+					<div
+						class="video-preview-placeholder flex size-full flex-col items-center justify-center gap-3 px-4 text-center"
+					>
+						<p class="preview-eyebrow text-[11px] tracking-[0.2em] uppercase">
+							Program Monitor
+						</p>
+						<p class="preview-title text-sm font-medium">Drop source video to begin</p>
+						<p class="max-w-[16rem] text-[11px] text-muted-foreground">
+							Drag a video onto this panel, or open a file from disk.
+						</p>
+						<Button
+							variant="secondary"
+							size="sm"
+							class="mt-1 gap-1.5"
+							onclick={openFilePicker}
+						>
+							<FolderOpen class="size-3.5" />
+							Open video
+						</Button>
+						<p class="font-mono text-[11px] text-primary">
+							{formatTimecode(transportMs, projectStore.current.fps)}
+						</p>
+					</div>
+					<div
+						class="pointer-events-none absolute inset-y-0 w-px bg-primary shadow-[0_0_12px_color-mix(in_oklab,var(--primary)_55%,transparent)]"
+						style="left: {durationMs > 0 ? Math.min(100, (transportMs / durationMs) * 100) : 0}%"
+						aria-hidden="true"
+					></div>
+				{/if}
+
+				{#if dropActive}
+					<div class="video-drop-overlay" aria-live="polite">
+						<div class="video-drop-card">
+							<Upload class="size-5" />
+							<span>Drop video to load</span>
+						</div>
+					</div>
+				{/if}
+			</div>
+		</div>
+
+		{#if overlaySubtitle}
+			<div class="video-subtitle-overlay" aria-live="polite">
+				<p
+					class="video-subtitle-text"
+					class:font-khmer={overlayUsesKhmer}
+					lang={normalizeDubLanguage(projectStore.current.targetLanguage)}
+				>
+					{overlaySubtitle}
+				</p>
+			</div>
+		{/if}
+
+		{#if zoom > 1}
+			<span
+				class="absolute top-2 right-2 rounded-md border border-border/70 bg-[var(--surface-overlay)] px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground shadow-sm"
+			>
+				{zoom.toFixed(2)}×
+			</span>
+		{/if}
+
+		{#if videoName && !overlaySubtitle}
+			<span
+				class="absolute bottom-2 left-2 max-w-[70%] truncate rounded-md border border-border/70 bg-[var(--surface-overlay)] px-1.5 py-0.5 text-[10px] text-muted-foreground shadow-sm"
+				title={videoName}
+			>
+				{videoName}
+			</span>
+		{/if}
+	</div>
+
+	<!-- Transport / controls -->
+	<div class="shrink-0 space-y-2 border-t border-border/70 bg-sidebar/95 px-2.5 py-2 backdrop-blur">
+		<div class="flex items-center gap-2">
+			<span
+				bind:this={currentTimeEl}
+				class="w-12 shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground"
+			>
+				{formatClock(transportMs, showHours)}
+			</span>
+			<div
+				bind:this={scrubTrackEl}
+				class="preview-scrub relative h-2 flex-1 cursor-pointer touch-none rounded-full bg-muted"
+				role="slider"
+				tabindex="0"
+				aria-label="Playback progress"
+				aria-valuemin={0}
+				aria-valuemax={Math.max(durationMs, 1)}
+				aria-valuenow={transportMs}
+				onpointerdown={onScrubPointerDown}
+				onpointermove={onScrubPointerMove}
+				onpointerup={onScrubPointerUp}
+				onpointercancel={onScrubPointerUp}
+				onkeydown={(e) => {
+					const step = e.shiftKey ? 1000 : 100;
+					if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
+						e.preventDefault();
+						seekTo(transportMs - step);
+					} else if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
+						e.preventDefault();
+						seekTo(transportMs + step);
+					} else if (e.key === 'Home') {
+						e.preventDefault();
+						seekTo(0);
+					} else if (e.key === 'End') {
+						e.preventDefault();
+						seekTo(durationMs);
+					}
+				}}
+			>
+				<div
+					bind:this={progressFillEl}
+					class="preview-scrub-fill absolute inset-y-0 left-0 rounded-full bg-primary"
+					style="width: {durationMs > 0 ? Math.min(100, (transportMs / durationMs) * 100) : 0}%"
+				></div>
+			</div>
+			<span
+				bind:this={durationTimeEl}
+				class="w-12 shrink-0 text-right font-mono text-[11px] tabular-nums text-muted-foreground"
+			>
+				{formatClock(durationMs, showHours)}
+			</span>
+		</div>
+
+		<Tooltip.Provider>
+			<div class="flex items-center gap-1">
+				<Tooltip.Root>
+					<Tooltip.Trigger class="inline-flex">
+						{#snippet child({ props })}
+							<Button
+								{...props}
+								size="icon-sm"
+								aria-label={playback.isPlaying ? 'Pause' : 'Play'}
+								onclick={togglePlay}
+							>
+								{#if playback.isPlaying}
+									<Pause class="size-4 fill-current" />
+								{:else}
+									<Play class="size-4 fill-current" />
+								{/if}
+							</Button>
+						{/snippet}
+					</Tooltip.Trigger>
+					<Tooltip.Content sideOffset={6}
+						>{playback.isPlaying ? 'Pause' : 'Play'}</Tooltip.Content
+					>
+				</Tooltip.Root>
+
+				<Tooltip.Root>
+					<Tooltip.Trigger class="inline-flex">
+						{#snippet child({ props })}
+							<Button
+								{...props}
+								variant="ghost"
+								size="icon-sm"
+								aria-label="Open video"
+								onclick={openFilePicker}
+							>
+								<FolderOpen class="size-4" />
+							</Button>
+						{/snippet}
+					</Tooltip.Trigger>
+					<Tooltip.Content sideOffset={6}>Open video</Tooltip.Content>
+				</Tooltip.Root>
+
+				<Select.Root
+					type="single"
+					value={playbackRate}
+					onValueChange={setSpeed}
+				>
+					<Select.Trigger size="sm" class="h-7 min-w-[4.25rem] px-2 text-xs" aria-label="Playback speed">
+						{playbackRate}×
+					</Select.Trigger>
+					<Select.Content align="start">
+						{#each speeds as speed}
+							<Select.Item value={speed} label="{speed}×">{speed}×</Select.Item>
+						{/each}
+					</Select.Content>
+				</Select.Root>
+
+				<div class="ml-auto flex items-center gap-0.5">
+					<Tooltip.Root>
+						<Tooltip.Trigger class="inline-flex">
+							{#snippet child({ props })}
+								<Button
+									{...props}
+									variant="ghost"
+									size="icon-sm"
+									aria-label="Zoom out"
+									disabled={zoom <= 1}
+									onclick={() => zoomBy(-0.25)}
+								>
+									<ZoomOut class="size-4" />
+								</Button>
+							{/snippet}
+						</Tooltip.Trigger>
+						<Tooltip.Content sideOffset={6}>Zoom out</Tooltip.Content>
+					</Tooltip.Root>
+
+					<Tooltip.Root>
+						<Tooltip.Trigger class="inline-flex">
+							{#snippet child({ props })}
+								<Button
+									{...props}
+									variant="ghost"
+									size="icon-sm"
+									aria-label="Zoom in"
+									disabled={zoom >= 3}
+									onclick={() => zoomBy(0.25)}
+								>
+									<ZoomIn class="size-4" />
+								</Button>
+							{/snippet}
+						</Tooltip.Trigger>
+						<Tooltip.Content sideOffset={6}>Zoom in</Tooltip.Content>
+					</Tooltip.Root>
+
+					<Tooltip.Root>
+						<Tooltip.Trigger class="inline-flex">
+							{#snippet child({ props })}
+								<Button
+									{...props}
+									variant="ghost"
+									size="icon-sm"
+									aria-label={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+									onclick={toggleFullscreen}
+								>
+									{#if isFullscreen}
+										<Minimize class="size-4" />
+									{:else}
+										<Maximize class="size-4" />
+									{/if}
+								</Button>
+							{/snippet}
+						</Tooltip.Trigger>
+						<Tooltip.Content sideOffset={6}
+							>{isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}</Tooltip.Content
+						>
+					</Tooltip.Root>
+				</div>
+			</div>
+		</Tooltip.Provider>
+	</div>
+</section>
+
+<style>
+	.video-preview {
+		background: color-mix(in oklab, var(--sidebar) 88%, var(--primary) 4%);
+		box-shadow: var(--elevation-inset);
+	}
+
+	.video-preview-stage {
+		background:
+			radial-gradient(
+				ellipse at center,
+				color-mix(in oklab, var(--surface-monitor-mid) 85%, var(--primary) 15%),
+				var(--surface-monitor-deep) 72%
+			);
+		border-bottom: 1px solid color-mix(in oklab, var(--border) 80%, transparent);
+	}
+
+	.video-preview-stage.video-drop-active {
+		outline: 1px solid color-mix(in oklab, var(--primary) 55%, transparent);
+		outline-offset: -1px;
+	}
+
+	.video-preview-frame {
+		border: 1px solid color-mix(in oklab, var(--border) 70%, var(--primary) 12%);
+		background: var(--surface-monitor);
+		box-shadow:
+			0 0 0 1px color-mix(in oklab, var(--primary) 10%, transparent),
+			0 8px 24px oklch(0.3 0.04 265 / 18%);
+	}
+
+	.video-preview-placeholder {
+		border: 1px dashed color-mix(in oklab, var(--border) 55%, var(--primary) 20%);
+		background: color-mix(in oklab, var(--surface-monitor) 88%, var(--primary) 6%);
+	}
+
+	.video-drop-overlay {
+		position: absolute;
+		inset: 0;
+		z-index: 5;
+		display: grid;
+		place-items: center;
+		background: color-mix(in oklab, var(--surface-monitor) 55%, var(--primary) 12%);
+		backdrop-filter: blur(2px);
+	}
+
+	.video-drop-card {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		border-radius: 0.5rem;
+		border: 1px solid color-mix(in oklab, var(--primary) 40%, var(--border));
+		background: color-mix(in oklab, var(--card) 88%, transparent);
+		padding: 0.65rem 0.9rem;
+		font-size: 12px;
+		font-weight: 500;
+		color: var(--foreground);
+		box-shadow: var(--elevation-float);
+	}
+
+	.video-subtitle-overlay {
+		pointer-events: none;
+		position: absolute;
+		inset-inline: 0.75rem;
+		bottom: 0.85rem;
+		z-index: 20;
+		display: flex;
+		justify-content: center;
+		/* Force a compositor layer above <video> (WebView2 often paints video on top). */
+		transform: translateZ(0);
+	}
+
+	.video-subtitle-text {
+		max-width: min(92%, 36rem);
+		margin: 0;
+		border-radius: 0.4rem;
+		background: oklch(0 0 0 / 62%);
+		padding: 0.35rem 0.7rem;
+		text-align: center;
+		font-size: clamp(0.8rem, 2.4vw, 1.05rem);
+		font-weight: 500;
+		line-height: 1.45;
+		color: white;
+		text-shadow: 0 1px 2px oklch(0 0 0 / 55%);
+		backdrop-filter: blur(2px);
+	}
+
+	:global(:root:not(.dark)) .video-subtitle-text {
+		background: oklch(0.18 0.02 265 / 72%);
+	}
+
+	.preview-eyebrow {
+		color: oklch(0.72 0.02 265);
+	}
+
+	.preview-title {
+		color: oklch(0.94 0.015 265);
+	}
+
+	:global(.dark) .video-preview {
+		background: black;
+		box-shadow: none;
+	}
+
+	:global(.dark) .video-preview-stage {
+		background: radial-gradient(
+			ellipse at center,
+			oklch(0.24 0.06 275) 0%,
+			oklch(0.1 0.03 260) 70%
+		);
+		border-bottom-color: color-mix(in oklab, var(--border) 70%, transparent);
+	}
+
+	:global(.dark) .video-preview-frame {
+		border-color: transparent;
+		border-radius: 0;
+		background: transparent;
+		box-shadow: none;
+	}
+
+	:global(.dark) .video-preview-placeholder {
+		border: 1px solid color-mix(in oklab, var(--border) 40%, transparent);
+		background: oklch(0 0 0 / 55%);
+	}
+
+	:global(.dark) .preview-eyebrow {
+		color: var(--muted-foreground);
+	}
+
+	:global(.dark) .preview-title {
+		color: color-mix(in oklab, var(--foreground) 90%, transparent);
+	}
+</style>

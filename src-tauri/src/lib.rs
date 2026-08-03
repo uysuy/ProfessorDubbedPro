@@ -1,16 +1,54 @@
+use tauri::Manager;
+
+mod asr_funasr;
+mod export;
+mod transcribe;
+mod translate;
+mod tts;
+
+/// reqwest + msedge-tts both use rustls. If aws-lc-rs and ring are both linked,
+/// rustls 0.23 panics unless a process-level CryptoProvider is installed first.
+fn install_rustls_crypto_provider() {
+	static ONCE: std::sync::Once = std::sync::Once::new();
+	ONCE.call_once(|| {
+		let _ = rustls::crypto::ring::default_provider().install_default();
+	});
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-  tauri::Builder::default()
-    .setup(|app| {
-      if cfg!(debug_assertions) {
-        app.handle().plugin(
-          tauri_plugin_log::Builder::default()
-            .level(log::LevelFilter::Info)
-            .build(),
-        )?;
-      }
-      Ok(())
-    })
-    .run(tauri::generate_context!())
-    .expect("error while running tauri application");
+	install_rustls_crypto_provider();
+
+	tauri::Builder::default()
+		.plugin(tauri_plugin_dialog::init())
+		.plugin(tauri_plugin_fs::init())
+		.invoke_handler(tauri::generate_handler![
+			export::export_project,
+			export::begin_staged_file,
+			export::append_staged_file,
+			export::cleanup_staged_file,
+			tts::synthesize_speech,
+			tts::list_edge_voices,
+			transcribe::transcribe_video,
+			transcribe::cancel_transcription,
+			translate::translate_texts,
+		])
+		.setup(|app| {
+			if cfg!(debug_assertions) {
+				app.handle().plugin(
+					tauri_plugin_log::Builder::default()
+						.level(log::LevelFilter::Info)
+						.build(),
+				)?;
+			}
+
+			// Keep focus on the main window at launch for keyboard navigation.
+			if let Some(window) = app.get_webview_window("main") {
+				let _ = window.set_focus();
+			}
+
+			Ok(())
+		})
+		.run(tauri::generate_context!())
+		.expect("error while running tauri application");
 }

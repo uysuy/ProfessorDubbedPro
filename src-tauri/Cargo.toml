@@ -1,25 +1,30 @@
 [package]
-name = "app"
+name = "professor-dubbed-pro"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
-license = ""
-repository = ""
+description = "ProfessorDubbedPro — professional video dubbing studio"
+authors = ["ProfessorDubbedPro"]
 edition = "2021"
 rust-version = "1.77.2"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [lib]
-name = "app_lib"
+name = "professor_dubbed_pro_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.6.3" }
+tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-tauri = { version = "2.11.3" }
+tauri = { version = "2.11.3", features = ["protocol-asset"] }
 tauri-plugin-log = "2"
+tauri-plugin-dialog = "2.7.2"
+which = "8.0.5"
+tauri-plugin-fs = "2.5.1"
+msedge-tts = "0.4.0"
+uuid = { version = "1", features = ["v4"] }
+# rustls-tls alone can enable both aws-lc-rs and ring → CryptoProvider panic on TTS.
+# Use no-provider + install ring explicitly in lib.rs at startup.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-webpki-roots-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

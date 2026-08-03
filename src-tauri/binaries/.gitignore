@@ -1,0 +1,4 @@
+# Bundled FFmpeg sidecar — keep README, ignore large binaries
+*
+!.gitignore
+!README.md

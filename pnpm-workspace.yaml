@@ -1,3 +1,6 @@
 onlyBuiltDependencies:
   - '@tailwindcss/oxide'
   - esbuild
+
+patchedDependencies:
+  paneforge@1.0.2: patches/paneforge@1.0.2.patch

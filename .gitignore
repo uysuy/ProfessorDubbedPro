@@ -8,6 +8,17 @@ node_modules
 /.svelte-kit
 /build
 
+# Tauri
+src-tauri/target
+src-tauri/gen/schemas
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep
+src-tauri/models/*
+!src-tauri/models/.gitkeep
+
+# FunASR local venv (Python SenseVoice)
+.venv-funasr/
+
 # OS
 .DS_Store
 Thumbs.db
