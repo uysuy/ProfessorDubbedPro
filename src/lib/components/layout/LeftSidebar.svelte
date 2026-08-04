@@ -64,6 +64,14 @@
 		}
 	);
 
+	/** Clear paste-script draft when the open project changes (New / Open). */
+	$effect(() => {
+		const projectId = projectStore.current.id;
+		void projectId;
+		scriptDraft = '';
+		scriptFeedback = null;
+	});
+
 	onMount(() => {
 		fontsLoading = true;
 		void listSystemFonts()
@@ -226,9 +234,6 @@
 						<Type class="size-3.5" />
 						Subtitle style
 					</p>
-					<span class="font-mono text-[10px] text-muted-foreground"
-						>{Math.round(subStyle.fontSizePx)}px</span
-					>
 				</div>
 				<div class="space-y-1">
 					<p class="text-[10px] text-muted-foreground">Font (Windows list)</p>
@@ -285,7 +290,14 @@
 					</div>
 				</div>
 				<div class="space-y-1">
-					<p class="text-[10px] text-muted-foreground">Size</p>
+					<div class="flex items-center justify-between gap-2">
+						<p class="text-[10px] text-muted-foreground">Size</p>
+						<span
+							class="rounded border border-border/60 bg-muted/40 px-1.5 py-0.5 font-mono text-[11px] font-semibold tabular-nums text-foreground"
+							title="Design size at 720p height (preview & burn-in scale together)"
+							>{Math.round(subStyle.fontSizePx)} px</span
+						>
+					</div>
 					<Slider
 						type="single"
 						value={subStyle.fontSizePx}
