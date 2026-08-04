@@ -63,6 +63,48 @@ export interface DubbingTrack {
 	volumeDb: number;
 }
 
+/** On-video / burn-in subtitle look — preview and export must match. */
+export type SubtitleLook = 'box' | 'outline';
+
+export type SubtitleStyle = {
+	/** ASS / CSS font family name, e.g. "Khmer OS", "Noto Sans Khmer". */
+	fontFamily: string;
+	/** Absolute TTF/OTF path when known (export copies into fontsdir). */
+	fontFile?: string | null;
+	/**
+	 * Design font size in px as if the picture were 720px tall.
+	 * Preview and burn-in both scale by pictureHeight / 720.
+	 */
+	fontSizePx: number;
+	/** Anchor X of the subtitle box, 0 = left … 1 = right. */
+	x: number;
+	/** Anchor Y of the subtitle box, 0 = top … 1 = bottom. */
+	y: number;
+	/**
+	 * `outline` = white text + black stroke (like many Chinese burn-ins).
+	 * `box` = translucent background plate behind text.
+	 */
+	look: SubtitleLook;
+	/** Max width of the subtitle block as a fraction of the video frame (0.2–0.98). */
+	maxWidthPct: number;
+	/**
+	 * Black outline thickness in design px (at 720p tall). 0 = none.
+	 * Only applies when `look === 'outline'`.
+	 */
+	outlineWidth: number;
+};
+
+export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
+	fontFamily: 'Noto Sans Khmer',
+	fontFile: null,
+	fontSizePx: 20,
+	x: 0.5,
+	y: 0.84,
+	look: 'outline',
+	maxWidthPct: 0.96,
+	outlineWidth: 1
+};
+
 export interface DubbingProject {
 	id: string;
 	name: string;
@@ -75,6 +117,8 @@ export interface DubbingProject {
 	assets: MediaAsset[];
 	tracks: DubbingTrack[];
 	cues: SubtitleCue[];
+	/** Burn-in / preview subtitle appearance. */
+	subtitleStyle: SubtitleStyle;
 	updatedAt: string;
 }
 

@@ -80,6 +80,7 @@
 				videoFile: projectStore.videoFile,
 				originalAudioGain: projectStore.originalAudioEffectiveGain,
 				dubClips: collectDubClips(),
+				subtitleStyle: projectStore.current.subtitleStyle,
 				onStatus: (msg) => {
 					status = msg;
 				}

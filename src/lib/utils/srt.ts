@@ -17,19 +17,26 @@ function cueText(cue: SubtitleCue): string {
 	return cue.source?.trim() ?? '';
 }
 
+export type CuesToSrtOptions = {
+	/** Transform cue text (e.g. preview-matched soft wrap for burn-in). */
+	mapText?: (text: string, cue: SubtitleCue) => string;
+};
+
 /**
  * Build a UTF-8 SRT document from project cues.
  * Prefers Khmer translation; falls back to source text.
  * End time follows TTS play-through so burn-in doesn’t linger in dead air.
  */
-export function cuesToSrt(cues: SubtitleCue[]): string {
+export function cuesToSrt(cues: SubtitleCue[], opts?: CuesToSrtOptions): string {
 	const sorted = [...cues].sort((a, b) => a.startMs - b.startMs || a.index - b.index);
 	const blocks: string[] = [];
 	let n = 0;
 
 	for (const cue of sorted) {
-		const text = cueText(cue);
+		let text = cueText(cue);
 		if (!text) continue;
+		if (opts?.mapText) text = opts.mapText(text, cue);
+		if (!text.trim()) continue;
 		const start = Math.max(0, Math.round(cue.startMs));
 		const end = Math.max(start + 1, Math.round(cueAudioEndMs(cue)));
 		n += 1;

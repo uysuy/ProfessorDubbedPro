@@ -1,4 +1,5 @@
-import type { DubbingProject, SubtitleCue, VoiceProfile } from '$lib/types/project';
+import type { DubbingProject, SubtitleCue, SubtitleStyle, VoiceProfile } from '$lib/types/project';
+import { DEFAULT_SUBTITLE_STYLE } from '$lib/types/project';
 import { classifyMediaFile } from '$lib/utils/media';
 import { extractWaveformFromFile, extractWaveformFromUrl } from '$lib/utils/audio-waveform';
 import {
@@ -168,20 +169,22 @@ async function extractOriginalAudioFromFile(file: File) {
 			label: file.name
 		};
 		// Prefer media duration from decoded audio when project duration is still a placeholder.
-		// Never shrink below subtitle/TTS content (Khmer often extends past the picture).
+		// Never shrink timeline below subtitle/TTS content (Khmer often extends past the picture),
+		// but keep videoAsset.durationMs as true picture length for Fit-to-dub / overhang.
 		if (result.durationMs > 1000 && Math.abs(result.durationMs - project.durationMs) > 500) {
 			const videoId = project.videoAssetId;
 			let contentFloor = 0;
 			for (const cue of project.cues) {
 				contentFloor = Math.max(contentFloor, cueAudioEndMs(cue), cue.endMs);
 			}
-			const durationMs = Math.max(result.durationMs, contentFloor + 200);
+			const mediaMs = Math.round(result.durationMs);
+			const durationMs = Math.max(mediaMs, contentFloor + 200);
 			project = touch(
 				{
 					...project,
 					durationMs,
 					assets: project.assets.map((a) =>
-						a.id === videoId ? { ...a, durationMs } : a
+						a.id === videoId ? { ...a, durationMs: mediaMs } : a
 					)
 				},
 				{ recordHistory: false }
@@ -233,13 +236,14 @@ async function extractOriginalAudioFromSrc(src: string, label: string) {
 			for (const cue of project.cues) {
 				contentFloor = Math.max(contentFloor, cueAudioEndMs(cue), cue.endMs);
 			}
-			const durationMs = Math.max(result.durationMs, contentFloor + 200);
+			const mediaMs = Math.round(result.durationMs);
+			const durationMs = Math.max(mediaMs, contentFloor + 200);
 			project = touch(
 				{
 					...project,
 					durationMs,
 					assets: project.assets.map((a) =>
-						a.id === videoId ? { ...a, durationMs } : a
+						a.id === videoId ? { ...a, durationMs: mediaMs } : a
 					)
 				},
 				{ recordHistory: false }
@@ -1882,9 +1886,14 @@ export const projectStore = {
 	 * Set timeline length. By default never shrinks below dub content end
 	 * (media metadata reload used to wipe TTS-extended timelines).
 	 * Pass `{ force: true }` after Tempo remaster when media length is authoritative.
+	 *
+	 * `ms` is treated as true picture length for the video asset. The project
+	 * timeline may be longer (content floor); the asset must stay at picture
+	 * length so Fit-to-dub / overhang detection still works.
 	 */
 	setDurationMs(ms: number, opts?: { force?: boolean }) {
-		let durationMs = Math.max(1000, Math.round(ms));
+		const mediaMs = Math.max(1000, Math.round(ms));
+		let durationMs = mediaMs;
 		if (!opts?.force) {
 			durationMs = Math.max(durationMs, this.contentEndMs() + 200);
 		}
@@ -1894,7 +1903,7 @@ export const projectStore = {
 				...project,
 				durationMs,
 				assets: project.assets.map((a) =>
-					a.id === videoId ? { ...a, durationMs } : a
+					a.id === videoId ? { ...a, durationMs: mediaMs } : a
 				)
 			},
 			{ recordHistory: false }
@@ -2104,6 +2113,42 @@ export const projectStore = {
 	toggleOriginalAudioMute() {
 		originalAudioMuted = !originalAudioMuted;
 	},
+
+	/** Update burn-in / preview subtitle look (font, size, position, look). */
+	setSubtitleStyle(patch: Partial<SubtitleStyle>) {
+		const cur = project.subtitleStyle ?? { ...DEFAULT_SUBTITLE_STYLE };
+		const next: SubtitleStyle = {
+			fontFamily:
+				typeof patch.fontFamily === 'string' && patch.fontFamily.trim()
+					? patch.fontFamily.trim()
+					: cur.fontFamily,
+			fontFile:
+				patch.fontFile !== undefined
+					? patch.fontFile
+					: (cur.fontFile ?? null),
+			fontSizePx: Number.isFinite(Number(patch.fontSizePx))
+				? Math.max(12, Math.min(72, Math.round(Number(patch.fontSizePx))))
+				: cur.fontSizePx,
+			x: Number.isFinite(Number(patch.x))
+				? Math.max(0.05, Math.min(0.95, Number(patch.x)))
+				: cur.x,
+			y: Number.isFinite(Number(patch.y))
+				? Math.max(0.03, Math.min(0.97, Number(patch.y)))
+				: cur.y,
+			look:
+				patch.look === 'box' || patch.look === 'outline'
+					? patch.look
+					: (cur.look ?? DEFAULT_SUBTITLE_STYLE.look),
+			maxWidthPct: Number.isFinite(Number(patch.maxWidthPct))
+				? Math.max(0.2, Math.min(0.98, Number(patch.maxWidthPct)))
+				: (cur.maxWidthPct ?? DEFAULT_SUBTITLE_STYLE.maxWidthPct),
+			outlineWidth: Number.isFinite(Number(patch.outlineWidth))
+				? Math.max(0, Math.min(5, Number(patch.outlineWidth)))
+				: (cur.outlineWidth ?? DEFAULT_SUBTITLE_STYLE.outlineWidth)
+		};
+		project = touch({ ...project, subtitleStyle: next });
+	},
+
 	async generateSelected() {
 		// Ensure right-sidebar Prosody is on the cues about to speak.
 		this.applyProsodyToCues({ pitch, speed, volume });

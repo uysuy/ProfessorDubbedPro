@@ -3,6 +3,7 @@
 	import { Progress } from '$lib/components/ui/progress/index.js';
 	import { Separator } from '$lib/components/ui/separator/index.js';
 	import { Slider } from '$lib/components/ui/slider/index.js';
+	import * as Select from '$lib/components/ui/select/index.js';
 	import { projectStore } from '$lib/stores/project.svelte';
 	import { dndStore } from '$lib/stores/dnd.svelte';
 	import { tempoStore } from '$lib/stores/tempo.svelte';
@@ -14,6 +15,7 @@
 		type TranslationQuality
 	} from '$lib/stores/preferences.svelte';
 	import { translateProviderLabel } from '$lib/utils/translate';
+	import { listSystemFonts, type SystemFontInfo } from '$lib/utils/system-fonts';
 	import VideoPreview from '$lib/components/studio/VideoPreview.svelte';
 	import {
 		ClipboardPaste,
@@ -24,8 +26,10 @@
 		PanelLeftClose,
 		Scissors,
 		Subtitles,
+		Type,
 		X
 	} from '@lucide/svelte';
+	import { onMount } from 'svelte';
 
 	const videoTools = [
 		{ id: 'trim', label: 'Trim', icon: Scissors },
@@ -44,6 +48,46 @@
 	let startHeight = 0;
 	let scriptDraft = $state('');
 	let scriptFeedback = $state<string | null>(null);
+	let systemFonts = $state<SystemFontInfo[]>([]);
+	let fontsLoading = $state(false);
+
+	const subStyle = $derived(
+		projectStore.current.subtitleStyle ?? {
+			fontFamily: 'Noto Sans Khmer',
+			fontFile: null,
+			fontSizePx: 20,
+			x: 0.5,
+			y: 0.84,
+			look: 'outline' as const,
+			maxWidthPct: 0.96,
+			outlineWidth: 1
+		}
+	);
+
+	onMount(() => {
+		fontsLoading = true;
+		void listSystemFonts()
+			.then((list) => {
+				systemFonts = list;
+			})
+			.finally(() => {
+				fontsLoading = false;
+			});
+	});
+
+	function pickFont(family: string) {
+		const hit = systemFonts.find((f) => f.family === family);
+		projectStore.setSubtitleStyle({
+			fontFamily: family,
+			fontFile: hit?.path ?? null
+		});
+	}
+
+	function setSubPreset(where: 'top' | 'middle' | 'bottom') {
+		// Bottom = top edge of Khmer under typical CN/EN hardsubs (grows downward).
+		const y = where === 'top' ? 0.08 : where === 'middle' ? 0.5 : 0.84;
+		projectStore.setSubtitleStyle({ x: 0.5, y });
+	}
 
 	const translatorEngine = $derived(translateProviderLabel(translationStore.provider));
 	const qualityLabel = $derived(
@@ -174,6 +218,132 @@
 
 	<div class="min-h-0 flex-1 space-y-4 overflow-auto p-3">
 		<section>
+			<div
+				class="mb-3 space-y-2 rounded-md border border-border/70 bg-card/80 p-2.5 shadow-[var(--elevation-panel)]"
+			>
+				<div class="flex items-center justify-between gap-2">
+					<p class="flex items-center gap-1.5 text-[11px] font-semibold text-foreground">
+						<Type class="size-3.5" />
+						Subtitle style
+					</p>
+					<span class="font-mono text-[10px] text-muted-foreground"
+						>{Math.round(subStyle.fontSizePx)}px</span
+					>
+				</div>
+				<div class="space-y-1">
+					<p class="text-[10px] text-muted-foreground">Font (Windows list)</p>
+					<Select.Root
+						type="single"
+						value={subStyle.fontFamily}
+						onValueChange={(v) => {
+							if (v) pickFont(v);
+						}}
+					>
+						<Select.Trigger class="h-8 w-full text-[12px]" aria-label="Subtitle font">
+							{fontsLoading ? 'Loading fonts…' : subStyle.fontFamily}
+						</Select.Trigger>
+						<Select.Content class="max-h-64">
+							{#if systemFonts.length === 0}
+								<Select.Item value="Noto Sans Khmer" label="Noto Sans Khmer"
+									>Noto Sans Khmer</Select.Item
+								>
+								<Select.Item value="Khmer UI" label="Khmer UI">Khmer UI</Select.Item>
+								<Select.Item value="Khmer OS" label="Khmer OS">Khmer OS</Select.Item>
+							{:else}
+								{#each systemFonts as font}
+									<Select.Item value={font.family} label={font.family}
+										>{font.family}</Select.Item
+									>
+								{/each}
+							{/if}
+						</Select.Content>
+					</Select.Root>
+				</div>
+				<div class="space-y-1">
+					<p class="text-[10px] text-muted-foreground">Look</p>
+					<div class="grid grid-cols-2 gap-1">
+						<button
+							type="button"
+							class="rounded border px-1.5 py-1 text-[10px] transition-colors
+								{subStyle.look === 'outline'
+								? 'border-primary/50 bg-primary/10 text-primary'
+								: 'border-border/60 text-muted-foreground hover:text-foreground'}"
+							onclick={() => projectStore.setSubtitleStyle({ look: 'outline' })}
+						>
+							Outline (no box)
+						</button>
+						<button
+							type="button"
+							class="rounded border px-1.5 py-1 text-[10px] transition-colors
+								{subStyle.look === 'box'
+								? 'border-primary/50 bg-primary/10 text-primary'
+								: 'border-border/60 text-muted-foreground hover:text-foreground'}"
+							onclick={() => projectStore.setSubtitleStyle({ look: 'box' })}
+						>
+							Background box
+						</button>
+					</div>
+				</div>
+				<div class="space-y-1">
+					<p class="text-[10px] text-muted-foreground">Size</p>
+					<Slider
+						type="single"
+						value={subStyle.fontSizePx}
+						min={12}
+						max={72}
+						step={1}
+						onValueChange={(v) => projectStore.setSubtitleStyle({ fontSizePx: v })}
+						aria-label="Subtitle font size"
+					/>
+				</div>
+				{#if subStyle.look === 'outline'}
+					<div class="space-y-1">
+						<div class="flex items-center justify-between gap-2">
+							<p class="text-[10px] text-muted-foreground">Outline thickness</p>
+							<span class="font-mono text-[10px] text-muted-foreground"
+								>{(subStyle.outlineWidth ?? 1).toFixed(1)}</span
+							>
+						</div>
+						<Slider
+							type="single"
+							value={subStyle.outlineWidth ?? 1}
+							min={0}
+							max={4}
+							step={0.25}
+							onValueChange={(v) => projectStore.setSubtitleStyle({ outlineWidth: v })}
+							aria-label="Subtitle outline thickness"
+						/>
+					</div>
+				{/if}
+				<div class="flex flex-wrap gap-1">
+					<button
+						type="button"
+						class="rounded border border-border/60 px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+						onclick={() => setSubPreset('top')}
+					>
+						Top
+					</button>
+					<button
+						type="button"
+						class="rounded border border-border/60 px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+						onclick={() => setSubPreset('middle')}
+					>
+						Middle
+					</button>
+					<button
+						type="button"
+						class="rounded border border-border/60 px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+						onclick={() => setSubPreset('bottom')}
+					>
+						Bottom
+					</button>
+				</div>
+				<p class="text-[10px] leading-snug text-muted-foreground">
+					Bottom places the top of Khmer under the hardsubs — text grows down only.
+					Drag on preview to fine-tune. Export matches this box.
+				</p>
+			</div>
+
 			<p class="mb-2 text-[11px] font-semibold tracking-[0.14em] text-muted-foreground uppercase">
 				Video Tools
 			</p>
@@ -243,14 +413,24 @@
 					{:else if !projectStore.current.cues.length}
 						Generate / load subtitles & TTS first.
 					{:else if fitToDubPlan?.alreadyFits}
-						Dub already fits the video media
+						Video and dub lengths already match
 						{#if tempoStore.mediaDurationMs > 0}
 							<span class="font-mono"> ({formatEstDuration(tempoStore.mediaDurationMs)})</span>
 						{/if}.
 					{:else if fitToDubPlan?.tooExtreme}
-						Dub is too long to stretch (need &lt; 2× video). Shorten Khmer lines.
+						{#if fitToDubPlan.mode === 'shorten'}
+							Video is too long vs dub (need ≤ 2×). Extend Khmer or trim the source.
+						{:else}
+							Dub is too long to stretch (need &lt; 2× video). Shorten Khmer lines.
+						{/if}
+					{:else if fitToDubPlan?.mode === 'shorten'}
+						Speeds picture to match shorter Khmer TTS
+						<span class="font-mono">
+							({formatEstDuration(fitToDubPlan.videoMs)} → {formatEstDuration(fitToDubPlan.contentMs)})</span
+						>
+						— pitch-safe; cue times & TTS stay put.
 					{:else if fitToDubPlan}
-						Stretches picture to cover Khmer TTS
+						Stretches picture to cover longer Khmer TTS
 						<span class="font-mono">
 							({formatEstDuration(fitToDubPlan.videoMs)} → {formatEstDuration(fitToDubPlan.contentMs)})</span
 						>
@@ -329,7 +509,7 @@
 				<p class="text-[10px] leading-snug text-muted-foreground">
 					Manual apply also stretches subtitle times. Prefer
 					<span class="font-medium text-foreground/80"> Fit video to dub </span>
-					when Khmer TTS is already longer than the video.
+					to match picture length to Khmer TTS (stretch or shorten).
 					{#if estimatedDurationMs > 0}
 						<span class="font-mono"> Est. → {formatEstDuration(estimatedDurationMs)}</span>
 					{/if}
@@ -495,7 +675,7 @@
 				></textarea>
 				<p class="text-[10px] leading-snug text-muted-foreground">
 					One line → one cue (timeline order). Extra lines create new cues after the last ASR
-					window. Clears old TTS — Generate, then Fit video to dub if Khmer runs past the picture.
+					window. Clears old TTS — Generate, then Fit video to dub if lengths diverge.
 				</p>
 				<Button
 					size="sm"

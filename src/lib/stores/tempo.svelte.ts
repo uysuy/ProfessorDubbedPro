@@ -50,12 +50,20 @@ function dubContentEndMs(): number {
 	return max;
 }
 
-/** Overhang of dub past true media (ms). Positive ⇒ Fit is useful. */
+/** Overhang of dub past true media (ms). Positive ⇒ stretch Fit is useful. */
 function dubOverhangMs(): number {
 	const videoMs = videoDurationMs();
 	const contentMs = dubContentEndMs();
 	if (videoMs < 500 || contentMs < 500) return 0;
 	return Math.max(0, contentMs - videoMs);
+}
+
+/** How much the picture outlasts the dub (ms). Positive ⇒ shorten Fit is useful. */
+function videoUnderhangMs(): number {
+	const videoMs = videoDurationMs();
+	const contentMs = dubContentEndMs();
+	if (videoMs < 500 || contentMs < 500) return 0;
+	return Math.max(0, videoMs - contentMs);
 }
 
 export const tempoStore = {
@@ -90,6 +98,10 @@ export const tempoStore = {
 		return dubOverhangMs();
 	},
 
+	get videoUnderhangMs() {
+		return videoUnderhangMs();
+	},
+
 	/** True media length used for fit math (waveform / asset). */
 	get mediaDurationMs() {
 		return videoDurationMs();
@@ -102,8 +114,8 @@ export const tempoStore = {
 	setTempoFactor(v: number) {
 		const n = Number(v);
 		if (!Number.isFinite(n)) return;
-		// Allow down to 0.5× for fit-to-dub (FFmpeg atempo floor).
-		tempoFactor = Math.round(Math.min(1, Math.max(0.5, n)) * 1000) / 1000;
+		// Manual slider is slowdown-only; fit-to-dub may set up to 2.0×.
+		tempoFactor = Math.round(Math.min(2, Math.max(0.5, n)) * 1000) / 1000;
 	},
 
 	async cancel() {
@@ -127,7 +139,7 @@ export const tempoStore = {
 			return false;
 		}
 		if (Math.abs(tempoFactor - 1) < 0.001) {
-			error = 'Tempo is 1.00× — nothing to remaster. Pick a slower factor (e.g. 0.92).';
+			error = 'Tempo is 1.00× — nothing to remaster. Pick a different factor.';
 			dndStore.flash(error);
 			return false;
 		}
@@ -178,8 +190,9 @@ export const tempoStore = {
 	},
 
 	/**
-	 * Stretch video to cover the current subtitle/TTS timeline (pitch-safe).
-	 * Keeps cue times and TTS clips — does not chipmunk the Khmer voice.
+	 * Match video length to the subtitle/TTS timeline (pitch-safe).
+	 * Stretches when dub is longer; shortens when the picture outlasts the dub.
+	 * Keeps cue times and TTS clips.
 	 */
 	async fitToDub(): Promise<boolean> {
 		if (isRemastering) return false;
@@ -196,13 +209,15 @@ export const tempoStore = {
 
 		if (plan.alreadyFits) {
 			error = null;
-			message = 'Dub already fits inside the video — nothing to remaster.';
+			message = 'Video and dub lengths already match — nothing to remaster.';
 			dndStore.flash(message);
 			return false;
 		}
 		if (plan.tooExtreme) {
 			error =
-				'Dub is more than 2× the video length. Shorten Khmer lines, then try again (min 0.50×).';
+				plan.mode === 'shorten'
+					? 'Video is more than 2× the dub length. Trim the source or extend Khmer lines (max 2.00×).'
+					: 'Dub is more than 2× the video length. Shorten Khmer lines, then try again (min 0.50×).';
 			dndStore.flash(error);
 			return false;
 		}

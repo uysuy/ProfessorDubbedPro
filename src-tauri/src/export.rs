@@ -36,6 +36,72 @@ fn default_clip_volume() -> f64 {
 	0.8
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSubtitleStyle {
+	/// ASS / CSS font family.
+	#[serde(default = "default_font_family")]
+	pub font_family: String,
+	/// Absolute path to TTF/OTF when known.
+	#[serde(default)]
+	pub font_file: Option<String>,
+	/// Design font size in px as if picture were 720px tall.
+	#[serde(default = "default_font_size_px")]
+	pub font_size_px: f64,
+	/// Anchor X 0–1.
+	#[serde(default = "default_style_x")]
+	pub x: f64,
+	/// Anchor Y 0–1.
+	#[serde(default = "default_style_y")]
+	pub y: f64,
+	/// `outline` | `box`
+	#[serde(default = "default_look")]
+	pub look: String,
+	/// Max text width as fraction of frame width.
+	#[serde(default = "default_max_width_pct")]
+	pub max_width_pct: f64,
+	/// Black outline thickness in design px (at 720p tall).
+	#[serde(default = "default_outline_width")]
+	pub outline_width: f64,
+}
+
+fn default_font_family() -> String {
+	"Noto Sans Khmer".into()
+}
+fn default_font_size_px() -> f64 {
+	20.0
+}
+fn default_style_x() -> f64 {
+	0.5
+}
+fn default_style_y() -> f64 {
+	0.84
+}
+fn default_look() -> String {
+	"outline".into()
+}
+fn default_max_width_pct() -> f64 {
+	0.96
+}
+fn default_outline_width() -> f64 {
+	1.0
+}
+
+impl Default for ExportSubtitleStyle {
+	fn default() -> Self {
+		Self {
+			font_family: default_font_family(),
+			font_file: None,
+			font_size_px: default_font_size_px(),
+			x: default_style_x(),
+			y: default_style_y(),
+			look: default_look(),
+			max_width_pct: default_max_width_pct(),
+			outline_width: default_outline_width(),
+		}
+	}
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportProjectArgs {
@@ -52,6 +118,9 @@ pub struct ExportProjectArgs {
 	/// Generated TTS clips to mix onto the timeline (optional).
 	#[serde(default)]
 	pub dub_clips: Option<Vec<ExportDubClip>>,
+	/// Preview-matched burn-in look (font / size / position).
+	#[serde(default)]
+	pub subtitle_style: Option<ExportSubtitleStyle>,
 }
 
 #[derive(Debug, Serialize)]
@@ -401,13 +470,229 @@ fn probe_video_size(ffmpeg: &Path, video: &Path) -> (u32, u32) {
 	(1280, 720)
 }
 
-/// Escape ASS dialogue text (keep Khmer grapheme clusters intact — no mid-syllable wraps).
+/// Escape ASS dialogue text (keep Khmer grapheme clusters intact).
 fn escape_ass_text(text: &str) -> String {
 	text.replace('\\', r"\\")
 		.replace('{', r"\{")
 		.replace('}', r"\}")
 		.replace('\r', "")
 		.replace('\n', r"\N")
+}
+
+fn is_khmer_base(c: char) -> bool {
+	let u = c as u32;
+	(0x1780..=0x17B3).contains(&u)
+}
+
+fn is_khmer_coeng(c: char) -> bool {
+	c == '\u{17D2}'
+}
+
+/// Dependent vowels, signs, and other marks that must stay with the syllable.
+fn is_khmer_mark(c: char) -> bool {
+	let u = c as u32;
+	(0x17B4..=0x17D1).contains(&u)
+		|| (0x17D3..=0x17DD).contains(&u)
+		|| c == '\u{200C}'
+		|| c == '\u{200D}'
+}
+
+/// Visual column weight for wrapping. Marks / coeng are 0; bases count as 1.
+fn wrap_column_weight(c: char) -> usize {
+	let u = c as u32;
+	if is_khmer_base(c) {
+		return 1;
+	}
+	if is_khmer_coeng(c) || is_khmer_mark(c) {
+		return 0;
+	}
+	if c.is_ascii_alphanumeric() || c.is_whitespace() {
+		return 1;
+	}
+	if (0x4E00..=0x9FFF).contains(&u) {
+		return 1;
+	}
+	if (0x0300..=0x036F).contains(&u) {
+		return 0;
+	}
+	1
+}
+
+fn unit_column_weight(unit: &str) -> usize {
+	unit.chars().map(wrap_column_weight).sum::<usize>().max(if unit.is_empty() { 0 } else { 1 })
+}
+
+/// Split into unbreakable wrap units (Khmer phonetic syllables stay whole).
+///
+/// Includes an optional final consonant (coda): e.g. ទាំង stays one unit, not ទាំ|ង.
+fn wrap_units(text: &str) -> Vec<String> {
+	let chars: Vec<char> = text.chars().collect();
+	let mut units: Vec<String> = Vec::new();
+	let mut i = 0usize;
+	while i < chars.len() {
+		let c = chars[i];
+
+		// Spaces / ASCII punctuation: break opportunity after.
+		if c.is_whitespace() {
+			units.push(c.to_string());
+			i += 1;
+			continue;
+		}
+
+		// Khmer phonetic syllable:
+		//   base (+ coeng + base)* + marks* + optional coda consonant
+		// Coda = following base that is NOT itself followed by coeng or marks
+		// (those start the next syllable, e.g. យ in យ៉ាង).
+		if is_khmer_base(c) {
+			let start = i;
+			i += 1;
+			loop {
+				if i < chars.len() && is_khmer_coeng(chars[i]) {
+					i += 1;
+					if i < chars.len() && is_khmer_base(chars[i]) {
+						i += 1;
+					}
+					continue;
+				}
+				if i < chars.len() && is_khmer_mark(chars[i]) {
+					i += 1;
+					continue;
+				}
+				break;
+			}
+			// Optional final consonant (coda) — keeps ទាំង / អ្នក intact.
+			if i < chars.len() && is_khmer_base(chars[i]) {
+				let after = chars.get(i + 1).copied();
+				let starts_next_syllable = after
+					.map(|n| is_khmer_coeng(n) || is_khmer_mark(n))
+					.unwrap_or(false);
+				if !starts_next_syllable {
+					i += 1;
+				}
+			}
+			units.push(chars[start..i].iter().collect());
+			continue;
+		}
+
+		// Orphan coeng + following base (malformed but keep together)
+		if is_khmer_coeng(c) {
+			let start = i;
+			i += 1;
+			if i < chars.len() && is_khmer_base(chars[i]) {
+				i += 1;
+				while i < chars.len() && is_khmer_mark(chars[i]) {
+					i += 1;
+				}
+				if i < chars.len() && is_khmer_base(chars[i]) {
+					let after = chars.get(i + 1).copied();
+					let starts_next_syllable = after
+						.map(|n| is_khmer_coeng(n) || is_khmer_mark(n))
+						.unwrap_or(false);
+					if !starts_next_syllable {
+						i += 1;
+					}
+				}
+			}
+			units.push(chars[start..i].iter().collect());
+			continue;
+		}
+
+		// Standalone mark — glue to previous unit when possible
+		if is_khmer_mark(c) || wrap_column_weight(c) == 0 {
+			if let Some(prev) = units.last_mut() {
+				prev.push(c);
+			} else {
+				units.push(c.to_string());
+			}
+			i += 1;
+			continue;
+		}
+
+		// Latin / other: keep runs of non-space together
+		let start = i;
+		i += 1;
+		while i < chars.len() {
+			let n = chars[i];
+			if n.is_whitespace() || is_khmer_base(n) || is_khmer_coeng(n) {
+				break;
+			}
+			if wrap_column_weight(n) == 0 {
+				i += 1;
+				continue;
+			}
+			if n.is_ascii_alphanumeric() && chars[start].is_ascii_alphanumeric() {
+				i += 1;
+				continue;
+			}
+			if n.is_ascii_alphanumeric() {
+				break;
+			}
+			i += 1;
+		}
+		units.push(chars[start..i].iter().collect());
+	}
+	merge_sticky_onsets(units)
+}
+
+/// Glue a lone consonant onto the next Khmer cluster (ប + ន្តិច → បន្តិច).
+fn merge_sticky_onsets(units: Vec<String>) -> Vec<String> {
+	let mut out: Vec<String> = Vec::new();
+	let mut i = 0usize;
+	while i < units.len() {
+		let u = &units[i];
+		let bare = {
+			let mut ch = u.chars();
+			matches!(ch.next(), Some(c) if is_khmer_base(c)) && ch.next().is_none()
+		};
+		if bare {
+			if let Some(next) = units.get(i + 1) {
+				if next.chars().next().map(is_khmer_base).unwrap_or(false) {
+					out.push(format!("{u}{next}"));
+					i += 2;
+					continue;
+				}
+			}
+		}
+		out.push(u.clone());
+		i += 1;
+	}
+	out
+}
+
+/// Soft-wrap to preview box width without splitting Khmer syllables.
+fn soft_wrap_to_width(text: &str, max_cols: usize) -> String {
+	let max_cols = max_cols.max(6);
+	let mut out: Vec<String> = Vec::new();
+	for paragraph in text.split('\n') {
+		let paragraph = paragraph.trim_end();
+		if paragraph.is_empty() {
+			continue;
+		}
+		let mut line = String::new();
+		let mut cols = 0usize;
+		for unit in wrap_units(paragraph) {
+			let w = unit_column_weight(&unit);
+			let is_space = unit.chars().all(|c| c.is_whitespace());
+			if !is_space && cols + w > max_cols && !line.is_empty() {
+				// Drop trailing spaces on the finished line
+				out.push(line.trim_end().to_string());
+				line.clear();
+				cols = 0;
+			}
+			if is_space && line.is_empty() {
+				continue; // no leading spaces on a wrapped line
+			}
+			line.push_str(&unit);
+			cols += w;
+		}
+		if !line.is_empty() {
+			out.push(line.trim_end().to_string());
+		}
+	}
+	if out.is_empty() {
+		return String::new();
+	}
+	out.join("\n")
 }
 
 fn srt_time_to_ass(ts: &str) -> Option<String> {
@@ -432,22 +717,142 @@ fn srt_time_to_ass(ts: &str) -> Option<String> {
 	Some(format!("{h}:{m:02}:{s:02}.{cs:02}"))
 }
 
-/// Convert SRT → ASS styled like the in-app preview (Noto + translucent box).
+/// Prepare fontsdir: prefer the user's selected font file, else resolve by family,
+/// else bundled Noto. Returns `(fonts_dir, ASS Fontname)` matching a file in fontsdir.
+fn prepare_subtitle_fonts_dir(
+	app: &AppHandle,
+	work_dir: &Path,
+	style: &ExportSubtitleStyle,
+) -> Result<(PathBuf, String), String> {
+	// Always stage bundled/system Khmer as fallback so shaping never dies.
+	let (fonts, noto_family) = prepare_khmer_fonts_dir(app, work_dir)?;
+
+	let requested = style.font_family.trim();
+	let requested = if requested.is_empty() {
+		"Noto Sans Khmer"
+	} else {
+		requested
+	};
+
+	let mut user_src: Option<PathBuf> = None;
+	if let Some(file) = style
+		.font_file
+		.as_ref()
+		.map(|s| s.trim())
+		.filter(|s| !s.is_empty())
+	{
+		let p = PathBuf::from(file);
+		if p.is_file() {
+			user_src = Some(p);
+		}
+	}
+	if user_src.is_none() {
+		user_src = crate::fonts::find_system_font_path(requested);
+	}
+
+	if let Some(src) = user_src {
+		let ext = src
+			.extension()
+			.and_then(|e| e.to_str())
+			.map(|e| e.to_ascii_lowercase())
+			.unwrap_or_default();
+		if matches!(ext.as_str(), "ttf" | "otf") {
+			let dest_name = src
+				.file_name()
+				.and_then(|s| s.to_str())
+				.unwrap_or("user-font.ttf");
+			let dest = fonts.join(dest_name);
+			let _ = fs::copy(&src, &dest);
+			if dest.is_file() {
+				// ASS Fontname must match the font's real name table, not the picker label.
+				let family = crate::fonts::read_font_family_name(&dest)
+					.or_else(|| crate::fonts::read_font_family_name(&src))
+					.unwrap_or_else(|| requested.to_string());
+				return Ok((fonts, family));
+			}
+		}
+	}
+
+	Ok((fonts, noto_family))
+}
+
+/// Convert SRT → ASS matching preview width / size / position.
 fn srt_to_preview_ass(
 	srt: &str,
-	font_family: &str,
-	play_res_x: u32,
-	play_res_y: u32,
+	style: &ExportSubtitleStyle,
+	video_w: u32,
+	video_h: u32,
 ) -> String {
-	let family = font_family.replace(',', "");
-	// Match preview: readable Khmer without dominating a 576-wide frame.
-	let fontsize = ((play_res_y as f64) / 42.0).round().clamp(15.0, 22.0) as u32;
-	let margin_v = ((play_res_y as f64) * 0.055).round().clamp(28.0, 64.0) as u32;
-	let margin_h = ((play_res_x as f64) * 0.05).round().clamp(18.0, 48.0) as u32;
-	// BorderStyle=3 opaque box; Outline ≈ padding. Alpha 0x64 ≈ 39% transparent black.
-	let style = format!(
-		"Style: Default,{family},{fontsize},&H00FFFFFF,&H000000FF,&H64000000,&H00000000,0,0,0,0,100,100,0,0,3,10,0,2,{margin_h},{margin_h},{margin_v},1"
-	);
+	let family = style.font_family.replace(',', "").trim().to_string();
+	let family = if family.is_empty() {
+		"Noto Sans Khmer".to_string()
+	} else {
+		family
+	};
+
+	let play_res_x = video_w.max(16);
+	let play_res_y = video_h.max(16);
+	let scale = (play_res_y as f64) / 720.0;
+
+	let size_px = if style.font_size_px.is_finite() {
+		style.font_size_px.clamp(12.0, 72.0)
+	} else {
+		20.0
+	};
+	let fontsize = (size_px * scale).round().clamp(12.0, 160.0) as u32;
+
+	let x = if style.x.is_finite() {
+		style.x.clamp(0.05, 0.95)
+	} else {
+		0.5
+	};
+	let y = if style.y.is_finite() {
+		style.y.clamp(0.05, 0.97)
+	} else {
+		0.88
+	};
+	// Lower third: TOP of Khmer pinned (grows down under CN/EN hardsubs).
+	// Always use \pos — MarginV-only placement drifted from the preview pin.
+	let (an, y_use) = if y >= 0.55 {
+		(8u32, y.clamp(0.55, 0.96))
+	} else if y <= 0.45 {
+		(8u32, y.clamp(0.03, 0.45))
+	} else {
+		(5u32, y)
+	};
+
+	let max_w = if style.max_width_pct.is_finite() {
+		style.max_width_pct.clamp(0.2, 0.98)
+	} else {
+		0.96
+	};
+	// Preview box width → ASS margins (libass wraps with real glyph advances).
+	let side_margin = (((1.0 - max_w) * 0.5) * play_res_x as f64)
+		.round()
+		.clamp(0.0, play_res_x as f64 * 0.4) as i64;
+
+	let outline = if style.outline_width.is_finite() {
+		style.outline_width.clamp(0.0, 4.0)
+	} else {
+		1.0
+	};
+	let outline = (outline * scale)
+		.min((fontsize as f64) * 0.06)
+		.clamp(0.0, 12.0);
+
+	let look = style.look.trim().to_ascii_lowercase();
+	let pos_x = ((x * play_res_x as f64).round() as i64).clamp(0, play_res_x as i64);
+	let pos_y = ((y_use * play_res_y as f64).round() as i64).clamp(0, play_res_y as i64);
+
+	let style_line = if look == "box" {
+		format!(
+			"Style: Default,{family},{fontsize},&H00FFFFFF,&H000000FF,&H64000000,&H00000000,0,0,0,0,100,100,0,0,3,0,0,{an},{side_margin},{side_margin},0,1"
+		)
+	} else {
+		format!(
+			"Style: Default,{family},{fontsize},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,{outline:.2},0,{an},{side_margin},{side_margin},0,1"
+		)
+	};
 
 	let mut events = String::new();
 	let normalized = srt.replace("\r\n", "\n");
@@ -460,7 +865,6 @@ fn srt_to_preview_ass(
 		if lines.len() < 3 {
 			continue;
 		}
-		// lines[0]=index, lines[1]=times, rest=text
 		let time_line = lines[1];
 		let Some((start_raw, end_raw)) = time_line.split_once("-->") else {
 			continue;
@@ -471,11 +875,34 @@ fn srt_to_preview_ass(
 		let Some(end) = srt_time_to_ass(end_raw.trim()) else {
 			continue;
 		};
-		let text = escape_ass_text(&lines[2..].join("\n"));
+		let raw = lines[2..].join("\n");
+		if raw.trim().is_empty() {
+			continue;
+		}
+		// Frontend burn-in path pre-wraps with the same font metrics as the preview
+		// and inserts hard newlines. Re-wrapping here would break syllables differently.
+		// Fall back to column wrap only when the cue is still a single line.
+		let wrapped = if raw.contains('\n') {
+			raw.lines()
+				.map(|l| l.trim_end())
+				.filter(|l| !l.is_empty())
+				.collect::<Vec<_>>()
+				.join("\n")
+		} else {
+			const CHAR_EM: f64 = 0.55;
+			let max_cols = ((max_w * play_res_x as f64) / (fontsize as f64 * CHAR_EM))
+				.floor()
+				.clamp(8.0, 220.0) as usize;
+			soft_wrap_to_width(&raw, max_cols)
+		};
+		let text = escape_ass_text(&wrapped);
 		if text.is_empty() {
 			continue;
 		}
-		events.push_str(&format!("Dialogue: 0,{start},{end},Default,,0,0,0,,{text}\n"));
+		// Explicit pin + pre-wrapped lines (\q2 = no further auto-wrap).
+		events.push_str(&format!(
+			"Dialogue: 0,{start},{end},Default,,0,0,0,,{{\\an{an}\\pos({pos_x},{pos_y})\\q2}}{text}\n"
+		));
 	}
 
 	format!(
@@ -489,7 +916,7 @@ PlayResY: {play_res_y}\n\
 \n\
 [V4+ Styles]\n\
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
-{style}\n\
+{style_line}\n\
 \n\
 [Events]\n\
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
@@ -497,36 +924,43 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\
 	)
 }
 
-/// libass burn-in filter using ASS (preview-matched box + Noto shaping).
-fn burn_in_ass_filter(ass_name: &str, fonts_dir: &Path) -> String {
-	let fonts_rel = fonts_dir
-		.file_name()
-		.and_then(|s| s.to_str())
-		.unwrap_or("fonts");
-	// `ass` filter uses libass with full shaping; fontsdir must be relative to cwd.
-	format!("ass={ass_name}:fontsdir={fonts_rel}")
+/// Escape a filesystem path for an FFmpeg filtergraph option value.
+fn ffmpeg_filter_path(path: &Path) -> String {
+	path.to_string_lossy()
+		.replace('\\', "/")
+		.replace(':', "\\:")
+		.replace('\'', "\\'")
+		.replace('[', "\\[")
+		.replace(']', "\\]")
 }
 
-/// Write preview-styled ASS next to the temp SRT; returns (fonts_dir, ass_filename).
+/// libass burn-in filter — absolute fontsdir is required on Windows or Khmer
+/// falls back to a Latin font and shaping breaks (preview still looks fine).
+fn burn_in_ass_filter(ass_path: &Path, fonts_dir: &Path) -> String {
+	let ass = ffmpeg_filter_path(ass_path);
+	let fonts = ffmpeg_filter_path(fonts_dir);
+	format!("ass='{ass}':fontsdir='{fonts}'")
+}
+
+/// Write preview-styled ASS next to the temp SRT; returns (fonts_dir, ass_path).
 fn write_burn_in_ass(
 	app: &AppHandle,
 	ffmpeg: &Path,
 	video_path: &Path,
 	srt_path: &Path,
 	srt_dir: &Path,
-) -> Result<(PathBuf, String), String> {
+	style: &ExportSubtitleStyle,
+) -> Result<(PathBuf, PathBuf), String> {
 	let srt = fs::read_to_string(srt_path).map_err(|e| format!("Could not read SRT: {e}"))?;
-	let (fonts_dir, font_family) = prepare_khmer_fonts_dir(app, srt_dir)?;
+	let (fonts_dir, family) = prepare_subtitle_fonts_dir(app, srt_dir, style)?;
+	// Fontname MUST match the file actually in fontsdir (not the picker label alone).
+	let mut style = style.clone();
+	style.font_family = family;
 	let (w, h) = probe_video_size(ffmpeg, video_path);
-	let ass = srt_to_preview_ass(&srt, &font_family, w, h);
+	let ass = srt_to_preview_ass(&srt, &style, w, h);
 	let ass_path = srt_dir.join("burnin.ass");
 	write_utf8_file(&ass_path, &ass)?;
-	let ass_name = ass_path
-		.file_name()
-		.and_then(|s| s.to_str())
-		.unwrap_or("burnin.ass")
-		.to_string();
-	Ok((fonts_dir, ass_name))
+	Ok((fonts_dir, ass_path))
 }
 
 /// Burn SRT into the picture (always visible — matches studio preview).
@@ -535,6 +969,7 @@ fn burn_in_subtitles(
 	video_path: &Path,
 	srt_path: &Path,
 	output_path: &Path,
+	style: &ExportSubtitleStyle,
 ) -> Result<(), String> {
 	let ffmpeg = find_ffmpeg(app)?;
 	ensure_parent_dir(output_path)?;
@@ -545,8 +980,9 @@ fn burn_in_subtitles(
 		.map(|p| p.to_path_buf())
 		.unwrap_or_else(|| PathBuf::from("."));
 
-	let (fonts_dir, ass_name) = write_burn_in_ass(app, &ffmpeg, video_path, srt_path, &srt_dir)?;
-	let vf = burn_in_ass_filter(&ass_name, &fonts_dir);
+	let (fonts_dir, ass_path) =
+		write_burn_in_ass(app, &ffmpeg, video_path, srt_path, &srt_dir, style)?;
+	let vf = burn_in_ass_filter(&ass_path, &fonts_dir);
 
 	let status = Command::new(&ffmpeg)
 		.current_dir(&srt_dir)
@@ -612,6 +1048,7 @@ fn export_video_with_audio_mix(
 	output_path: &Path,
 	original_gain: f64,
 	clips: &[ExportDubClip],
+	style: &ExportSubtitleStyle,
 ) -> Result<(), String> {
 	let ffmpeg = find_ffmpeg(app)?;
 	ensure_parent_dir(output_path)?;
@@ -676,11 +1113,12 @@ fn export_video_with_audio_mix(
 		"{mix_inputs}amix=inputs={n}:duration=longest:dropout_transition=2:normalize=0[aout]"
 	));
 
-	let (fonts_dir, ass_name) = write_burn_in_ass(app, &ffmpeg, video_path, srt_path, &srt_dir)?;
+	let (fonts_dir, ass_path) =
+		write_burn_in_ass(app, &ffmpeg, video_path, srt_path, &srt_dir, style)?;
 
 	match mode {
 		ExportMode::VideoBurnedIn => {
-			let sub = burn_in_ass_filter(&ass_name, &fonts_dir);
+			let sub = burn_in_ass_filter(&ass_path, &fonts_dir);
 			let vchain = if pad_sec > 0.05 {
 				format!("[0:v]{sub},tpad=stop_mode=clone:stop_duration={pad_sec:.3}[vout]")
 			} else {
@@ -736,8 +1174,6 @@ fn export_video_with_audio_mix(
 				"veryfast",
 				"-crf",
 				"20",
-				"-pix_fmt",
-				"yuv420p",
 				"-c:a",
 				"aac",
 				"-b:a",
@@ -746,16 +1182,12 @@ fn export_video_with_audio_mix(
 				"mov_text",
 				"-metadata:s:s:0",
 				"language=khm",
-				"-metadata:s:s:0",
-				"title=Khmer",
-				"-disposition:s:0",
-				"default",
 				"-movflags",
 				"+faststart",
 				&ffmpeg_path_arg(output_path),
 			]);
 		}
-		ExportMode::Srt => return Err("Internal: SRT mode has no audio mix.".into()),
+		ExportMode::Srt => return Err("Internal: SRT mode in video mix.".into()),
 	}
 
 	let status = cmd
@@ -776,6 +1208,7 @@ fn export_video_with_audio_mix(
 			output_path,
 			original_gain,
 			clips,
+			style,
 		);
 	}
 	Err(err)
@@ -790,6 +1223,7 @@ fn export_video_with_audio_mix_legacy(
 	output_path: &Path,
 	original_gain: f64,
 	clips: &[ExportDubClip],
+	style: &ExportSubtitleStyle,
 ) -> Result<(), String> {
 	// Re-enter with filters that use classic adelay=ms|ms only by temporarily
 	// rewriting clip filters via a local helper path: call the same structure
@@ -840,10 +1274,11 @@ fn export_video_with_audio_mix_legacy(
 		mix_labels.len()
 	));
 
-	let (fonts_dir, ass_name) = write_burn_in_ass(app, &ffmpeg, video_path, srt_path, &srt_dir)?;
+	let (fonts_dir, ass_path) =
+		write_burn_in_ass(app, &ffmpeg, video_path, srt_path, &srt_dir, style)?;
 	match mode {
 		ExportMode::VideoBurnedIn => {
-			let sub = burn_in_ass_filter(&ass_name, &fonts_dir);
+			let sub = burn_in_ass_filter(&ass_path, &fonts_dir);
 			let vchain = if pad_sec > 0.05 {
 				format!("[0:v]{sub},tpad=stop_mode=clone:stop_duration={pad_sec:.3}[vout]")
 			} else {
@@ -932,6 +1367,7 @@ fn export_video_gain_only(
 	srt_path: &Path,
 	output_path: &Path,
 	original_gain: f64,
+	style: &ExportSubtitleStyle,
 ) -> Result<(), String> {
 	let ffmpeg = find_ffmpeg(app)?;
 	ensure_parent_dir(output_path)?;
@@ -954,9 +1390,9 @@ fn export_video_gain_only(
 
 	match mode {
 		ExportMode::VideoBurnedIn => {
-			let (fonts_dir, ass_name) =
-				write_burn_in_ass(app, &ffmpeg, video_path, srt_path, &srt_dir)?;
-			let vf = burn_in_ass_filter(&ass_name, &fonts_dir);
+			let (fonts_dir, ass_path) =
+				write_burn_in_ass(app, &ffmpeg, video_path, srt_path, &srt_dir, style)?;
+			let vf = burn_in_ass_filter(&ass_path, &fonts_dir);
 			cmd.args([
 				"-vf",
 				&vf,
@@ -1126,12 +1562,14 @@ pub fn export_project(app: AppHandle, args: ExportProjectArgs) -> Result<ExportP
 			));
 			write_utf8_file(&srt_tmp, &args.srt_content)?;
 
+			let style = args.subtitle_style.clone().unwrap_or_default();
+
 			let result = if needs_audio_remix(gain, &clips) {
 				if clips.is_empty() {
-					export_video_gain_only(&app, &args.mode, &video, &srt_tmp, &output, gain)
+					export_video_gain_only(&app, &args.mode, &video, &srt_tmp, &output, gain, &style)
 				} else {
 					export_video_with_audio_mix(
-						&app, &args.mode, &video, &srt_tmp, &output, gain, &clips,
+						&app, &args.mode, &video, &srt_tmp, &output, gain, &clips, &style,
 					)
 				}
 				.map(|_| match args.mode {
@@ -1150,7 +1588,8 @@ pub fn export_project(app: AppHandle, args: ExportProjectArgs) -> Result<ExportP
 						mux.map(|_| "videoSoftSubs")
 					}
 					ExportMode::VideoBurnedIn => {
-						burn_in_subtitles(&app, &video, &srt_tmp, &output).map(|_| "videoBurnedIn")
+						burn_in_subtitles(&app, &video, &srt_tmp, &output, &style)
+							.map(|_| "videoBurnedIn")
 					}
 					ExportMode::Srt => unreachable!(),
 				}
@@ -1170,5 +1609,50 @@ pub fn export_project(app: AppHandle, args: ExportProjectArgs) -> Result<ExportP
 				mode: mode.into(),
 			})
 		}
+	}
+}
+
+#[cfg(test)]
+mod khmer_wrap_tests {
+	use super::{soft_wrap_to_width, wrap_units};
+
+	#[test]
+	fn teang_stays_one_unit() {
+		// ទាំង must not split before final ង
+		let units = wrap_units("ទាំង");
+		assert_eq!(units, vec!["ទាំង".to_string()]);
+	}
+
+	#[test]
+	fn teang_not_split_across_lines() {
+		let text = "អ្នកលក់ដែលពូកែនៅទូទាំងពិភពលោកមានលក្ខណៈពិសេសជារួមទាំងប្រាំយ៉ាង";
+		// Force a wrap somewhere in the middle — no unit boundary may fall inside ទាំង
+		for cols in 8..40 {
+			let wrapped = soft_wrap_to_width(text, cols);
+			assert!(
+				!wrapped.contains("ទាំ\nង") && !wrapped.contains("ទាំ\\Nង"),
+				"split ទាំង at max_cols={cols}: {wrapped:?}"
+			);
+			assert!(
+				wrapped.replace('\n', "").contains("ទាំង"),
+				"ទាំង missing after wrap at {cols}: {wrapped:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn next_syllable_with_marks_still_splits() {
+		// ប្រាំ | យ៉ាង — យ is followed by mark ៉, so it starts a new syllable
+		let units = wrap_units("ប្រាំយ៉ាង");
+		assert!(units.len() >= 2, "{units:?}");
+		assert_eq!(units[0], "ប្រាំ");
+		assert!(units[1].starts_with('យ'), "{units:?}");
+	}
+
+	#[test]
+	fn bantec_stays_one_unit() {
+		// បន្តិច must not split as ប|ន្តិច
+		let units = wrap_units("បន្តិច");
+		assert_eq!(units, vec!["បន្តិច".to_string()], "{units:?}");
 	}
 }

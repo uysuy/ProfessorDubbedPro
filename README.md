@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square" alt="MIT" /></a>
-  <img src="https://img.shields.io/badge/version-0.2.0-3b82f6?style=flat-square" alt="v0.2.0" />
+  <img src="https://img.shields.io/badge/version-0.2.1-3b82f6?style=flat-square" alt="v0.2.1" />
   <img src="https://img.shields.io/badge/free%20for%20everyone-0ea5e9?style=flat-square" alt="Free" />
   <img src="https://img.shields.io/badge/platform-Windows-64748b?style=flat-square" alt="Windows" />
   <img src="https://img.shields.io/badge/Tauri%202%20%2B%20SvelteKit-38bdf8?style=flat-square" alt="Stack" />
@@ -70,17 +70,24 @@ Real app UI — works on GitHub.com and the GitHub mobile app (images scale to y
 - **Paste Khmer script** — one line per cue; extra lines create new cues (skips auto-translate)
 - **Generate TTS** — Edge Read Aloud Khmer voices; natural pace (no chipmunk lip-sync)
 - **Tighten silent gaps** — packs TTS back-to-back (~0.1s breath); drops long Chinese ASR dead air
-- **Tempo / Fit video to dub** — pitch-safe slowdown; stretch picture to cover longer Khmer speech
+- **Tempo / Fit video to dub** — pitch-safe stretch or shorten so picture length matches Khmer TTS
 - **Original Audio mixer** — mute / volume fader on the timeline (preview + export mix)
 - **Studio** — timeline, preview, subtitle table, project save
-- **Export** — `.srt`, soft-sub video, or burn-in with **Noto Sans Khmer** (preview-matched box + shaping) and TTS + original mix
+- **Export** — `.srt`, soft-sub video, or burn-in with system/Khmer fonts (preview-matched wrap + position) and TTS + original mix
 
-> **v0.2** — Dubbed audio mix export, tempo fit, gap packing, and Khmer burn-in quality.  
+> **v0.2.1** — Preview-matched Khmer burn-in wrap, subtitle styling, and Fit video to dub in both directions.  
 > See [Changelog](#changelog).
 
 ---
 
 ## Changelog
+
+### v0.2.1 — 2026-08-04
+
+- **Khmer burn-in wrap** — export line breaks follow the studio preview (DOM/CSS measure → hard `\N`); no more character-count wrap that split syllables or diverged from preview
+- **Subtitle style** — system font picker, outline/box look, size, outline thickness, max width (~96%), bottom-anchored Khmer under CN/EN hardsubs
+- **Fit video to dub (both ways)** — stretch when Khmer is longer **or** speed up (pitch-safe) when the picture outlasts the dub; sync banner for either case
+- **Preview overlay** — drag to move; handles for size / width; burn-in text tracks the visual playhead
 
 ### v0.2.0 — 2026-08-04
 

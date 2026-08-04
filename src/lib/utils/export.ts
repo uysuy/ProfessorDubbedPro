@@ -1,6 +1,13 @@
 import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
-import type { SubtitleCue } from '$lib/types/project';
+import type { SubtitleCue, SubtitleStyle } from '$lib/types/project';
+import { DEFAULT_SUBTITLE_STYLE } from '$lib/types/project';
+import {
+	detectPreviewFrameSize,
+	ensureWrapFontLoaded,
+	wrapSubtitleText,
+	type SubtitleWrapStyle
+} from '$lib/utils/khmer-wrap';
 import { isTauriRuntime } from '$lib/utils/platform';
 import { cuesToSrt } from '$lib/utils/srt';
 
@@ -61,6 +68,8 @@ export type RunExportOptions = {
 	originalAudioGain?: number;
 	/** Generated TTS clips to mix into the exported video. */
 	dubClips?: ExportDubClip[];
+	/** Preview-matched burn-in style (font / size / position). */
+	subtitleStyle?: SubtitleStyle | null;
 	onStatus?: (message: string) => void;
 };
 
@@ -68,12 +77,35 @@ function isVideoMode(mode: ExportMode): boolean {
 	return mode === 'videoSoftSubs' || mode === 'videoBurnedIn';
 }
 
+function burnInWrapStyle(style: SubtitleStyle): SubtitleWrapStyle {
+	const frame = detectPreviewFrameSize();
+	return {
+		fontFamily: style.fontFamily,
+		fontSizePx: style.fontSizePx,
+		maxWidthPct: style.maxWidthPct ?? DEFAULT_SUBTITLE_STYLE.maxWidthPct,
+		frameWidth: frame.width,
+		frameHeight: frame.height,
+		look: style.look ?? 'outline'
+	};
+}
+
 /**
  * Run an export: pick destination, then write SRT or mux/burn via Tauri/FFmpeg.
  * In the browser (non-Tauri), only SRT download is supported.
  */
 export async function runProjectExport(opts: RunExportOptions): Promise<ExportProjectResult> {
-	const srtContent = cuesToSrt(opts.cues);
+	const style = opts.subtitleStyle ?? DEFAULT_SUBTITLE_STYLE;
+	let srtContent: string;
+	if (opts.mode === 'videoBurnedIn') {
+		const wrapStyle = burnInWrapStyle(style);
+		opts.onStatus?.('Matching subtitle wrap to preview…');
+		await ensureWrapFontLoaded(wrapStyle);
+		srtContent = cuesToSrt(opts.cues, {
+			mapText: (text) => wrapSubtitleText(text, wrapStyle)
+		});
+	} else {
+		srtContent = cuesToSrt(opts.cues);
+	}
 	if (!srtContent.trim()) {
 		throw new Error('No subtitle cues to export. Add translation text first.');
 	}
@@ -169,7 +201,17 @@ export async function runProjectExport(opts: RunExportOptions): Promise<ExportPr
 						typeof c.durationMs === 'number' && c.durationMs > 0
 							? Math.round(c.durationMs)
 							: undefined
-				}))
+				})),
+				subtitleStyle: {
+					fontFamily: style.fontFamily,
+					fontFile: style.fontFile ?? null,
+					fontSizePx: style.fontSizePx,
+					x: style.x,
+					y: style.y,
+					look: style.look ?? 'outline',
+					maxWidthPct: style.maxWidthPct ?? 0.96,
+					outlineWidth: style.outlineWidth ?? 1
+				}
 			}
 		});
 

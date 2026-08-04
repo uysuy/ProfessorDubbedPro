@@ -116,24 +116,99 @@
 		mediaDurationMs > 0 ? mediaDurationMs : projectStore.current.durationMs
 	);
 	const dubOverhangSec = $derived(Math.round(tempoStore.dubOverhangMs / 1000));
-	const showSyncBanner = $derived(tempoStore.dubOverhangMs > 800);
+	const videoUnderhangSec = $derived(Math.round(tempoStore.videoUnderhangMs / 1000));
+	const showSyncBanner = $derived(
+		tempoStore.dubOverhangMs > 800 || tempoStore.videoUnderhangMs > 800
+	);
+	const syncBannerIsShorten = $derived(
+		tempoStore.videoUnderhangMs > tempoStore.dubOverhangMs
+	);
 	/** Coarse clock for paused UI / empty-state (not updated every frame). */
 	let transportMs = $state(0);
 	const showHours = $derived(durationMs >= 3600_000);
 	const videoName = $derived(projectStore.videoAsset?.name ?? null);
-	/** Preview burn-in — driven by store playhead so scrub/pause always resolve. */
-	const overlaySubtitle = $derived.by(() => {
-		const ms = playback.playheadMs;
+	/**
+	 * Burn-in text — updated from the visual clock (same as TTS), not the
+	 * ~100ms-throttled store playhead (that made text lag the picture).
+	 */
+	let overlayText = $state<string | null>(null);
+
+	function resolveOverlayText(ms: number): string | null {
 		const cues = projectStore.current.cues;
 		const cue = cues.find((c) => ms >= c.startMs && ms < cueAudioEndMs(c));
 		if (!cue) return null;
 		const text = cue.translation?.trim() || cue.source?.trim();
 		return text ? text : null;
-	});
+	}
+
+	function paintOverlay(ms: number) {
+		const next = resolveOverlayText(ms);
+		if (next !== overlayText) overlayText = next;
+	}
+
 	const overlayUsesKhmer = $derived(
 		usesKhmerScript(normalizeDubLanguage(projectStore.current.targetLanguage))
 	);
+	const subStyle = $derived(
+		projectStore.current.subtitleStyle ?? {
+			fontFamily: 'Noto Sans Khmer',
+			fontFile: null,
+			fontSizePx: 20,
+			x: 0.5,
+			y: 0.84,
+			look: 'outline' as const,
+			maxWidthPct: 0.96,
+			outlineWidth: 1
+		}
+	);
 
+	let frameEl: HTMLElement | undefined = $state();
+	let pictureEl: HTMLElement | undefined = $state();
+	/** object-contain picture rect inside the 16:9 frame (fractions 0–1). */
+	let pictureBox = $state({ left: 0, top: 0, width: 1, height: 1 });
+	/** CSS px scale so design sizes (720p-tall) match burn-in. */
+	let designScale = $state(1);
+
+	function updatePictureBox() {
+		if (!frameEl) return;
+		const fw = frameEl.clientWidth;
+		const fh = frameEl.clientHeight;
+		if (fw < 2 || fh < 2) return;
+
+		const vw = videoEl?.videoWidth || 16;
+		const vh = videoEl?.videoHeight || 9;
+		const scale = Math.min(fw / vw, fh / vh);
+		const w = vw * scale;
+		const h = vh * scale;
+		pictureBox = {
+			left: (fw - w) / 2 / fw,
+			top: (fh - h) / 2 / fh,
+			width: w / fw,
+			height: h / fh
+		};
+		// Same 720p-tall design space as export ASS mapping.
+		designScale = Math.max(0.25, h / 720);
+	}
+
+	function outlineTextShadow(widthPx: number): string {
+		const d = Math.max(0, Math.min(5, widthPx));
+		if (d < 0.05) return 'none';
+		const a = d.toFixed(2);
+		return [
+			`-${a}px -${a}px 0 #000`,
+			`${a}px -${a}px 0 #000`,
+			`-${a}px ${a}px 0 #000`,
+			`${a}px ${a}px 0 #000`,
+			`-${a}px 0 0 #000`,
+			`${a}px 0 0 #000`,
+			`0 -${a}px 0 #000`,
+			`0 ${a}px 0 #000`
+		].join(', ');
+	}
+
+	const overlayFontPx = $derived(subStyle.fontSizePx * designScale);
+	const overlayOutlinePx = $derived((subStyle.outlineWidth ?? 1) * designScale);
+	const overlayShadow = $derived(outlineTextShadow(overlayOutlinePx));
 	let raf = 0;
 	let lastTick = 0;
 	let playToken = 0;
@@ -187,6 +262,133 @@
 		}
 	}
 
+	let subSelected = $state(false);
+	type SubDragKind =
+		| 'move'
+		| 'resize-nw'
+		| 'resize-ne'
+		| 'resize-sw'
+		| 'resize-se'
+		| 'resize-e'
+		| 'resize-w';
+	let subDrag: {
+		kind: SubDragKind;
+		pointerId: number;
+		startX: number;
+		startY: number;
+		originX: number;
+		originY: number;
+		originSize: number;
+		originMaxW: number;
+	} | null = $state(null);
+
+	function deselectSub() {
+		subSelected = false;
+		endSubDrag();
+	}
+
+	function endSubDrag() {
+		if (!subDrag) return;
+		subDrag = null;
+		window.removeEventListener('pointermove', onWindowSubPointerMove);
+		window.removeEventListener('pointerup', onWindowSubPointerUp);
+		window.removeEventListener('pointercancel', onWindowSubPointerUp);
+	}
+
+	function beginSubDrag(kind: SubDragKind, e: PointerEvent) {
+		subSelected = true;
+		subDrag = {
+			kind,
+			pointerId: e.pointerId,
+			startX: e.clientX,
+			startY: e.clientY,
+			originX: subStyle.x,
+			originY: subStyle.y,
+			originSize: subStyle.fontSizePx,
+			originMaxW: subStyle.maxWidthPct ?? 0.96
+		};
+		window.addEventListener('pointermove', onWindowSubPointerMove);
+		window.addEventListener('pointerup', onWindowSubPointerUp);
+		window.addEventListener('pointercancel', onWindowSubPointerUp);
+	}
+
+	function onSubPointerDown(e: PointerEvent) {
+		if (e.button !== 0) return;
+		// Ignore clicks that started on a resize handle (handles stopPropagation too).
+		if ((e.target as HTMLElement | null)?.closest?.('.video-subtitle-handle')) return;
+		e.preventDefault();
+		e.stopPropagation();
+		beginSubDrag('move', e);
+	}
+
+	function onHandlePointerDown(kind: SubDragKind, e: PointerEvent) {
+		if (e.button !== 0) return;
+		e.preventDefault();
+		e.stopPropagation();
+		beginSubDrag(kind, e);
+	}
+
+	function onWindowSubPointerMove(e: PointerEvent) {
+		if (!subDrag || e.pointerId !== subDrag.pointerId) return;
+		e.preventDefault();
+		const box = pictureEl?.getBoundingClientRect() ?? frameEl?.getBoundingClientRect();
+		if (!box || box.width < 8 || box.height < 8) return;
+
+		if (subDrag.kind === 'move') {
+			const dx = (e.clientX - subDrag.startX) / box.width;
+			const dy = (e.clientY - subDrag.startY) / box.height;
+			projectStore.setSubtitleStyle({
+				x: Math.max(0.05, Math.min(0.95, subDrag.originX + dx)),
+				y: Math.max(0.03, Math.min(0.97, subDrag.originY + dy))
+			});
+			return;
+		}
+
+		if (subDrag.kind === 'resize-e' || subDrag.kind === 'resize-w') {
+			// Grow/shrink box width from center (anchor stays put via translate -50%).
+			const dx = (e.clientX - subDrag.startX) / box.width;
+			const signed = subDrag.kind === 'resize-e' ? dx : -dx;
+			projectStore.setSubtitleStyle({
+				maxWidthPct: Math.max(0.2, Math.min(0.98, subDrag.originMaxW + signed * 2))
+			});
+			return;
+		}
+
+		// Corner: scale font size by distance change from center.
+		const cx = box.left + subDrag.originX * box.width;
+		const cy = box.top + subDrag.originY * box.height;
+		const startDist = Math.hypot(subDrag.startX - cx, subDrag.startY - cy) || 1;
+		const nowDist = Math.hypot(e.clientX - cx, e.clientY - cy);
+		const scale = nowDist / startDist;
+		projectStore.setSubtitleStyle({
+			fontSizePx: Math.max(12, Math.min(72, Math.round(subDrag.originSize * scale)))
+		});
+	}
+
+	function onWindowSubPointerUp(e: PointerEvent) {
+		if (!subDrag || e.pointerId !== subDrag.pointerId) return;
+		endSubDrag();
+	}
+
+	function onFramePointerDown(e: PointerEvent) {
+		// Click empty frame area → deselect subtitle chrome.
+		if ((e.target as HTMLElement | null)?.closest?.('.video-subtitle-overlay')) return;
+		deselectSub();
+	}
+
+	$effect(() => {
+		if (!overlayText) deselectSub();
+	});
+
+	/** While paused/scrubbing, keep burn-in in sync with store playhead + cue edits. */
+	$effect(() => {
+		const cues = projectStore.current.cues;
+		const ms = playback.playheadMs;
+		void cues;
+		if (playback.isPlaying) return;
+		paintOverlay(ms);
+	});
+
 	function paintTransport(ms: number) {
 		const dur = Math.max(durationMs, 1);
 		if (currentTimeEl) {
@@ -203,6 +405,7 @@
 		// Paint timer/progress via DOM — never feed a Bits UI slider every frame
 		// (that re-triggered seek and made playback crawl).
 		paintTransport(safe);
+		paintOverlay(safe);
 
 		if (forceStore || now - lastStorePushAt >= 100) {
 			lastStorePushAt = now;
@@ -450,6 +653,7 @@
 		playToken += 1;
 		lastPlaying = false;
 		stopClock();
+		endSubDrag();
 		ttsMixer.dispose();
 	});
 
@@ -479,12 +683,25 @@
 		durationChecked = false;
 		ensureMediaDuration();
 		applyPlaybackRate(videoEl);
+		updatePictureBox();
 		const ms = videoDurationSec() * 1000;
 		if (ms > 0) {
 			mediaDurationMs = ms;
 			projectStore.setDurationMs(ms);
 		}
 	}
+
+	$effect(() => {
+		const frame = frameEl;
+		const video = videoEl;
+		void src;
+		if (!frame) return;
+		updatePictureBox();
+		const ro = new ResizeObserver(() => updatePictureBox());
+		ro.observe(frame);
+		if (video) ro.observe(video);
+		return () => ro.disconnect();
+	});
 
 	/** Seek the media element; clears `ended` so scrubbing after finish works. */
 	function applyVideoCurrentTime(ms: number) {
@@ -721,8 +938,11 @@
 	>
 		<div class="absolute inset-0 flex items-center justify-center overflow-hidden p-2">
 			<div
+				bind:this={frameEl}
 				class="video-preview-frame relative aspect-video h-full max-h-full w-full max-w-full overflow-hidden rounded-md transition-transform duration-200 ease-out"
 				style="transform: scale({zoom}); transform-origin: center center;"
+				onpointerdown={onFramePointerDown}
+				role="presentation"
 			>
 				{#if src}
 					<video
@@ -778,20 +998,79 @@
 						</div>
 					</div>
 				{/if}
+
+				<!-- Align burn-in with object-contain picture (not letterbox bars). -->
+				<div
+					bind:this={pictureEl}
+					class="video-picture-layer"
+					style="left: {pictureBox.left * 100}%; top: {pictureBox.top * 100}%; width: {pictureBox.width *
+						100}%; height: {pictureBox.height * 100}%;"
+				>
+					{#if overlayText}
+						<div
+							class="video-subtitle-overlay"
+							class:video-subtitle-selected={subSelected}
+							class:video-subtitle-dragging={subDrag?.kind === 'move'}
+							class:video-subtitle-look-outline={subStyle.look !== 'box'}
+							class:video-subtitle-look-box={subStyle.look === 'box'}
+							class:video-subtitle-anchor-bottom={subStyle.y >= 0.55}
+							class:video-subtitle-anchor-top={subStyle.y <= 0.45}
+							class:video-subtitle-anchor-middle={subStyle.y > 0.45 && subStyle.y < 0.55}
+							style="left: {subStyle.x * 100}%; top: {subStyle.y * 100}%; width: {(subStyle.maxWidthPct ??
+								0.96) * 100}%;"
+							aria-live="polite"
+							role="group"
+							aria-label="Subtitle overlay — click to select, drag to move, handles to resize"
+							onpointerdown={onSubPointerDown}
+						>
+							<p
+								class="video-subtitle-text"
+								class:font-khmer={overlayUsesKhmer}
+								lang={normalizeDubLanguage(projectStore.current.targetLanguage)}
+								style="font-family: '{subStyle.fontFamily}', var(--font-khmer), sans-serif; font-size: {overlayFontPx}px; {subStyle.look !==
+								'box'
+									? `text-shadow: ${overlayShadow};`
+									: ''}"
+							>
+								{overlayText}
+							</p>
+							{#if subSelected}
+								<span
+									class="video-subtitle-handle video-subtitle-handle-nw"
+									aria-hidden="true"
+									onpointerdown={(e) => onHandlePointerDown('resize-nw', e)}
+								></span>
+								<span
+									class="video-subtitle-handle video-subtitle-handle-ne"
+									aria-hidden="true"
+									onpointerdown={(e) => onHandlePointerDown('resize-ne', e)}
+								></span>
+								<span
+									class="video-subtitle-handle video-subtitle-handle-sw"
+									aria-hidden="true"
+									onpointerdown={(e) => onHandlePointerDown('resize-sw', e)}
+								></span>
+								<span
+									class="video-subtitle-handle video-subtitle-handle-se"
+									aria-hidden="true"
+									onpointerdown={(e) => onHandlePointerDown('resize-se', e)}
+								></span>
+								<span
+									class="video-subtitle-handle video-subtitle-handle-w"
+									aria-hidden="true"
+									onpointerdown={(e) => onHandlePointerDown('resize-w', e)}
+								></span>
+								<span
+									class="video-subtitle-handle video-subtitle-handle-e"
+									aria-hidden="true"
+									onpointerdown={(e) => onHandlePointerDown('resize-e', e)}
+								></span>
+							{/if}
+						</div>
+					{/if}
+				</div>
 			</div>
 		</div>
-
-		{#if overlaySubtitle}
-			<div class="video-subtitle-overlay" aria-live="polite">
-				<p
-					class="video-subtitle-text"
-					class:font-khmer={overlayUsesKhmer}
-					lang={normalizeDubLanguage(projectStore.current.targetLanguage)}
-				>
-					{overlaySubtitle}
-				</p>
-			</div>
-		{/if}
 
 		{#if zoom > 1}
 			<span
@@ -801,7 +1080,7 @@
 			</span>
 		{/if}
 
-		{#if videoName && !overlaySubtitle}
+		{#if videoName && !overlayText}
 			<span
 				class="absolute bottom-2 left-2 max-w-[70%] truncate rounded-md border border-border/70 bg-[var(--surface-overlay)] px-1.5 py-0.5 text-[10px] text-muted-foreground shadow-sm"
 				title={videoName}
@@ -813,7 +1092,11 @@
 		{#if showSyncBanner}
 			<div class="sync-banner" role="status">
 				<p>
-					Khmer TTS runs ~{dubOverhangSec}s past the video — preview stops at the picture end.
+					{#if syncBannerIsShorten}
+						Video runs ~{videoUnderhangSec}s past the Khmer dub — picture feels slow vs the script.
+					{:else}
+						Khmer TTS runs ~{dubOverhangSec}s past the video — preview stops at the picture end.
+					{/if}
 				</p>
 				<Button
 					size="sm"
@@ -1077,33 +1360,136 @@
 		box-shadow: var(--elevation-float);
 	}
 
-	.video-subtitle-overlay {
+	.video-picture-layer {
 		pointer-events: none;
 		position: absolute;
-		inset-inline: 0.75rem;
-		bottom: 0.85rem;
+		z-index: 20;
+		overflow: hidden;
+	}
+
+	.video-subtitle-overlay {
+		pointer-events: auto;
+		position: absolute;
 		z-index: 20;
 		display: flex;
 		justify-content: center;
-		/* Force a compositor layer above <video> (WebView2 often paints video on top). */
-		transform: translateZ(0);
+		box-sizing: border-box;
+		cursor: grab;
+		touch-action: none;
+		transform: translate(-50%, -50%) translateZ(0);
+	}
+
+	/* Lower third: top of box is the handle (grows down — stays under CN/EN hardsubs). */
+	.video-subtitle-anchor-bottom {
+		transform: translate(-50%, 0) translateZ(0);
+	}
+	.video-subtitle-anchor-top {
+		transform: translate(-50%, 0) translateZ(0);
+	}
+	.video-subtitle-anchor-middle {
+		transform: translate(-50%, -50%) translateZ(0);
+	}
+
+	.video-subtitle-selected {
+		outline: 1px solid color-mix(in oklab, var(--primary) 80%, white);
+		outline-offset: 2px;
+		box-shadow: 0 0 0 1px color-mix(in oklab, var(--primary) 35%, transparent);
+	}
+
+	.video-subtitle-dragging {
+		cursor: grabbing;
 	}
 
 	.video-subtitle-text {
-		max-width: min(92%, 36rem);
+		width: 100%;
+		max-width: 100%;
 		margin: 0;
+		text-align: center;
+		font-weight: 500;
+		/* Tight stack for wrapped Khmer; ≥1.2 keeps coeng / vowel marks from colliding. */
+		line-height: 1.22;
+		color: white;
+		user-select: none;
+		/* Browser Khmer line-breaking (export copies these breaks via DOM measure). */
+		white-space: normal;
+		overflow-wrap: normal;
+		word-break: normal;
+		line-break: auto;
+	}
+
+	/* Beat global `.font-khmer { line-height: 1.65 }` used in script panels. */
+	.video-subtitle-text:global(.font-khmer) {
+		line-height: 1.22;
+		color: white;
+		white-space: normal;
+		overflow-wrap: normal;
+		word-break: normal;
+		line-break: auto;
+	}
+
+	.video-subtitle-look-box .video-subtitle-text {
 		border-radius: 0.4rem;
 		background: oklch(0 0 0 / 62%);
 		padding: 0.35rem 0.7rem;
-		text-align: center;
-		font-size: clamp(0.8rem, 2.4vw, 1.05rem);
 		font-weight: 500;
-		line-height: 1.45;
-		color: white;
 		text-shadow: none;
+		-webkit-text-stroke: 0;
 		backdrop-filter: blur(2px);
-		/* Prefer Noto shaping — same family used for burn-in export */
-		font-family: var(--font-khmer);
+	}
+
+	.video-subtitle-look-outline .video-subtitle-text {
+		background: transparent;
+		padding: 0.1rem 0.15rem;
+		font-weight: 500;
+		/* text-shadow set inline from outlineWidth × designScale */
+		-webkit-text-stroke: 0;
+		paint-order: stroke fill;
+	}
+
+	.video-subtitle-handle {
+		position: absolute;
+		z-index: 2;
+		width: 10px;
+		height: 10px;
+		box-sizing: border-box;
+		border: 1px solid color-mix(in oklab, var(--primary) 70%, white);
+		background: white;
+		box-shadow: 0 0 0 1px color-mix(in oklab, var(--primary) 40%, transparent);
+		pointer-events: auto;
+		touch-action: none;
+	}
+
+	.video-subtitle-handle-nw {
+		top: -6px;
+		left: -6px;
+		cursor: nwse-resize;
+	}
+	.video-subtitle-handle-ne {
+		top: -6px;
+		right: -6px;
+		cursor: nesw-resize;
+	}
+	.video-subtitle-handle-sw {
+		bottom: -6px;
+		left: -6px;
+		cursor: nesw-resize;
+	}
+	.video-subtitle-handle-se {
+		bottom: -6px;
+		right: -6px;
+		cursor: nwse-resize;
+	}
+	.video-subtitle-handle-w {
+		top: 50%;
+		left: -6px;
+		margin-top: -5px;
+		cursor: ew-resize;
+	}
+	.video-subtitle-handle-e {
+		top: 50%;
+		right: -6px;
+		margin-top: -5px;
+		cursor: ew-resize;
 	}
 
 	.sync-banner {
@@ -1133,7 +1519,7 @@
 		color: var(--foreground);
 	}
 
-	:global(:root:not(.dark)) .video-subtitle-text {
+	:global(:root:not(.dark)) .video-subtitle-look-box .video-subtitle-text {
 		background: oklch(0.18 0.02 265 / 72%);
 	}
 

@@ -3,8 +3,10 @@ import type {
 	DubbingTrack,
 	MediaAsset,
 	MediaKind,
-	SubtitleCue
+	SubtitleCue,
+	SubtitleStyle
 } from '$lib/types/project';
+import { DEFAULT_SUBTITLE_STYLE } from '$lib/types/project';
 
 export const PROJECT_STORAGE_KEY = 'pdp.currentProject';
 
@@ -84,6 +86,7 @@ export function createEmptyProject(
 		assets: [],
 		tracks,
 		cues: [],
+		subtitleStyle: { ...DEFAULT_SUBTITLE_STYLE },
 		updatedAt: new Date().toISOString()
 	};
 }
@@ -179,6 +182,44 @@ function normalizeCue(raw: unknown, index: number): SubtitleCue | null {
 	});
 }
 
+function normalizeSubtitleStyle(raw: unknown): SubtitleStyle {
+	if (!isRecord(raw)) return { ...DEFAULT_SUBTITLE_STYLE };
+	const fontFamily =
+		typeof raw.fontFamily === 'string' && raw.fontFamily.trim()
+			? raw.fontFamily.trim()
+			: DEFAULT_SUBTITLE_STYLE.fontFamily;
+	const fontFile =
+		typeof raw.fontFile === 'string' && raw.fontFile.trim()
+			? raw.fontFile.trim()
+			: raw.fontFile === null
+				? null
+				: DEFAULT_SUBTITLE_STYLE.fontFile ?? null;
+	const fontSizePx = Number.isFinite(Number(raw.fontSizePx))
+		? Math.max(12, Math.min(72, Math.round(Number(raw.fontSizePx))))
+		: DEFAULT_SUBTITLE_STYLE.fontSizePx;
+	const x = Number.isFinite(Number(raw.x))
+		? Math.max(0.05, Math.min(0.95, Number(raw.x)))
+		: DEFAULT_SUBTITLE_STYLE.x;
+	let y = Number.isFinite(Number(raw.y))
+		? Math.max(0.03, Math.min(0.97, Number(raw.y)))
+		: DEFAULT_SUBTITLE_STYLE.y;
+	// Legacy coords → sit under EN hardsubs, clear of bottom player chrome.
+	if (y >= 0.9 || Math.abs(y - 0.78) < 0.001 || Math.abs(y - 0.88) < 0.001) y = 0.84;
+	const look: SubtitleStyle['look'] =
+		raw.look === 'box' || raw.look === 'outline' ? raw.look : DEFAULT_SUBTITLE_STYLE.look;
+	let maxWidthPct = Number.isFinite(Number(raw.maxWidthPct))
+		? Math.max(0.2, Math.min(0.98, Number(raw.maxWidthPct)))
+		: DEFAULT_SUBTITLE_STYLE.maxWidthPct;
+	// Legacy defaults wrapped Khmer too early (box was narrow + export over-counted em width).
+	if (Math.abs(maxWidthPct - 0.86) < 0.001 || Math.abs(maxWidthPct - 0.92) < 0.001) {
+		maxWidthPct = DEFAULT_SUBTITLE_STYLE.maxWidthPct;
+	}
+	const outlineWidth = Number.isFinite(Number(raw.outlineWidth))
+		? Math.max(0, Math.min(5, Number(raw.outlineWidth)))
+		: DEFAULT_SUBTITLE_STYLE.outlineWidth;
+	return { fontFamily, fontFile, fontSizePx, x, y, look, maxWidthPct, outlineWidth };
+}
+
 /** Validate / normalize a persisted project payload. */
 export function parseProject(raw: unknown): DubbingProject | null {
 	if (!isRecord(raw)) return null;
@@ -224,6 +265,7 @@ export function parseProject(raw: unknown): DubbingProject | null {
 		assets,
 		tracks: Array.isArray(raw.tracks) && raw.tracks.length ? (raw.tracks as DubbingTrack[]) : base.tracks,
 		cues,
+		subtitleStyle: normalizeSubtitleStyle(raw.subtitleStyle),
 		updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : new Date().toISOString()
 	};
 }
@@ -237,6 +279,7 @@ export function serializeProject(project: DubbingProject): DubbingProject {
 		assets: [...project.assets],
 		tracks: [...project.tracks],
 		cues: project.cues.map((c) => ({ ...c })),
+		subtitleStyle: { ...project.subtitleStyle },
 		updatedAt: new Date().toISOString()
 	};
 	return JSON.parse(JSON.stringify(plain)) as DubbingProject;

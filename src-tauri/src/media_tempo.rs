@@ -18,7 +18,7 @@ const PROGRESS_EVENT: &str = "video-tempo-progress";
 pub struct RemasterVideoTempoArgs {
 	/// Absolute path to the source video.
 	pub video_path: String,
-	/// Playback speed relative to the current file (0.5–1.0 slows; 1.0 = no-op).
+	/// Playback speed relative to the current file (0.5–2.0; &lt;1 slows, &gt;1 speeds).
 	pub tempo: f64,
 }
 
@@ -53,7 +53,7 @@ fn clamp_tempo(raw: f64) -> Result<f64, String> {
 	if !raw.is_finite() {
 		return Err("Tempo must be a finite number.".into());
 	}
-	// Keep within FFmpeg atempo single-filter range; UI targets 0.80–1.00.
+	// Keep within FFmpeg atempo range (chained for extremes); UI fit uses 0.5–2.0.
 	let t = raw.clamp(0.5, 2.0);
 	if (t - 1.0).abs() < 0.001 {
 		return Err("Tempo is already 1.00× — nothing to remaster.".into());

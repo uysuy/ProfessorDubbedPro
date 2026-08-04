@@ -112,20 +112,29 @@ export function scaleCueTimesForTempo<T extends { startMs: number; endMs: number
 	});
 }
 
+export type FitToDubMode = 'stretch' | 'shorten' | 'none';
+
 export type FitToDubPlan = {
 	/** FFmpeg tempo (playback speed of current file). */
 	tempo: number;
 	videoMs: number;
 	contentMs: number;
-	/** True when dub already fits inside the video (no remaster needed). */
+	/** True when durations already match within tolerance. */
 	alreadyFits: boolean;
-	/** True when required slowdown is below FFmpeg-safe floor (0.5×). */
+	/** True when required tempo is outside FFmpeg-safe range (0.5×–2.0×). */
 	tooExtreme: boolean;
+	/**
+	 * stretch = slow video (tempo &lt; 1) when dub is longer;
+	 * shorten = speed video (tempo &gt; 1) when video is longer than dub.
+	 */
+	mode: FitToDubMode;
 };
 
 /**
  * Compute pitch-safe tempo so remastered video duration ≈ dub/content length.
- * `tempo = videoMs / contentMs` (e.g. 75s video / 92s dub → 0.82×).
+ * `tempo = videoMs / contentMs`
+ * - dub longer → tempo &lt; 1 (stretch picture)
+ * - video longer → tempo &gt; 1 (shorten picture — “video feels slower than script”)
  * Caller must remaster WITHOUT scaling cues (timeline already matches the dub).
  */
 export function computeFitToDubTempo(opts: {
@@ -138,10 +147,25 @@ export function computeFitToDubTempo(opts: {
 	const videoMs = Math.max(0, Math.round(opts.videoMs));
 	const contentMs = Math.max(0, Math.round(opts.contentMs) + pad);
 	if (videoMs < 500 || contentMs < 500) {
-		return { tempo: 1, videoMs, contentMs, alreadyFits: true, tooExtreme: false };
+		return {
+			tempo: 1,
+			videoMs,
+			contentMs,
+			alreadyFits: true,
+			tooExtreme: false,
+			mode: 'none'
+		};
 	}
-	if (contentMs <= videoMs + 200) {
-		return { tempo: 1, videoMs, contentMs, alreadyFits: true, tooExtreme: false };
+	const delta = contentMs - videoMs;
+	if (Math.abs(delta) <= 200) {
+		return {
+			tempo: 1,
+			videoMs,
+			contentMs,
+			alreadyFits: true,
+			tooExtreme: false,
+			mode: 'none'
+		};
 	}
 	const raw = videoMs / contentMs;
 	if (raw < 0.5 - 1e-6) {
@@ -150,15 +174,28 @@ export function computeFitToDubTempo(opts: {
 			videoMs,
 			contentMs,
 			alreadyFits: false,
-			tooExtreme: true
+			tooExtreme: true,
+			mode: 'stretch'
 		};
 	}
-	const tempo = Math.round(Math.min(1, Math.max(0.5, raw)) * 1000) / 1000;
+	if (raw > 2.0 + 1e-6) {
+		return {
+			tempo: 2,
+			videoMs,
+			contentMs,
+			alreadyFits: false,
+			tooExtreme: true,
+			mode: 'shorten'
+		};
+	}
+	const tempo = Math.round(Math.min(2, Math.max(0.5, raw)) * 1000) / 1000;
+	const mode: FitToDubMode = tempo < 1 - 1e-6 ? 'stretch' : tempo > 1 + 1e-6 ? 'shorten' : 'none';
 	return {
 		tempo,
 		videoMs,
 		contentMs,
-		alreadyFits: Math.abs(tempo - 1) < 0.001,
-		tooExtreme: false
+		alreadyFits: mode === 'none',
+		tooExtreme: false,
+		mode
 	};
 }

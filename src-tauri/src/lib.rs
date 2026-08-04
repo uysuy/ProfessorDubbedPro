@@ -2,6 +2,7 @@ use tauri::Manager;
 
 mod asr_funasr;
 mod export;
+mod fonts;
 mod media_tempo;
 mod transcribe;
 mod translate;
@@ -28,6 +29,7 @@ pub fn run() {
 			export::begin_staged_file,
 			export::append_staged_file,
 			export::cleanup_staged_file,
+			fonts::list_system_fonts,
 			media_tempo::remaster_video_tempo,
 			media_tempo::cancel_video_tempo,
 			tts::synthesize_speech,

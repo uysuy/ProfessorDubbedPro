@@ -281,8 +281,10 @@
 		line-height: 1.65;
 		font-feature-settings: 'kern' 1, 'liga' 1, 'clig' 1;
 		text-rendering: optimizeLegibility;
-		word-break: break-word;
-		overflow-wrap: anywhere;
+		/* Keep Khmer orthographic syllables intact (no mid-cluster wrap). */
+		word-break: normal;
+		overflow-wrap: normal;
+		line-break: auto;
 		-webkit-font-smoothing: antialiased;
 		font-weight: 500;
 	}
