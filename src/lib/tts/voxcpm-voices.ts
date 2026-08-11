@@ -21,15 +21,6 @@ export const VOXCPM_VOICES: VoxcpmVoicePreset[] = [
 		prompt: 'clear warm female teacher, 30s, calm classroom tone, natural pace'
 	},
 	{
-		id: 'voxcpm-km-narrator-f',
-		name: 'KM Narrator (F)',
-		language: 'km',
-		style: 'Narrative',
-		gender: 'female',
-		type: 'Studio',
-		prompt: 'natural female narrator, friendly articulate, moderate pace, clear diction'
-	},
-	{
 		id: 'voxcpm-km-coach-m',
 		name: 'KM Coach (M)',
 		language: 'km',
@@ -39,6 +30,24 @@ export const VOXCPM_VOICES: VoxcpmVoicePreset[] = [
 		prompt: 'confident male trainer, 40s, clear instructional tone, steady pace'
 	},
 	{
+		id: 'voxcpm-km-narrator-f',
+		name: 'KM Narrator (F)',
+		language: 'km',
+		style: 'Narrative',
+		gender: 'female',
+		type: 'Studio',
+		prompt: 'natural female narrator, friendly articulate, moderate pace, clear diction'
+	},
+	{
+		id: 'voxcpm-km-narrator-m',
+		name: 'KM Narrator (M)',
+		language: 'km',
+		style: 'Narrative',
+		gender: 'male',
+		type: 'Studio',
+		prompt: 'natural male narrator, warm articulate, moderate pace, clear diction'
+	},
+	{
 		id: 'voxcpm-km-soft-f',
 		name: 'KM Soft (F)',
 		language: 'km',
@@ -46,6 +55,33 @@ export const VOXCPM_VOICES: VoxcpmVoicePreset[] = [
 		gender: 'female',
 		type: 'Ready',
 		prompt: 'soft gentle female voice, relaxed, slightly slow, warm'
+	},
+	{
+		id: 'voxcpm-km-soft-m',
+		name: 'KM Soft (M)',
+		language: 'km',
+		style: 'Soft',
+		gender: 'male',
+		type: 'Ready',
+		prompt: 'soft gentle male voice, relaxed, slightly slow, warm'
+	},
+	{
+		id: 'voxcpm-km-host-m',
+		name: 'KM Host (M)',
+		language: 'km',
+		style: 'Broadcast',
+		gender: 'male',
+		type: 'Studio',
+		prompt: 'clear male host, mid 30s, bright presentational tone, steady pace'
+	},
+	{
+		id: 'voxcpm-km-host-f',
+		name: 'KM Host (F)',
+		language: 'km',
+		style: 'Broadcast',
+		gender: 'female',
+		type: 'Studio',
+		prompt: 'clear female host, mid 30s, bright presentational tone, steady pace'
 	}
 ];
 
@@ -66,6 +102,39 @@ export function resolveVoxcpmVoiceId(preferred: string | null | undefined, fallb
 	const b = (fallback ?? '').trim();
 	if (isVoxcpmVoiceId(b)) return b;
 	return DEFAULT_VOXCPM_VOICE_ID;
+}
+
+/**
+ * Keep the same style family when gender changes (Soft F → Soft M).
+ * Falls back to the default preset for that gender.
+ */
+export function matchVoxcpmVoiceToGender(
+	voiceId: string | null | undefined,
+	gender: 'female' | 'male' | 'neutral'
+): string {
+	const id = resolveVoxcpmVoiceId(voiceId);
+	const current = VOXCPM_VOICES.find((v) => v.id === id);
+	if (gender !== 'male' && gender !== 'female') {
+		return id;
+	}
+	if (current?.gender === gender) return current.id;
+	if (current) {
+		const peer = VOXCPM_VOICES.find((v) => v.style === current.style && v.gender === gender);
+		if (peer) return peer.id;
+	}
+	const fallback =
+		gender === 'male'
+			? VOXCPM_VOICES.find((v) => v.gender === 'male')
+			: VOXCPM_VOICES.find((v) => v.gender === 'female');
+	return fallback?.id ?? DEFAULT_VOXCPM_VOICE_ID;
+}
+
+/** Presets shown for a speaker gender (neutral → all). */
+export function voxcpmVoicesForGender(gender: 'female' | 'male' | 'neutral'): VoxcpmVoicePreset[] {
+	if (gender === 'male' || gender === 'female') {
+		return VOXCPM_VOICES.filter((v) => v.gender === gender);
+	}
+	return VOXCPM_VOICES;
 }
 
 export function voxcpmVoiceLabel(voiceId: string): string {

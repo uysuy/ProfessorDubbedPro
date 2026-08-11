@@ -14,7 +14,12 @@
 	import { PanelLeftOpen, PanelRightOpen } from '@lucide/svelte';
 	import ExportDialog from '$lib/components/studio/ExportDialog.svelte';
 	import ProjectSettingsDialog from '$lib/components/studio/ProjectSettingsDialog.svelte';
+	import SubtitleDialog from '$lib/components/studio/SubtitleDialog.svelte';
+	import TempoDialog from '$lib/components/studio/TempoDialog.svelte';
+	import VoiceEngineDialog from '$lib/components/studio/VoiceEngineDialog.svelte';
+	import ProsodyDialog from '$lib/components/studio/ProsodyDialog.svelte';
 	import { matchStudioShortcut, type StudioShortcutId } from '$lib/utils/shortcuts';
+	import { isTauriRuntime } from '$lib/utils/platform';
 
 	type PaneApi = {
 		collapse: () => void;
@@ -26,6 +31,56 @@
 	let rightPane = $state<PaneApi | null>(null);
 	let exportOpen = $state(false);
 	let settingsOpen = $state(false);
+
+	async function onImportMedia() {
+		try {
+			if (isTauriRuntime()) {
+				const { open } = await import('@tauri-apps/plugin-dialog');
+				const selected = await open({
+					multiple: true,
+					filters: [
+						{
+							name: 'Media',
+							extensions: ['mp4', 'mkv', 'mov', 'webm', 'avi', 'mp3', 'wav', 'm4a', 'srt']
+						}
+					]
+				});
+				const paths = Array.isArray(selected)
+					? selected
+					: selected
+						? [selected]
+						: [];
+				if (!paths.length) return;
+				const { readFile } = await import('@tauri-apps/plugin-fs');
+				const files: File[] = [];
+				for (const path of paths) {
+					if (typeof path !== 'string') continue;
+					const bytes = await readFile(path);
+					const name = path.split(/[/\\]/).pop() || 'media';
+					files.push(new File([bytes], name));
+				}
+				if (!files.length) return;
+				const n = await projectStore.importMediaFiles(files);
+				dndStore.flash(n > 0 ? `Imported ${n} file${n === 1 ? '' : 's'}` : 'Nothing imported');
+				return;
+			}
+			const input = document.createElement('input');
+			input.type = 'file';
+			input.multiple = true;
+			input.accept = 'video/*,audio/*,.srt';
+			input.onchange = async () => {
+				const list = input.files ? [...input.files] : [];
+				if (!list.length) return;
+				const n = await projectStore.importMediaFiles(list);
+				dndStore.flash(n > 0 ? `Imported ${n} file${n === 1 ? '' : 's'}` : 'Nothing imported');
+			};
+			input.click();
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			if (/cancel/i.test(message)) return;
+			dndStore.flash(message || 'Import failed');
+		}
+	}
 
 	onMount(() => {
 		projectStore.hydrate();
@@ -268,6 +323,7 @@
 		onOpen={onOpenProject}
 		onSave={onSaveProject}
 		onExport={onExportProject}
+		onImportMedia={onImportMedia}
 		onSettings={() => {
 			settingsOpen = true;
 		}}
@@ -381,4 +437,8 @@
 
 <ExportDialog bind:open={exportOpen} />
 <ProjectSettingsDialog bind:open={settingsOpen} />
+<SubtitleDialog />
+<TempoDialog />
+<VoiceEngineDialog />
+<ProsodyDialog />
 <DragGhost />

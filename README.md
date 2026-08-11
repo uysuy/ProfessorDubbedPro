@@ -69,6 +69,7 @@ Real app UI — works on GitHub.com and the GitHub mobile app (images scale to y
 - **Translate ZH → KM** — Fast (Azure / Google) or High Quality (DeepSeek / Qwen / Gemini) with slang glossary
 - **Paste Khmer script** — one line per cue; extra lines create new cues (skips auto-translate)
 - **Generate TTS** — Edge Read Aloud Khmer voices (default); optional **VoxCPM2** local engine for more natural KM (`pnpm voxcpm:setup`)
+- **Detect Speakers + Lock voice** — neural diarization (Speaker 1…N + gender), then lock each actor to a Khmer VoxCPM preset sample so Generate stays consistent
 - **Tighten silent gaps** — packs TTS back-to-back (~0.1s breath); drops long Chinese ASR dead air
 - **Tempo / Fit video to dub** — pitch-safe stretch or shorten so picture length matches Khmer TTS
 - **Original Audio mixer** — mute / volume fader on the timeline (preview + export mix)
@@ -223,6 +224,8 @@ pnpm tauri:dev
 
 First **Extract Subs** may download SenseVoice / VAD weights from ModelScope (~hundreds of MB, then cached).
 
+`pnpm funasr:setup` also installs **SpeechBrain ECAPA** for Detect Speakers. First detect may download ECAPA weights (~100MB from Hugging Face). After detect, open **Voice → Engine & Speakers…**, pick a Khmer preset per speaker, and **Lock voice** so Generate clones a fixed sample (design presets alone will drift).
+
 </details>
 
 <details>
@@ -287,7 +290,7 @@ Output: `src-tauri/target/release/bundle/`
 | `pnpm dev` | UI only |
 | `pnpm ffmpeg:download` | FFmpeg sidecar |
 | `pnpm whisper:download` | whisper.cpp + models |
-| `pnpm funasr:setup` | FunASR venv |
+| `pnpm funasr:setup` | FunASR venv + speaker diarization (ECAPA) |
 | `pnpm check` | Type / Svelte check |
 | `pnpm lint` · `pnpm format` | Lint / format |
 

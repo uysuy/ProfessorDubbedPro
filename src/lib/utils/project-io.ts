@@ -266,12 +266,31 @@ function normalizeSpeakerBank(raw: unknown): SpeakerVoiceProfile[] {
 		const gender: SpeakerVoiceProfile['gender'] =
 			genderRaw === 'male' || genderRaw === 'female' ? genderRaw : 'neutral';
 		const refWavPath = typeof item.refWavPath === 'string' ? item.refWavPath : '';
+		const videoRefWavPath =
+			typeof item.videoRefWavPath === 'string' && item.videoRefWavPath.trim()
+				? item.videoRefWavPath.trim()
+				: undefined;
 		const cueCount = Number.isFinite(Number(item.cueCount)) ? Number(item.cueCount) : 0;
 		const voiceId =
 			typeof item.voiceId === 'string' && item.voiceId
 				? item.voiceId
 				: voiceIdForSpeakerGender(gender);
-		out.push({ id, gender, refWavPath, cueCount, voiceId });
+		// Legacy: video detect wrote refWavPath without locked — do not treat as preset lock.
+		const locked =
+			item.locked === true && typeof refWavPath === 'string' && refWavPath.trim().length > 0;
+		out.push({
+			id,
+			gender,
+			refWavPath: locked ? refWavPath : '',
+			locked,
+			cueCount,
+			voiceId,
+			...(videoRefWavPath
+				? { videoRefWavPath }
+				: !locked && refWavPath
+					? { videoRefWavPath: refWavPath }
+					: {})
+		});
 	}
 	return out;
 }

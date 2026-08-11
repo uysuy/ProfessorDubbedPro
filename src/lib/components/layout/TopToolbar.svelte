@@ -3,13 +3,28 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Separator } from '$lib/components/ui/separator/index.js';
 	import * as Tooltip from '$lib/components/ui/tooltip/index.js';
+	import * as DropdownMenu from '$lib/components/ui/dropdown-menu/index.js';
 	import WindowControls from '$lib/components/layout/WindowControls.svelte';
 	import ThemeToggle from '$lib/components/layout/ThemeToggle.svelte';
 	import { projectStore } from '$lib/stores/project.svelte';
 	import { autosaveStore } from '$lib/stores/autosave.svelte';
+	import { studioUi } from '$lib/stores/studio-ui.svelte';
 	import { languageLabel, normalizeDubLanguage } from '$lib/stores/preferences.svelte';
+	import { dndStore } from '$lib/stores/dnd.svelte';
+	import { transcriptionStore } from '$lib/stores/transcription.svelte';
+	import { tempoStore } from '$lib/stores/tempo.svelte';
+	import { importSrtFromDialog } from '$lib/utils/import-srt';
 	import { detectPlatform, isTauriRuntime, type DesktopPlatform } from '$lib/utils/platform';
-	import { Undo2, Redo2, Save, Download, Settings, FilePlus2, FolderOpen } from '@lucide/svelte';
+	import {
+		Undo2,
+		Redo2,
+		Save,
+		Download,
+		Settings,
+		FilePlus2,
+		FolderOpen,
+		ChevronDown
+	} from '@lucide/svelte';
 
 	interface Props {
 		canUndo?: boolean;
@@ -21,6 +36,7 @@
 		onSave?: () => void;
 		onExport?: () => void;
 		onSettings?: () => void;
+		onImportMedia?: () => void;
 	}
 
 	let {
@@ -32,7 +48,8 @@
 		onOpen,
 		onSave,
 		onExport,
-		onSettings
+		onSettings,
+		onImportMedia
 	}: Props = $props();
 
 	let editingName = $state(false);
@@ -88,6 +105,31 @@
 			/* ignore */
 		}
 	}
+
+	async function extractSubs() {
+		projectStore.setVideoTool('subs');
+		if (transcriptionStore.isTranscribing) return;
+		await transcriptionStore.extractSubs();
+	}
+
+	function alignScript() {
+		projectStore.setVideoTool('tempo');
+		void tempoStore.fitToDub();
+	}
+
+	async function generateSelected() {
+		if (!projectStore.selectedCueIds.length) {
+			dndStore.flash('Select a subtitle first');
+			return;
+		}
+		const n = await projectStore.generateSelected();
+		if (n > 0) {
+			const prompted = tempoStore.promptOverhangAfterTts();
+			if (!prompted) dndStore.flash(n === 1 ? 'Audio generated' : `Audio generated ×${n}`);
+		} else if (projectStore.generateError) {
+			dndStore.flash(projectStore.generateError);
+		}
+	}
 </script>
 
 <header
@@ -100,7 +142,6 @@
 		<WindowControls />
 	{/if}
 
-	<!-- Brand / logo -->
 	<a
 		href="/"
 		class="group flex shrink-0 items-center gap-2 rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
@@ -129,7 +170,105 @@
 
 	<Separator orientation="vertical" class="mx-0.5 hidden h-5 opacity-70 sm:block" />
 
-	<!-- Project name -->
+	<div
+		class="hidden shrink-0 items-center gap-0.5 md:flex"
+		data-tauri-drag-region="false"
+		data-no-drag
+	>
+		<DropdownMenu.Root>
+			<DropdownMenu.Trigger
+				class="inline-flex h-7 items-center gap-0.5 rounded-md px-2 text-[12px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+			>
+				File <ChevronDown class="size-3 opacity-60" />
+			</DropdownMenu.Trigger>
+			<DropdownMenu.Content align="start" class="min-w-44">
+				<DropdownMenu.Item onclick={() => onNew?.()}>New project</DropdownMenu.Item>
+				<DropdownMenu.Item onclick={() => onOpen?.()}>Open…</DropdownMenu.Item>
+				<DropdownMenu.Item onclick={() => onSave?.()}>Save</DropdownMenu.Item>
+				<DropdownMenu.Separator />
+				<DropdownMenu.Item onclick={() => onImportMedia?.()}>Import media…</DropdownMenu.Item>
+				<DropdownMenu.Item onclick={() => onExport?.()}>Export…</DropdownMenu.Item>
+				<DropdownMenu.Separator />
+				<DropdownMenu.Item onclick={() => onSettings?.()}>Settings…</DropdownMenu.Item>
+			</DropdownMenu.Content>
+		</DropdownMenu.Root>
+
+		<DropdownMenu.Root>
+			<DropdownMenu.Trigger
+				class="inline-flex h-7 items-center gap-0.5 rounded-md px-2 text-[12px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+			>
+				Subtitle <ChevronDown class="size-3 opacity-60" />
+			</DropdownMenu.Trigger>
+			<DropdownMenu.Content align="start" class="min-w-48">
+				<DropdownMenu.Item onclick={() => studioUi.openSubtitle('paste')}
+					>Paste script…</DropdownMenu.Item
+				>
+				<DropdownMenu.Item onclick={() => void importSrtFromDialog()}
+					>Import SRT…</DropdownMenu.Item
+				>
+				<DropdownMenu.Item
+					disabled={transcriptionStore.isTranscribing}
+					onclick={() => void extractSubs()}>Extract Subs</DropdownMenu.Item
+				>
+				<DropdownMenu.Item onclick={() => studioUi.openSubtitle('translate')}
+					>Translate…</DropdownMenu.Item
+				>
+				<DropdownMenu.Separator />
+				<DropdownMenu.Item onclick={() => studioUi.openSubtitle('style')}
+					>Style…</DropdownMenu.Item
+				>
+			</DropdownMenu.Content>
+		</DropdownMenu.Root>
+
+		<DropdownMenu.Root>
+			<DropdownMenu.Trigger
+				class="inline-flex h-7 items-center gap-0.5 rounded-md px-2 text-[12px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+			>
+				Video <ChevronDown class="size-3 opacity-60" />
+			</DropdownMenu.Trigger>
+			<DropdownMenu.Content align="start" class="min-w-48">
+				<DropdownMenu.Item
+					disabled={tempoStore.isRemastering || !projectStore.current.cues.length}
+					onclick={alignScript}>Align script ↔ video</DropdownMenu.Item
+				>
+				<DropdownMenu.Item onclick={() => studioUi.openTempo()}>Tempo…</DropdownMenu.Item>
+				<DropdownMenu.Separator />
+				<DropdownMenu.Item
+					onclick={() => {
+						projectStore.toggleOriginalAudioMute();
+						dndStore.flash(
+							projectStore.originalAudioMuted
+								? 'Original audio muted'
+								: 'Original audio unmuted'
+						);
+					}}
+				>
+					{projectStore.originalAudioMuted ? 'Unmute original audio' : 'Mute original audio'}
+				</DropdownMenu.Item>
+			</DropdownMenu.Content>
+		</DropdownMenu.Root>
+
+		<DropdownMenu.Root>
+			<DropdownMenu.Trigger
+				class="inline-flex h-7 items-center gap-0.5 rounded-md px-2 text-[12px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+			>
+				Voice <ChevronDown class="size-3 opacity-60" />
+			</DropdownMenu.Trigger>
+			<DropdownMenu.Content align="start" class="min-w-48">
+				<DropdownMenu.Item
+					disabled={projectStore.isGenerating || !projectStore.selectedCueIds.length}
+					onclick={() => void generateSelected()}>Generate selected</DropdownMenu.Item
+				>
+				<DropdownMenu.Item onclick={() => studioUi.openVoiceEngine()}
+					>Engine & Speakers…</DropdownMenu.Item
+				>
+				<DropdownMenu.Item onclick={() => studioUi.openProsody()}>Prosody…</DropdownMenu.Item>
+			</DropdownMenu.Content>
+		</DropdownMenu.Root>
+	</div>
+
+	<Separator orientation="vertical" class="mx-0.5 hidden h-5 opacity-70 md:block" />
+
 	<div class="min-w-0 flex-1" data-tauri-drag-region>
 		{#if editingName}
 			<input
@@ -174,7 +313,6 @@
 		{/if}
 	</div>
 
-	<!-- Actions -->
 	<Tooltip.Provider>
 		<div class="flex shrink-0 items-center gap-1.5" data-tauri-drag-region="false" data-no-drag>
 			<div class="toolbar-group">

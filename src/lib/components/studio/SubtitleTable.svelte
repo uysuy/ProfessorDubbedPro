@@ -81,6 +81,18 @@
 	const canSplitAtPlayhead = $derived.by(() => canSplitCue(primarySelectedId));
 	const canMergeSelection = $derived(selectedCount >= 2);
 
+	/** Bank ids + any free-text speakers still present on cues. */
+	const speakerOptions = $derived.by(() => {
+		const ids = new Set<string>();
+		for (const s of projectStore.speakerBank) ids.add(s.id);
+		for (const c of projectStore.current.cues) {
+			const sp = (c.speaker || '').trim();
+			if (sp) ids.add(sp);
+		}
+		if (ids.size === 0) ids.add('Speaker 1');
+		return [...ids];
+	});
+
 	function canSplitCue(id: string | null | undefined) {
 		if (!id) return false;
 		const cue = projectStore.current.cues.find((c) => c.id === id);
@@ -870,15 +882,25 @@
 								</Table.Cell>
 
 								<Table.Cell class="cue-cell">
-									<Input
-										value={cue.speaker}
-										class="dense-input text-xs"
-										aria-label="Speaker for cue {cue.index}"
-										oninput={(e) =>
-											projectStore.updateCue(cue.id, {
-												speaker: (e.currentTarget as HTMLInputElement).value
-											})}
-									/>
+									<Select.Root
+										type="single"
+										value={(cue.speaker || '').trim() || 'Speaker 1'}
+										onValueChange={(v) => {
+											if (v) projectStore.updateCue(cue.id, { speaker: v });
+										}}
+									>
+										<Select.Trigger
+											class="dense-input h-7 w-full min-w-[5.5rem] border-transparent bg-transparent px-1.5 text-xs shadow-none"
+											aria-label="Speaker for cue {cue.index}"
+										>
+											{(cue.speaker || '').trim() || 'Speaker 1'}
+										</Select.Trigger>
+										<Select.Content>
+											{#each speakerOptions as sp (sp)}
+												<Select.Item value={sp} label={sp}>{sp}</Select.Item>
+											{/each}
+										</Select.Content>
+									</Select.Root>
 								</Table.Cell>
 
 								<Table.Cell class="cue-cell">

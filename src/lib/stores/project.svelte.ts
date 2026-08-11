@@ -31,9 +31,10 @@ import {
 	voiceIdForEngineGender,
 	voiceMatchesEngine
 } from '$lib/tts/voice-engine';
+import { matchVoxcpmVoiceToGender, resolveVoxcpmVoiceId } from '$lib/tts/voxcpm-voices';
 import { peaksForClip } from '$lib/utils/timeline';
 import { isTauriRuntime } from '$lib/utils/platform';
-	import { cueAudioEndMs, cuePreviewEndMs } from '$lib/utils/tts-fit';
+import { cueAudioEndMs, cuePreviewEndMs } from '$lib/utils/tts-fit';
 import { planTightenedCueGaps, estimateEdgeMp3DurationMs, ALIGN_BREATH_MS, ALIGN_HANG_PAD_MS, type TightenGapsOptions } from '$lib/utils/cue-gaps';
 import {
 	scaleCueTimesForTempo,
@@ -152,6 +153,7 @@ let generateProgress = $state(0);
 let generateError = $state<string | null>(null);
 let speakersDetecting = $state(false);
 let speakersError = $state<string | null>(null);
+let speakersLockingId = $state<string | null>(null);
 /** Runtime waveform peaks for TTS clips (not persisted). */
 let ttsWaveforms = $state<Record<string, number[]>>({});
 /** VideoPreview registers the mixer invalidate hook here. */
@@ -527,6 +529,9 @@ export const projectStore = {
 	},
 	get speakersError() {
 		return speakersError;
+	},
+	get speakersLockingId() {
+		return speakersLockingId;
 	},
 	get speakerBank() {
 		return project.speakerBank ?? [];
@@ -1409,11 +1414,11 @@ export const projectStore = {
 					);
 					let usedVoiceId = migrateVoiceId(cue.voiceId || voiceId);
 					if (engineId === 'voxcpm') {
-						const { resolveVoxcpmVoiceId } = await import('$lib/tts/voxcpm-voices');
-						usedVoiceId = resolveVoxcpmVoiceId(
-							bank?.voiceId || cue.voiceId || voiceId,
-							voiceId
-						);
+						const preferred = bank?.voiceId || cue.voiceId || voiceId;
+						usedVoiceId = resolveVoxcpmVoiceId(preferred, voiceId);
+						if (bank && (bank.gender === 'male' || bank.gender === 'female')) {
+							usedVoiceId = matchVoxcpmVoiceToGender(usedVoiceId, bank.gender);
+						}
 					}
 
 					const resolvedVoice =
@@ -1440,7 +1445,9 @@ export const projectStore = {
 					const basePitch = pitch;
 					const baseVolume = volume;
 					const referenceWavPath =
-						engineId === 'voxcpm' && bank?.refWavPath ? bank.refWavPath : undefined;
+						engineId === 'voxcpm' && bank?.locked && bank.refWavPath
+							? bank.refWavPath
+							: undefined;
 
 					// Single pass at the user's Prosody — consistent pitch & rate.
 					const result = await engine.synthesize({
@@ -3223,7 +3230,14 @@ export const projectStore = {
 			const nextVoice = voiceIdForEngineGender(eng, s.gender);
 			if (s.voiceId === nextVoice && voiceMatchesEngine(s.voiceId, eng)) return s;
 			speakerCount += 1;
-			return { ...s, voiceId: nextVoice };
+			// Engine switch invalidates VoxCPM preset locks.
+			return {
+				...s,
+				voiceId: nextVoice,
+				...(eng !== 'voxcpm' || !voiceMatchesEngine(s.voiceId, eng)
+					? { locked: false, refWavPath: '' }
+					: {})
+			};
 		});
 
 		const waveforms: Record<string, number[]> = {};
@@ -3353,8 +3367,8 @@ export const projectStore = {
 	},
 
 	/**
-	 * Cluster ASR cues into Speaker 1..N, write reference WAVs for VoxCPM cloning,
-	 * and lock each cue to that speaker's voice preset.
+	 * Cluster ASR cues into Speaker 1..N (neural embeddings), estimate gender,
+	 * and assign cues. Does not lock a Khmer voice — use lockSpeakerVoice for that.
 	 */
 	async detectSpeakers(opts?: { maxSpeakers?: number }): Promise<number> {
 		if (speakersDetecting) return 0;
@@ -3391,7 +3405,8 @@ export const projectStore = {
 				speakers: Array<{
 					id: string;
 					gender: string;
-					refWavPath: string;
+					refWavPath?: string;
+					videoRefWavPath?: string;
 					cueCount: number;
 				}>;
 				assignments: Array<{ cueId: string; speaker: string }>;
@@ -3408,15 +3423,33 @@ export const projectStore = {
 				}
 			});
 
+			const prevById = new Map(
+				(project.speakerBank ?? []).map((s) => [s.id, s] as const)
+			);
+			const eng = getTtsEngineId();
+
 			const bank: SpeakerVoiceProfile[] = (result.speakers ?? []).map((s) => {
-				const gender =
+				const detected =
 					s.gender === 'male' || s.gender === 'female' ? s.gender : ('neutral' as const);
+				const prev = prevById.get(s.id);
+				// Keep the user's boy/girl choice across Detect / rebuild when Speaker N survives.
+				const gender =
+					prev?.gender === 'male' || prev?.gender === 'female' ? prev.gender : detected;
+				const videoRef =
+					(s.videoRefWavPath ?? s.refWavPath ?? '').trim() || undefined;
+				const rawVoice = prev?.voiceId || voiceIdForSpeakerGender(gender, eng);
+				const voiceId =
+					eng === 'voxcpm'
+						? matchVoxcpmVoiceToGender(rawVoice, gender)
+						: voiceIdForSpeakerGender(gender, eng);
 				return {
 					id: s.id,
 					gender,
-					refWavPath: s.refWavPath,
+					refWavPath: '',
+					locked: false,
 					cueCount: s.cueCount,
-					voiceId: voiceIdForSpeakerGender(gender, getTtsEngineId())
+					voiceId,
+					...(videoRef ? { videoRefWavPath: videoRef } : {})
 				};
 			});
 			const byCue = new Map(result.assignments.map((a) => [a.cueId, a.speaker]));
@@ -3430,7 +3463,12 @@ export const projectStore = {
 					return {
 						...c,
 						speaker: spk,
-						voiceId: voiceBySpeaker.get(spk) ?? c.voiceId
+						voiceId: voiceBySpeaker.get(spk) ?? c.voiceId,
+						assignedAudio: null,
+						status:
+							c.status === 'generated' || c.status === 'error'
+								? ('ready' as const)
+								: c.status
 					};
 				})
 			});
@@ -3443,6 +3481,203 @@ export const projectStore = {
 		} finally {
 			speakersDetecting = false;
 		}
+	},
+
+	/** Rename / gender / preset for a speaker bank entry; syncs matching cues. */
+	updateSpeaker(
+		speakerId: string,
+		patch: Partial<Pick<SpeakerVoiceProfile, 'id' | 'gender' | 'voiceId'>>
+	): boolean {
+		const id = speakerId.trim();
+		if (!id) return false;
+		const bank = [...(project.speakerBank ?? [])];
+		const idx = bank.findIndex((s) => s.id === id);
+		if (idx < 0) return false;
+		const prev = bank[idx]!;
+		let nextId = prev.id;
+		if (typeof patch.id === 'string') {
+			const renamed = patch.id.trim();
+			if (!renamed) return false;
+			if (renamed !== prev.id && bank.some((s) => s.id === renamed)) return false;
+			nextId = renamed;
+		}
+		const gender =
+			patch.gender === 'male' || patch.gender === 'female' || patch.gender === 'neutral'
+				? patch.gender
+				: prev.gender;
+		let nextVoice =
+			typeof patch.voiceId === 'string' && patch.voiceId.trim()
+				? patch.voiceId.trim()
+				: prev.voiceId;
+
+		if (patch.gender && patch.gender !== prev.gender) {
+			nextVoice =
+				getTtsEngineId() === 'voxcpm'
+					? matchVoxcpmVoiceToGender(patch.voiceId || prev.voiceId, gender)
+					: voiceIdForSpeakerGender(gender, getTtsEngineId());
+		} else if (typeof patch.voiceId === 'string' && patch.voiceId.trim()) {
+			if (getTtsEngineId() === 'voxcpm' && (gender === 'male' || gender === 'female')) {
+				nextVoice = matchVoxcpmVoiceToGender(patch.voiceId, gender);
+			}
+		}
+
+		const genderChanged = gender !== prev.gender;
+		const voiceChanged = nextVoice !== prev.voiceId;
+		const renamed = nextId !== prev.id;
+		bank[idx] = {
+			...prev,
+			id: nextId,
+			gender,
+			voiceId: nextVoice,
+			// Changing preset/gender invalidates a previous lock sample.
+			...(genderChanged || voiceChanged
+				? { locked: false, refWavPath: '' }
+				: {})
+		};
+		project = touch({
+			...project,
+			speakerBank: bank,
+			cues: project.cues.map((c) => {
+				if ((c.speaker || '').trim() !== prev.id) return c;
+				const next = {
+					...c,
+					speaker: nextId,
+					voiceId: nextVoice
+				};
+				if ((renamed || voiceChanged || genderChanged) && c.assignedAudio) {
+					next.assignedAudio = null;
+					if (next.status === 'generated' || next.status === 'error') {
+						next.status = 'ready';
+					}
+					dropTtsWaveforms([c.id]);
+				}
+				return next;
+			})
+		});
+		saveProjectToStorage(project);
+		return true;
+	},
+
+	/**
+	 * Synthesize a short Khmer sample from the speaker's VoxCPM preset and lock it
+	 * as the clone reference for all of that speaker's lines.
+	 */
+	async lockSpeakerVoice(speakerId: string): Promise<boolean> {
+		const id = speakerId.trim();
+		const bank = (project.speakerBank ?? []).find((s) => s.id === id);
+		if (!bank) {
+			speakersError = 'Speaker not found — run Detect Speakers first.';
+			return false;
+		}
+		if (!isTauriRuntime()) {
+			speakersError = 'Voice lock requires the desktop app.';
+			return false;
+		}
+		if (getTtsEngineId() !== 'voxcpm') {
+			speakersError = 'Switch TTS engine to VoxCPM2 to lock a voice.';
+			return false;
+		}
+		if (speakersLockingId) return false;
+
+		speakersLockingId = id;
+		speakersError = null;
+		try {
+			// Gender always wins over a mismatched style (Soft F + Male → Soft M).
+			const usedVoiceId =
+				bank.gender === 'male' || bank.gender === 'female'
+					? matchVoxcpmVoiceToGender(bank.voiceId, bank.gender)
+					: resolveVoxcpmVoiceId(bank.voiceId, voiceId);
+			const engine = getTtsEngine();
+			const LOCK_TEXT = 'សួស្តី ខ្ញុំជាសំឡេងសាកល្បងសម្រាប់ចាក់សោ។';
+			const result = await engine.synthesize({
+				cueId: `lock-${Date.now()}-${id.replace(/[^\w.-]+/g, '_')}`,
+				text: LOCK_TEXT,
+				voiceId: usedVoiceId,
+				pitch: 0,
+				speed: 1,
+				volume: 100,
+				language: 'km'
+				// No referenceWavPath — design prompt for the chosen preset.
+			});
+			if (!result.filePath || !result.byteLength) {
+				throw new Error('Lock sample was empty — is VoxCPM2 started?');
+			}
+
+			const { invoke } = await import('@tauri-apps/api/core');
+			const saved = await invoke<{ filePath: string }>('save_speaker_lock_wav', {
+				args: {
+					projectId: project.id,
+					speakerId: id,
+					sourcePath: result.filePath
+				}
+			});
+
+			const nextBank = (project.speakerBank ?? []).map((s) =>
+				s.id === id
+					? {
+							...s,
+							voiceId: usedVoiceId,
+							refWavPath: saved.filePath,
+							locked: true
+						}
+					: s
+			);
+			const cueIds: string[] = [];
+			project = touch({
+				...project,
+				speakerBank: nextBank,
+				cues: project.cues.map((c) => {
+					if ((c.speaker || '').trim() !== id) return c;
+					cueIds.push(c.id);
+					return {
+						...c,
+						voiceId: usedVoiceId,
+						assignedAudio: null,
+						status:
+							c.status === 'generated' || c.status === 'error'
+								? ('ready' as const)
+								: c.status
+					};
+				})
+			});
+			if (cueIds.length) dropTtsWaveforms(cueIds);
+			saveProjectToStorage(project);
+			return true;
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			speakersError = msg;
+			return false;
+		} finally {
+			speakersLockingId = null;
+		}
+	},
+
+	clearSpeakerLock(speakerId: string): boolean {
+		const id = speakerId.trim();
+		const bank = project.speakerBank ?? [];
+		if (!bank.some((s) => s.id === id)) return false;
+		const cueIds: string[] = [];
+		project = touch({
+			...project,
+			speakerBank: bank.map((s) =>
+				s.id === id ? { ...s, locked: false, refWavPath: '' } : s
+			),
+			cues: project.cues.map((c) => {
+				if ((c.speaker || '').trim() !== id || !c.assignedAudio) return c;
+				cueIds.push(c.id);
+				return {
+					...c,
+					assignedAudio: null,
+					status:
+						c.status === 'generated' || c.status === 'error'
+							? ('ready' as const)
+							: c.status
+				};
+			})
+		});
+		if (cueIds.length) dropTtsWaveforms(cueIds);
+		saveProjectToStorage(project);
+		return true;
 	},
 
 	/** True when Khmer/TTS content runs past the source video picture. */

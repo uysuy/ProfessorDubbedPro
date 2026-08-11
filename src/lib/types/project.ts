@@ -117,14 +117,21 @@ export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
 };
 
 export interface SpeakerVoiceProfile {
-	/** e.g. "Speaker 1" */
+	/** e.g. "Speaker 1" or renamed "Teacher" */
 	id: string;
 	gender: 'female' | 'male' | 'neutral';
-	/** Absolute path to reference WAV for VoxCPM cloning. */
+	/**
+	 * Locked Khmer preset sample for VoxCPM clone mode.
+	 * Empty until the user locks a voice for this speaker.
+	 */
 	refWavPath: string;
+	/** True once `refWavPath` is a preset lock sample (not video audio). */
+	locked: boolean;
 	cueCount: number;
-	/** Fallback VoxCPM preset id when no ref clip. */
+	/** VoxCPM preset (or Edge voice) used when locking / as unlocked fallback. */
 	voiceId: string;
+	/** Optional video-derived clip from Detect (diagnostics only; not used for Generate). */
+	videoRefWavPath?: string;
 }
 
 export interface DubbingProject {

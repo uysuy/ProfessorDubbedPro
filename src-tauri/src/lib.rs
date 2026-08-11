@@ -45,6 +45,7 @@ pub fn run() {
 			transcribe::cancel_transcription,
 			translate::translate_texts,
 			speakers::detect_speakers,
+			speakers::save_speaker_lock_wav,
 		])
 		.setup(|app| {
 			if cfg!(debug_assertions) {

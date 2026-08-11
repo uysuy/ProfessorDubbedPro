@@ -8,7 +8,7 @@
 	import { dndStore } from '$lib/stores/dnd.svelte';
 	import { migrateVoiceId } from '$lib/tts/edge-voices';
 	import { isVoxcpmVoiceId } from '$lib/tts/voxcpm-voices';
-	import { previewEdgeVoice, stopVoicePreview } from '$lib/tts/voice-preview';
+	import { previewVoice as playVoicePreview, stopVoicePreview } from '$lib/tts/voice-preview';
 	import { Check, ChevronsUpDown, LoaderCircle, Pause, Play, Volume2 } from '@lucide/svelte';
 
 	interface Props {
@@ -90,14 +90,30 @@
 		previewLoadingId = null;
 	}
 
+	function friendlyPreviewError(raw: string, isVoxcpm: boolean): string {
+		const msg = raw.trim() || 'Voice preview failed';
+		const lower = msg.toLowerCase();
+		if (
+			isVoxcpm &&
+			(lower.includes('not reachable') ||
+				lower.includes('not loaded') ||
+				lower.includes('not started') ||
+				lower.includes('not ready') ||
+				lower.includes('no model') ||
+				lower.includes('model load') ||
+				lower.includes('click start') ||
+				lower.includes('connection') ||
+				lower.includes('refused') ||
+				lower.includes('unreachable'))
+		) {
+			return 'Start VoxCPM2 first — Voice → Engine & Speakers… → Start.';
+		}
+		return msg;
+	}
+
 	async function previewVoice(voice: VoiceProfile, e: MouseEvent) {
 		e.preventDefault();
 		e.stopPropagation();
-
-		if (isVoxcpmVoiceId(voice.id)) {
-			dndStore.flash('Preview uses Generate with VoxCPM (no Edge sample).');
-			return;
-		}
 
 		if (previewingId === voice.id || previewLoadingId === voice.id) {
 			stopPreview();
@@ -108,7 +124,7 @@
 		previewLoadingId = voice.id;
 
 		try {
-			await previewEdgeVoice(voice.id, {
+			await playVoicePreview(voice.id, {
 				language: voice.language,
 				onStart: () => {
 					previewLoadingId = null;
@@ -123,7 +139,7 @@
 			previewLoadingId = null;
 			previewingId = null;
 			const msg = err instanceof Error ? err.message : String(err);
-			dndStore.flash(msg || 'Voice preview failed');
+			dndStore.flash(friendlyPreviewError(msg, isVoxcpmVoiceId(voice.id)));
 		}
 	}
 

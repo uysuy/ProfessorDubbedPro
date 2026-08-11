@@ -37,7 +37,11 @@ pub struct DetectSpeakerCue {
 pub struct SpeakerProfileDto {
 	pub id: String,
 	pub gender: String,
+	/// Legacy / unused for Generate — prefer video_ref_wav_path from detect.
+	#[serde(default)]
 	pub ref_wav_path: String,
+	#[serde(default)]
+	pub video_ref_wav_path: String,
 	pub cue_count: u32,
 }
 
@@ -77,8 +81,10 @@ struct DiarizeFileResult {
 struct DiarizeSpeaker {
 	id: String,
 	gender: String,
-	#[serde(rename = "refWavPath")]
+	#[serde(default, rename = "refWavPath")]
 	ref_wav_path: String,
+	#[serde(default, rename = "videoRefWavPath")]
+	video_ref_wav_path: String,
 	#[serde(rename = "cueCount")]
 	cue_count: u32,
 }
@@ -278,11 +284,19 @@ fn detect_blocking(app: &AppHandle, args: DetectSpeakersArgs) -> Result<DetectSp
 	let speakers: Vec<SpeakerProfileDto> = parsed
 		.speakers
 		.into_iter()
-		.map(|s| SpeakerProfileDto {
-			id: s.id,
-			gender: s.gender,
-			ref_wav_path: s.ref_wav_path,
-			cue_count: s.cue_count,
+		.map(|s| {
+			let video = if !s.video_ref_wav_path.trim().is_empty() {
+				s.video_ref_wav_path
+			} else {
+				s.ref_wav_path.clone()
+			};
+			SpeakerProfileDto {
+				id: s.id,
+				gender: s.gender,
+				ref_wav_path: String::new(),
+				video_ref_wav_path: video,
+				cue_count: s.cue_count,
+			}
 		})
 		.collect();
 	let assignments: Vec<SpeakerAssignmentDto> = parsed
@@ -308,11 +322,86 @@ fn detect_blocking(app: &AppHandle, args: DetectSpeakersArgs) -> Result<DetectSp
 		ok: true,
 		speaker_count: speakers.len() as u32,
 		message: format!(
-			"Detected {} speaker(s). Reference clips saved for VoxCPM cloning.",
+			"Detected {} speaker(s). Lock a Khmer preset per speaker for stable dubbing.",
 			speakers.len()
 		),
 		speakers,
 		assignments,
+	})
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveSpeakerLockArgs {
+	pub project_id: String,
+	pub speaker_id: String,
+	pub source_path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveSpeakerLockResult {
+	pub file_path: String,
+}
+
+fn sanitize_speaker_file_stem(speaker_id: &str) -> String {
+	let safe: String = speaker_id
+		.chars()
+		.map(|c| {
+			if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+				c
+			} else {
+				'_'
+			}
+		})
+		.collect();
+	if safe.is_empty() {
+		"speaker".into()
+	} else {
+		safe
+	}
+}
+
+fn save_speaker_lock_blocking(
+	app: &AppHandle,
+	args: SaveSpeakerLockArgs,
+) -> Result<SaveSpeakerLockResult, String> {
+	let src = PathBuf::from(args.source_path.trim());
+	if !src.is_file() {
+		return Err(format!("Lock sample not found: {}", src.display()));
+	}
+	let dir = speakers_data_dir(app, &args.project_id)?;
+	let stem = sanitize_speaker_file_stem(&args.speaker_id);
+	// Unique path each lock so preview/Generate cannot keep a stale cached WAV.
+	let stamp = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map(|d| d.as_millis())
+		.unwrap_or(0);
+	let dest = dir.join(format!("lock-{stem}-{stamp}.wav"));
+	fs::copy(&src, &dest).map_err(|e| format!("Could not save lock WAV: {e}"))?;
+	// Remove older lock samples for this speaker (keep the new one).
+	if let Ok(entries) = fs::read_dir(&dir) {
+		let prefix = format!("lock-{stem}-");
+		for entry in entries.flatten() {
+			let path = entry.path();
+			if path == dest {
+				continue;
+			}
+			let name = path
+				.file_name()
+				.and_then(|n| n.to_str())
+				.unwrap_or("");
+			if name.starts_with(&prefix) && name.ends_with(".wav") {
+				let _ = fs::remove_file(&path);
+			}
+			// Legacy fixed name from earlier builds.
+			if name == format!("lock-{stem}.wav") {
+				let _ = fs::remove_file(&path);
+			}
+		}
+	}
+	Ok(SaveSpeakerLockResult {
+		file_path: dest.to_string_lossy().into_owned(),
 	})
 }
 
@@ -324,4 +413,14 @@ pub async fn detect_speakers(
 	tauri::async_runtime::spawn_blocking(move || detect_blocking(&app, args))
 		.await
 		.map_err(|e| format!("Speaker detect task failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn save_speaker_lock_wav(
+	app: AppHandle,
+	args: SaveSpeakerLockArgs,
+) -> Result<SaveSpeakerLockResult, String> {
+	tauri::async_runtime::spawn_blocking(move || save_speaker_lock_blocking(&app, args))
+		.await
+		.map_err(|e| format!("Save lock WAV task failed: {e}"))?
 }
