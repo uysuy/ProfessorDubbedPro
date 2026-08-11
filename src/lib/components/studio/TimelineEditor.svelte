@@ -23,6 +23,7 @@
 		deltaXToMs
 	} from '$lib/utils/timeline';
 	import { resamplePeaks } from '$lib/utils/audio-waveform';
+	import { cuePreviewEndMs } from '$lib/utils/tts-fit';
 	import { Pause, Play, Scan, Volume2, VolumeX, ZoomIn, ZoomOut } from '@lucide/svelte';
 	import { dndStore, MIME_TTS_AUDIO } from '$lib/stores/dnd.svelte';
 	import { onDestroy } from 'svelte';
@@ -429,20 +430,13 @@
 		) {
 			return { startMs: clipDrag.startMs, endMs: clipDrag.endMs };
 		}
-		// TTS clips: lip-synced audio stays on the video cue window; otherwise show full speech.
+		// TTS track: follow spoken Khmer length (and subtitle end), so Generate tails are visible.
 		if (trackKind === 'tts') {
-			const fit = (cue.assignedAudio as { fitPlaybackRate?: number } | null | undefined)
-				?.fitPlaybackRate;
-			if (typeof fit === 'number' && fit > 0) {
-				return { startMs: cue.startMs, endMs: cue.endMs };
-			}
-			const audioDur = cue.assignedAudio?.durationMs;
-			if (typeof audioDur === 'number' && audioDur > 0) {
-				return {
-					startMs: cue.startMs,
-					endMs: Math.max(cue.endMs, cue.startMs + Math.round(audioDur))
-				};
-			}
+			const spoken = cuePreviewEndMs(cue);
+			return {
+				startMs: cue.startMs,
+				endMs: Math.max(cue.startMs + 1, spoken)
+			};
 		}
 		return { startMs: cue.startMs, endMs: cue.endMs };
 	}

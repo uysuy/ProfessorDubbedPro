@@ -1,4 +1,4 @@
-import type { DubbingProject, SubtitleCue, SubtitleStyle, VoiceProfile } from '$lib/types/project';
+import type { DubbingProject, SpeakerVoiceProfile, SubtitleCue, SubtitleStyle, VoiceProfile } from '$lib/types/project';
 import { DEFAULT_SUBTITLE_STYLE } from '$lib/types/project';
 import { classifyMediaFile } from '$lib/utils/media';
 import { extractWaveformFromFile, extractWaveformFromUrl } from '$lib/utils/audio-waveform';
@@ -10,6 +10,7 @@ import {
 	loadProjectFromStorage,
 	saveProjectToStorage,
 	serializeProject,
+	voiceIdForSpeakerGender,
 	type NewCueInput
 } from '$lib/utils/project-io';
 import {
@@ -19,16 +20,36 @@ import {
 import { preferencesStore, languageLabel, normalizeDubLanguage } from '$lib/stores/preferences.svelte';
 import { voicesStore } from '$lib/stores/voices.svelte';
 import { setVisualPlayheadMs } from '$lib/stores/playback-clock';
-import { getTtsEngine } from '$lib/tts';
+import { getTtsEngine, getTtsEngineId } from '$lib/tts';
 import { TtsError } from '$lib/tts/types';
+import type { TtsEngineId } from '$lib/tts/types';
 import { migrateVoiceId } from '$lib/tts/edge-voices';
 import { resolveEdgeVoice } from '$lib/tts/edge-tts';
 import { textContainsKhmer } from '$lib/tts/edge-tts-script';
+import {
+	mapVoiceIdToEngine,
+	voiceIdForEngineGender,
+	voiceMatchesEngine
+} from '$lib/tts/voice-engine';
 import { peaksForClip } from '$lib/utils/timeline';
 import { isTauriRuntime } from '$lib/utils/platform';
-import { cueAudioEndMs } from '$lib/utils/tts-fit';
-import { planTightenedCueGaps, estimateEdgeMp3DurationMs, type TightenGapsOptions } from '$lib/utils/cue-gaps';
-import { scaleCueTimesForTempo } from '$lib/utils/video-tempo';
+	import { cueAudioEndMs, cuePreviewEndMs } from '$lib/utils/tts-fit';
+import { planTightenedCueGaps, estimateEdgeMp3DurationMs, ALIGN_BREATH_MS, ALIGN_HANG_PAD_MS, type TightenGapsOptions } from '$lib/utils/cue-gaps';
+import {
+	scaleCueTimesForTempo,
+	ALIGN_MAX_TTS_RATE,
+	ALIGN_FORCE_FIT_MAX_TTS_RATE,
+	ALIGN_FALLBACK_TTS_RATE
+} from '$lib/utils/video-tempo';
+import {
+	planPictureLockPatches,
+	withPictureAnchors,
+	pictureAnchorStart,
+	pictureAnchorEnd
+} from '$lib/utils/cue-picture-lock';
+import type { SmartAlignPatch } from '$lib/utils/cue-smart-align';
+import { parseSrt } from '$lib/utils/srt';
+import { packLinesIntoCueSlots, splitKhmerSentences, estimateKhmerSpeechMs, planCuesFromScriptLines } from '$lib/utils/script-paste';
 
 /** Live Edge-TTS Khmer voices (reactive via voicesStore). */
 export function getVoices(): VoiceProfile[] {
@@ -61,6 +82,14 @@ let videoUrl = $state<string | null>(null);
 let videoFile = $state<File | null>(null);
 /** Absolute filesystem path when opened via native dialog (preferred for FFmpeg). */
 let videoPath = $state<string | null>(null);
+/**
+ * Original user media (never overwritten by pitch-safe remasters).
+ * Manual Apply tempo is absolute vs this source; 1.00× restores it.
+ */
+let sourceVideoPath = $state<string | null>(null);
+let sourceVideoFile = $state<File | null>(null);
+/** Picture length of the original source (ms), when known. */
+let sourceDurationMs = $state(0);
 
 /** Absolute filesystem path of the open .dubproj (not persisted in localStorage). */
 let projectFilePath = $state<string | null>(null);
@@ -121,8 +150,12 @@ let isGenerating = $state(false);
 let generateProgress = $state(0);
 /** Last generate error message (cleared on next successful start). */
 let generateError = $state<string | null>(null);
+let speakersDetecting = $state(false);
+let speakersError = $state<string | null>(null);
 /** Runtime waveform peaks for TTS clips (not persisted). */
 let ttsWaveforms = $state<Record<string, number[]>>({});
+/** VideoPreview registers the mixer invalidate hook here. */
+let ttsInvalidateHandler: ((cueId: string | null) => void) | null = null;
 let lastSavedAt = $state<string | null>(null);
 let previewHeightPx = $state(360);
 let didHydrate = false;
@@ -130,6 +163,72 @@ let didHydrate = false;
 const PREVIEW_HEIGHT_KEY = 'pdp.previewHeight';
 const PREVIEW_HEIGHT_MIN = 220;
 const PREVIEW_HEIGHT_MAX = 720;
+
+/** Current speakable text for a cue (what TTS would synthesize). */
+function cueSpeakText(cue: { translation?: string; source?: string }): string {
+	return (cue.translation?.trim() || cue.source?.trim() || '').trim();
+}
+
+/** True when assigned clip was built for this cue’s current text. */
+function cueTtsMatchesText(cue: {
+	translation?: string;
+	source?: string;
+	assignedAudio?: { sourceText?: string; filePath?: string | null; url?: string | null } | null;
+}): boolean {
+	const audio = cue.assignedAudio;
+	if (!audio) return false;
+	if (!(audio.filePath || audio.url)) return false;
+	const text = cueSpeakText(cue);
+	if (!text) return false;
+	// Legacy clips without sourceText stay trusted until the user edits text.
+	if (typeof audio.sourceText !== 'string') return true;
+	return audio.sourceText === text;
+}
+
+function notifyTtsInvalidate(cueId: string | null) {
+	try {
+		ttsInvalidateHandler?.(cueId);
+	} catch {
+		/* mixer optional */
+	}
+}
+
+function dropTtsWaveforms(ids: Iterable<string>) {
+	const next = { ...ttsWaveforms };
+	let changed = false;
+	for (const id of ids) {
+		if (id in next) {
+			delete next[id];
+			changed = true;
+		}
+		notifyTtsInvalidate(id);
+	}
+	if (changed) ttsWaveforms = next;
+}
+
+/** Drop clips whose sourceText no longer matches the cue (after load / paste). */
+function scrubMismatchedTts(cues: SubtitleCue[]): {
+	cues: SubtitleCue[];
+	clearedIds: string[];
+} {
+	const clearedIds: string[] = [];
+	const next = cues.map((cue) => {
+		const audio = cue.assignedAudio;
+		if (!audio) return cue;
+		if (typeof audio.sourceText !== 'string') return cue;
+		if (audio.sourceText === cueSpeakText(cue)) return cue;
+		clearedIds.push(cue.id);
+		return {
+			...cue,
+			assignedAudio: null,
+			status:
+				cue.status === 'generated' || cue.status === 'error'
+					? ('ready' as const)
+					: cue.status
+		};
+	});
+	return { cues: next, clearedIds };
+}
 
 function revokeVideoUrl() {
 	if (videoUrl) {
@@ -168,10 +267,9 @@ async function extractOriginalAudioFromFile(file: File) {
 			durationMs: result.durationMs,
 			label: file.name
 		};
-		// Prefer media duration from decoded audio when project duration is still a placeholder.
-		// Never shrink timeline below subtitle/TTS content (Khmer often extends past the picture),
-		// but keep videoAsset.durationMs as true picture length for Fit-to-dub / overhang.
-		if (result.durationMs > 1000 && Math.abs(result.durationMs - project.durationMs) > 500) {
+		// Always stamp true picture length onto the video asset (Fit math depends on it).
+		// Timeline duration may still grow with Khmer TTS past the picture.
+		if (result.durationMs > 1000) {
 			const videoId = project.videoAssetId;
 			let contentFloor = 0;
 			for (const cue of project.cues) {
@@ -179,16 +277,22 @@ async function extractOriginalAudioFromFile(file: File) {
 			}
 			const mediaMs = Math.round(result.durationMs);
 			const durationMs = Math.max(mediaMs, contentFloor + 200);
-			project = touch(
-				{
-					...project,
-					durationMs,
-					assets: project.assets.map((a) =>
-						a.id === videoId ? { ...a, durationMs: mediaMs } : a
-					)
-				},
-				{ recordHistory: false }
-			);
+			const assetNeedsUpdate =
+				!videoId ||
+				(project.assets.find((a) => a.id === videoId)?.durationMs ?? 0) !== mediaMs;
+			const timelineNeedsUpdate = Math.abs(durationMs - project.durationMs) > 500;
+			if (assetNeedsUpdate || timelineNeedsUpdate) {
+				project = touch(
+					{
+						...project,
+						durationMs: timelineNeedsUpdate ? durationMs : project.durationMs,
+						assets: project.assets.map((a) =>
+							a.id === videoId ? { ...a, durationMs: mediaMs } : a
+						)
+					},
+					{ recordHistory: false }
+				);
+			}
 		}
 	} catch {
 		if (token !== originalAudioToken) return;
@@ -230,7 +334,7 @@ async function extractOriginalAudioFromSrc(src: string, label: string) {
 			durationMs: result.durationMs,
 			label
 		};
-		if (result.durationMs > 1000 && Math.abs(result.durationMs - project.durationMs) > 500) {
+		if (result.durationMs > 1000) {
 			const videoId = project.videoAssetId;
 			let contentFloor = 0;
 			for (const cue of project.cues) {
@@ -238,16 +342,22 @@ async function extractOriginalAudioFromSrc(src: string, label: string) {
 			}
 			const mediaMs = Math.round(result.durationMs);
 			const durationMs = Math.max(mediaMs, contentFloor + 200);
-			project = touch(
-				{
-					...project,
-					durationMs,
-					assets: project.assets.map((a) =>
-						a.id === videoId ? { ...a, durationMs: mediaMs } : a
-					)
-				},
-				{ recordHistory: false }
-			);
+			const assetNeedsUpdate =
+				!videoId ||
+				(project.assets.find((a) => a.id === videoId)?.durationMs ?? 0) !== mediaMs;
+			const timelineNeedsUpdate = Math.abs(durationMs - project.durationMs) > 500;
+			if (assetNeedsUpdate || timelineNeedsUpdate) {
+				project = touch(
+					{
+						...project,
+						durationMs: timelineNeedsUpdate ? durationMs : project.durationMs,
+						assets: project.assets.map((a) =>
+							a.id === videoId ? { ...a, durationMs: mediaMs } : a
+						)
+					},
+					{ recordHistory: false }
+				);
+			}
 		}
 	} catch {
 		if (token !== originalAudioToken) return;
@@ -321,6 +431,35 @@ export const projectStore = {
 	get videoPath() {
 		return videoPath;
 	},
+	get sourceVideoPath() {
+		return sourceVideoPath;
+	},
+	get sourceVideoFile() {
+		return sourceVideoFile;
+	},
+	get sourceDurationMs() {
+		return sourceDurationMs;
+	},
+	/**
+	 * If the user opened media before source tracking existed, treat the current
+	 * file as the original while still at 1.00×.
+	 */
+	captureSourceFromCurrentIfNeeded() {
+		if (sourceVideoPath || sourceVideoFile) return;
+		const tempo = Number.isFinite(project.mediaTempoFromSource)
+			? project.mediaTempoFromSource!
+			: 1;
+		if (Math.abs(tempo - 1) >= 0.001) return;
+		if (videoPath) sourceVideoPath = videoPath;
+		else if (videoFile) sourceVideoFile = videoFile;
+		if (sourceDurationMs < 1000) {
+			const asset = project.videoAssetId
+				? project.assets.find((a) => a.id === project.videoAssetId)
+				: null;
+			const mediaMs = asset?.durationMs || project.durationMs;
+			if (mediaMs > 1000) sourceDurationMs = Math.round(mediaMs);
+		}
+	},
 	get videoAsset() {
 		if (!project.videoAssetId) return null;
 		return project.assets.find((a) => a.id === project.videoAssetId) ?? null;
@@ -383,6 +522,15 @@ export const projectStore = {
 	get generateError() {
 		return generateError;
 	},
+	get speakersDetecting() {
+		return speakersDetecting;
+	},
+	get speakersError() {
+		return speakersError;
+	},
+	get speakerBank() {
+		return project.speakerBank ?? [];
+	},
 	/** Waveform peaks for a TTS clip (real Edge audio when available). */
 	ttsPeaksForCue(cueId: string, widthPx: number, barWidth = 2): number[] {
 		const real = ttsWaveforms[cueId];
@@ -442,7 +590,11 @@ export const projectStore = {
 		if (!loaded) return;
 		revokeVideoUrl();
 		resetOriginalAudio();
-		project = loaded;
+		const scrubbed = scrubMismatchedTts(loaded.cues);
+		project = scrubbed.clearedIds.length
+			? { ...loaded, cues: scrubbed.cues }
+			: loaded;
+		if (scrubbed.clearedIds.length) dropTtsWaveforms(scrubbed.clearedIds);
 		projectFilePath = null;
 		clearHistory();
 		resetPlayback();
@@ -730,7 +882,11 @@ export const projectStore = {
 
 		revokeVideoUrl();
 		resetOriginalAudio();
-		project = document.project;
+		const scrubbedOpen = scrubMismatchedTts(document.project.cues);
+		project = scrubbedOpen.clearedIds.length
+			? { ...document.project, cues: scrubbedOpen.cues }
+			: document.project;
+		if (scrubbedOpen.clearedIds.length) dropTtsWaveforms(scrubbedOpen.clearedIds);
 		projectFilePath = path;
 		clearHistory();
 		resetPlayback();
@@ -779,7 +935,11 @@ export const projectStore = {
 		if (!loaded) return false;
 		revokeVideoUrl();
 		resetOriginalAudio();
-		project = loaded;
+		const scrubbed = scrubMismatchedTts(loaded.cues);
+		project = scrubbed.clearedIds.length
+			? { ...loaded, cues: scrubbed.cues }
+			: loaded;
+		if (scrubbed.clearedIds.length) dropTtsWaveforms(scrubbed.clearedIds);
 		projectFilePath = null;
 		clearHistory();
 		resetPlayback();
@@ -828,6 +988,9 @@ export const projectStore = {
 		} else {
 			playback.focusedCueId = null;
 			playback.isPlaying = true;
+			void import('$lib/tts/voice-preview')
+				.then((m) => m.stopVoicePreview())
+				.catch(() => undefined);
 		}
 	},
 	/** Pause without moving the playhead (used when media ends). */
@@ -928,6 +1091,8 @@ export const projectStore = {
 					{
 						startMs,
 						endMs,
+						pictureStartMs: startMs,
+						pictureEndMs: endMs,
 						source: text,
 						translation: '',
 						status: 'ready',
@@ -948,6 +1113,7 @@ export const projectStore = {
 			...project,
 			sourceLanguage: nextSource,
 			cues,
+			mediaTempoFromSource: 1,
 			durationMs: Math.max(project.durationMs, maxEnd + 500),
 			tracks: project.tracks.map((t) =>
 				t.role === 'dialogue' ? { ...t, language: nextSource } : t
@@ -958,6 +1124,94 @@ export const projectStore = {
 		selectionAnchorId = cues[0]?.id ?? null;
 		playback.playheadMs = cues[0]?.startMs ?? 0;
 		return cues.length;
+	},
+
+	/**
+	 * Replace cues from a raw SRT document.
+	 * Khmer text → `translation` (ready for Generate). Other languages → `source`
+	 * (same as Extract), leaving translation empty for Paste/Translate.
+	 */
+	importSrtText(
+		raw: string,
+		opts?: { replace?: boolean; fileName?: string }
+	): { count: number; khmer: boolean } {
+		const parsed = parseSrt(raw);
+		if (!parsed.length) return { count: 0, khmer: false };
+
+		const khmer = parsed.some((c) => textContainsKhmer(c.text));
+		const replace = opts?.replace !== false;
+
+		const mapped = parsed.map((seg) => {
+			const startMs = seg.startMs;
+			const endMs = seg.endMs;
+			const text = seg.text.trim();
+			return createSubtitleCue(
+				0,
+				{
+					startMs,
+					endMs,
+					pictureStartMs: startMs,
+					pictureEndMs: endMs,
+					source: khmer ? '' : text,
+					translation: khmer ? text : '',
+					status: 'ready',
+					speaker: 'Speaker 1',
+					voiceId
+				},
+				{ voiceId, speaker: 'Speaker 1' }
+			);
+		});
+
+		const cues = mapped
+			.sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs)
+			.map((c, i) => ({ ...c, index: i + 1 }));
+
+		const maxEnd = cues.reduce((m, c) => Math.max(m, c.endMs), 0);
+		const asset =
+			opts?.fileName != null
+				? createMediaAsset({ name: opts.fileName }, 'subtitle', maxEnd)
+				: null;
+
+		const nextCues = replace
+			? cues
+			: [...project.cues, ...cues].map((c, i) => ({ ...c, index: i + 1 }));
+
+		project = touch({
+			...project,
+			targetLanguage: khmer ? 'km' : project.targetLanguage,
+			cues: nextCues,
+			mediaTempoFromSource: 1,
+			durationMs: Math.max(project.durationMs, maxEnd + 500),
+			assets: asset ? [asset, ...project.assets.filter((a) => a.kind !== 'subtitle' || a.name !== opts?.fileName)] : project.assets,
+			tracks: project.tracks.map((t) =>
+				t.role === 'dub' && khmer ? { ...t, language: 'km' } : t
+			)
+		});
+		ttsWaveforms = {};
+		selectedCueIds = nextCues[0] ? [nextCues[0].id] : [];
+		selectionAnchorId = nextCues[0]?.id ?? null;
+		playback.playheadMs = nextCues[0]?.startMs ?? 0;
+		// Keep SRT times exactly as authored (video-matched). Do not auto-inject
+		// 1.5–2s gaps — that accumulates and makes the dub lag the picture.
+		return { count: cues.length, khmer };
+	},
+
+	/** Read a File and import as SRT cues (UTF-8 / UTF-16). */
+	async importSrtFile(
+		file: File,
+		opts?: { replace?: boolean }
+	): Promise<{ count: number; khmer: boolean }> {
+		const buf = await file.arrayBuffer();
+		const bytes = new Uint8Array(buf);
+		let raw = '';
+		if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+			raw = new TextDecoder('utf-16le').decode(bytes);
+		} else if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+			raw = new TextDecoder('utf-16be').decode(bytes);
+		} else {
+			raw = new TextDecoder('utf-8').decode(bytes);
+		}
+		return this.importSrtText(raw, { replace: opts?.replace, fileName: file.name });
 	},
 
 	/** Append a new subtitle row. Returns the new cue id. */
@@ -1074,8 +1328,8 @@ export const projectStore = {
 				speed: src.speed,
 				volume: src.volume,
 				voiceId: src.voiceId,
-				status: src.status === 'generated' ? 'ready' : src.status,
-				assignedAudio: src.assignedAudio ? { ...src.assignedAudio } : null
+				status: 'ready' as const,
+				assignedAudio: null
 			},
 			{ voiceId: src.voiceId, speaker: src.speaker }
 		);
@@ -1145,12 +1399,34 @@ export const projectStore = {
 					continue;
 				}
 
+				// Drop stale peaks so the timeline never shows the previous line’s waveform.
+				dropTtsWaveforms([cueId]);
+
 				try {
-					const usedVoiceId = migrateVoiceId(cue.voiceId || voiceId);
-					const resolvedVoice = resolveEdgeVoice(usedVoiceId, targetLang, text);
+					const engineId = engine.id;
+					const bank = (project.speakerBank ?? []).find(
+						(s) => s.id === (cue.speaker || '').trim()
+					);
+					let usedVoiceId = migrateVoiceId(cue.voiceId || voiceId);
+					if (engineId === 'voxcpm') {
+						const { resolveVoxcpmVoiceId } = await import('$lib/tts/voxcpm-voices');
+						usedVoiceId = resolveVoxcpmVoiceId(
+							bank?.voiceId || cue.voiceId || voiceId,
+							voiceId
+						);
+					}
+
+					const resolvedVoice =
+						engineId === 'voxcpm'
+							? usedVoiceId
+							: resolveEdgeVoice(usedVoiceId, targetLang, text);
 
 					// Khmer voice + Chinese/empty translation → blank audio. Fail clearly.
-					if (resolvedVoice.toLowerCase().startsWith('km') && !textContainsKhmer(text)) {
+					const needsKhmer =
+						engineId === 'voxcpm' ||
+						resolvedVoice.toLowerCase().startsWith('km') ||
+						resolvedVoice.toLowerCase().includes('-km-');
+					if (needsKhmer && !textContainsKhmer(text)) {
 						failures.push(
 							`#${cue.index}: no Khmer text (paste script or Translate first)`
 						);
@@ -1163,7 +1439,8 @@ export const projectStore = {
 					const baseSpeed = speed;
 					const basePitch = pitch;
 					const baseVolume = volume;
-					const windowMs = Math.max(200, cue.endMs - cue.startMs);
+					const referenceWavPath =
+						engineId === 'voxcpm' && bank?.refWavPath ? bank.refWavPath : undefined;
 
 					// Single pass at the user's Prosody — consistent pitch & rate.
 					const result = await engine.synthesize({
@@ -1173,7 +1450,8 @@ export const projectStore = {
 						pitch: basePitch,
 						speed: baseSpeed,
 						volume: baseVolume,
-						language: targetLang
+						language: targetLang,
+						referenceWavPath
 					});
 
 					const asset = await resolveAsset(result.filePath, cue.id);
@@ -1187,23 +1465,39 @@ export const projectStore = {
 						);
 					}
 
-					// Prefer measured duration (Rust / waveform). Never fall back to the
-					// Chinese ASR window — that left multi-second silence after short TTS.
+					// Prefer measured duration (Rust / waveform / byte estimate).
+					// NEVER fall back to the Chinese ASR window — that made short lines
+					// (e.g. Hahaha) draw a long TTS clip that visually ate into the next cue.
 					const naturalMs = Math.max(
 						200,
 						asset.durationMs && asset.durationMs > 80
 							? Math.round(asset.durationMs)
 							: typeof result.durationMs === 'number' && result.durationMs > 80
 								? Math.round(result.durationMs)
-								: estimateEdgeMp3DurationMs(result.byteLength) || windowMs
+								: estimateEdgeMp3DurationMs(result.byteLength) || 2_000
 					);
 
-					const live = project.cues.find((c) => c.id === cueId) ?? cue;
+					// Guard: another cue must never receive this same file.
+					const pathTaken = project.cues.some(
+						(c) =>
+							c.id !== cue.id &&
+							c.assignedAudio?.filePath &&
+							c.assignedAudio.filePath === result.filePath
+					);
+					if (pathTaken) {
+						throw new TtsError(
+							`#${cue.index}: TTS file collision — regenerate this cue`,
+							'failed'
+						);
+					}
+
 					const shortVoice =
 						result.providerVoice.split('-').slice(-1)[0] ?? result.providerVoice;
 					const label = `${engine.label} · ${voicesStore.find(usedVoiceId)?.name ?? shortVoice}`;
-					// Keep ASR start for now; pack all cues tightly after the batch.
-					const endMs = live.startMs + naturalMs;
+					// Keep start; expand end so the full Khmer line can play (natural pitch).
+					// Later cues are pushed if needed so your breath gaps stay between lines.
+					const needEnd = Math.max(cue.startMs + 200, cue.startMs + naturalMs);
+					const nextEnd = Math.max(cue.endMs, needEnd);
 
 					project = touch({
 						...project,
@@ -1211,7 +1505,11 @@ export const projectStore = {
 							if (c.id !== cue.id) return c;
 							return {
 								...c,
-								endMs: Math.max(c.startMs + 200, endMs),
+								endMs: nextEnd,
+								pictureEndMs:
+									typeof c.pictureEndMs === 'number'
+										? Math.max(c.pictureEndMs, nextEnd)
+										: nextEnd,
 								status: 'generated' as const,
 								voiceId: usedVoiceId,
 								pitch: basePitch,
@@ -1225,12 +1523,16 @@ export const projectStore = {
 									url: asset.url,
 									durationMs: naturalMs,
 									engine: result.engine,
-									fitPlaybackRate: 1
+									fitPlaybackRate: 1,
+									sourceText: text
 								}
 							};
-						}),
-						durationMs: Math.max(project.durationMs, endMs + 200)
+						})
 					});
+					// Grow into / past the next cue → slide followers (keeps gaps, full speech).
+					if (nextEnd > cue.endMs) {
+						this.trimCuePushNeighbors(cue.id, 'end', cue.startMs, nextEnd, 200);
+					}
 					completed += 1;
 				} catch (err) {
 					const message =
@@ -1260,9 +1562,9 @@ export const projectStore = {
 				generateError = `${completed} generated, ${failures.length} failed. ${failures[0]}`;
 			}
 
-			// Pack TTS back-to-back (~100ms breath). Drops Chinese ASR dead air.
+			// After Generate: cue ends cover full Khmer TTS; breath gaps stay between lines.
 			if (completed > 0) {
-				this.tightenCueGaps({ maxGapMs: 100, hangPadMs: 40 });
+				this.syncTimelineDuration();
 			}
 
 			return completed;
@@ -1293,13 +1595,439 @@ export const projectStore = {
 		});
 		if (!changed) return { pulledMs: 0, changed: 0 };
 
-		const maxEnd = nextCues.reduce((m, c) => Math.max(m, c.endMs), 0);
 		project = touch({
 			...project,
-			cues: nextCues,
-			durationMs: Math.max(project.durationMs, maxEnd + 200)
+			cues: nextCues
 		});
+		this.syncTimelineDuration();
 		return { pulledMs, changed };
+	},
+
+	/**
+	 * Stamp ASR/hardsub windows when missing — does NOT move cue start/end.
+	 */
+	stampPictureAnchorsOnly(): { changed: number } {
+		const next = withPictureAnchors(project.cues);
+		let changed = 0;
+		for (let i = 0; i < next.length; i++) {
+			const a = project.cues[i];
+			const b = next[i];
+			if (!a || !b) continue;
+			if (a.pictureStartMs !== b.pictureStartMs || a.pictureEndMs !== b.pictureEndMs) {
+				changed += 1;
+			}
+		}
+		if (!changed) return { changed: 0 };
+		project = touch({ ...project, cues: next });
+		return { changed };
+	},
+
+	/**
+	 * Stamp ASR/hardsub windows when missing, then lock Khmer starts/ends to them.
+	 * Short holds (Hahaha) keep the subtitle until picture end; next line waits
+	 * for its hardsub start — never breath-pack the next cue early.
+	 */
+	applyPictureLockTiming(opts?: {
+		maxRate?: number;
+		mediaTempoFromSource?: number;
+		mediaDurationMs?: number;
+	}): { changed: number } {
+		const beforeMissing = project.cues.some(
+			(c) => typeof c.pictureStartMs !== 'number' || typeof c.pictureEndMs !== 'number'
+		);
+		const anchored = withPictureAnchors(project.cues);
+		const tempo =
+			opts?.mediaTempoFromSource ??
+			(Number.isFinite(project.mediaTempoFromSource) ? project.mediaTempoFromSource! : 1);
+		const mediaDurationMs =
+			opts?.mediaDurationMs ??
+			(originalAudio.durationMs > 1000
+				? originalAudio.durationMs
+				: project.videoAssetId
+					? (project.assets.find((a) => a.id === project.videoAssetId)?.durationMs ?? 0)
+					: 0);
+		const patches = planPictureLockPatches(anchored, {
+			maxRate: opts?.maxRate ?? ALIGN_MAX_TTS_RATE,
+			mediaTempoFromSource: tempo,
+			mediaDurationMs: mediaDurationMs > 500 ? mediaDurationMs : undefined
+		});
+		const byId = new Map(patches.map((p) => [p.id, p]));
+		let changed = 0;
+		const nextCues = anchored.map((cue) => {
+			const p = byId.get(cue.id);
+			if (!p) return cue;
+			const audio = cue.assignedAudio;
+			const nextRate = p.fitPlaybackRate;
+			const prevRate = audio?.fitPlaybackRate ?? 1;
+			if (
+				p.startMs === cue.startMs &&
+				p.endMs === cue.endMs &&
+				Math.abs(prevRate - nextRate) < 0.001 &&
+				!beforeMissing
+			) {
+				return cue;
+			}
+			changed += 1;
+			return {
+				...cue,
+				startMs: p.startMs,
+				endMs: p.endMs,
+				pictureStartMs: cue.pictureStartMs ?? pictureAnchorStart(cue),
+				pictureEndMs: cue.pictureEndMs ?? pictureAnchorEnd(cue),
+				assignedAudio: audio ? { ...audio, fitPlaybackRate: nextRate } : audio
+			};
+		});
+
+		if (!changed && !beforeMissing) return { changed: 0 };
+
+		project = touch({ ...project, cues: nextCues });
+		this.syncTimelineDuration();
+		return { changed: Math.max(changed, beforeMissing ? 1 : 0) };
+	},
+
+	/**
+	 * Apply Smart Align timing patches (start/end + fitPlaybackRate).
+	 * Preserves pictureStartMs / pictureEndMs anchors from Extract.
+	 */
+	applySmartAlignPatches(patches: SmartAlignPatch[]): { changed: number } {
+		if (!patches.length) return { changed: 0 };
+		const byId = new Map(patches.map((p) => [p.id, p]));
+		let changed = 0;
+		const nextCues = withPictureAnchors(project.cues).map((cue) => {
+			const p = byId.get(cue.id);
+			if (!p) return cue;
+			const audio = cue.assignedAudio;
+			const prevRate = audio?.fitPlaybackRate ?? 1;
+			if (
+				p.startMs === cue.startMs &&
+				p.endMs === cue.endMs &&
+				Math.abs(prevRate - p.fitPlaybackRate) < 0.001
+			) {
+				return cue;
+			}
+			changed += 1;
+			return {
+				...cue,
+				startMs: p.startMs,
+				endMs: p.endMs,
+				assignedAudio: audio
+					? { ...audio, fitPlaybackRate: p.fitPlaybackRate }
+					: audio
+			};
+		});
+		if (!changed) return { changed: 0 };
+		project = touch({ ...project, cues: nextCues });
+		this.syncTimelineDuration();
+		return { changed };
+	},
+
+	/**
+	 * Speed TTS in place so speech fits each cue's existing window.
+	 * Does not change startMs / endMs.
+	 */
+	applyTtsRateOnlyToFitVideo(videoMs: number): { changed: number; maxRate: number } {
+		const mediaEnd = Math.max(500, Math.round(videoMs));
+		let changed = 0;
+		let maxRate = 1;
+		const nextCues = project.cues.map((cue) => {
+			const audio = cue.assignedAudio;
+			const natural = audio?.durationMs;
+			if (!audio || typeof natural !== 'number' || natural < 80) return cue;
+
+			const windowEnd = Math.min(cue.endMs, mediaEnd - 20);
+			const avail = Math.max(200, windowEnd - cue.startMs);
+			const nextRate =
+				Math.round(Math.min(ALIGN_MAX_TTS_RATE, Math.max(1, natural / avail)) * 1000) /
+				1000;
+			maxRate = Math.max(maxRate, nextRate);
+			const prevRate = audio.fitPlaybackRate ?? 1;
+			if (Math.abs(prevRate - nextRate) < 0.001) return cue;
+			changed += 1;
+			return {
+				...cue,
+				assignedAudio: { ...audio, fitPlaybackRate: nextRate }
+			};
+		});
+		if (changed) project = touch({ ...project, cues: nextCues });
+		return { changed, maxRate };
+	},
+
+	/**
+	 * Set project.durationMs from content end and real media length.
+	 * May shrink after Align packs a long dub back into the picture.
+	 */
+	syncTimelineDuration(): number {
+		const assetMs =
+			(project.videoAssetId
+				? project.assets.find((a) => a.id === project.videoAssetId)?.durationMs
+				: undefined) ?? 0;
+		const mediaMs = Math.max(
+			originalAudio.durationMs > 1000 ? originalAudio.durationMs : 0,
+			assetMs > 1000 ? assetMs : 0
+		);
+		let contentEnd = 0;
+		for (const cue of project.cues) {
+			contentEnd = Math.max(contentEnd, cueAudioEndMs(cue), cue.endMs);
+		}
+		const next = Math.max(mediaMs, contentEnd + 200, 1000);
+		if (next !== project.durationMs) {
+			project = touch({ ...project, durationMs: next });
+		}
+		return next;
+	},
+
+	/**
+	 * Apply a uniform speech playback rate (≥1) to generated TTS clips, shrink
+	 * cue windows to play-through length, then pack gaps. Used by Fit video to dub
+	 * so detailed scripts share squeeze with pitch-safe video tempo.
+	 */
+	applySpeechAlignRate(rate: number): { changed: number; rate: number } {
+		// Cap — Align prefers natural speech; mild bump only when video hits 0.50× floor.
+		const r = Math.round(Math.max(1, Math.min(ALIGN_FALLBACK_TTS_RATE, rate)) * 1000) / 1000;
+		if (r <= 1.001) {
+			// Reset rates to 1 and re-pack to natural lengths.
+			let changed = 0;
+			const nextCues = project.cues.map((cue) => {
+				const audio = cue.assignedAudio;
+				if (!audio?.durationMs || audio.durationMs < 80) return cue;
+				const natural = Math.round(audio.durationMs);
+				const prevRate = audio.fitPlaybackRate ?? 1;
+				if (Math.abs(prevRate - 1) < 0.001 && cue.endMs - cue.startMs === natural) {
+					return cue;
+				}
+				changed += 1;
+				return {
+					...cue,
+					endMs: cue.startMs + Math.max(200, natural),
+					assignedAudio: { ...audio, fitPlaybackRate: 1 }
+				};
+			});
+			if (changed) {
+				project = touch({ ...project, cues: nextCues });
+				this.tightenCueGaps({ maxGapMs: ALIGN_BREATH_MS, hangPadMs: ALIGN_HANG_PAD_MS });
+			}
+			return { changed, rate: 1 };
+		}
+
+		let changed = 0;
+		const nextCues = project.cues.map((cue) => {
+			const audio = cue.assignedAudio;
+			if (!audio?.durationMs || audio.durationMs < 80) return cue;
+			const natural = Math.round(audio.durationMs);
+			const playMs = Math.max(200, Math.ceil(natural / r));
+			changed += 1;
+			return {
+				...cue,
+				endMs: cue.startMs + playMs,
+				assignedAudio: { ...audio, fitPlaybackRate: r }
+			};
+		});
+		if (!changed) return { changed: 0, rate: r };
+		project = touch({ ...project, cues: nextCues });
+		this.tightenCueGaps({ maxGapMs: ALIGN_BREATH_MS, hangPadMs: ALIGN_HANG_PAD_MS });
+		return { changed, rate: r };
+	},
+
+	/**
+	 * Pack all cues into [0, mediaMs] using speech rate + gap tighten.
+	 * Used when Align still leaves TTS past the picture.
+	 * Does not delete script text.
+	 *
+	 * `allowForceFit` defaults false — Align must not chipmunk speech into a short
+	 * picture; force-fit is only for explicit last-resort callers.
+	 */
+	packCuesIntoMedia(
+		mediaMs: number,
+		maxRate = ALIGN_MAX_TTS_RATE,
+		opts?: { allowForceFit?: boolean }
+	): { rate: number; endMs: number } {
+		const target = Math.max(1000, Math.round(mediaMs) - 200);
+		if (target < 500 || !project.cues.length) {
+			return { rate: 1, endMs: this.syncTimelineDuration() };
+		}
+
+		// Natural packed length (ignore prior rates), including breath gaps.
+		const sorted = [...project.cues].sort(
+			(a, b) => a.startMs - b.startMs || a.index - b.index
+		);
+		const breath = ALIGN_BREATH_MS;
+		let natural = 0;
+		for (let i = 0; i < sorted.length; i++) {
+			const cue = sorted[i]!;
+			const dur = cue.assignedAudio?.durationMs;
+			natural +=
+				typeof dur === 'number' && dur > 80
+					? Math.round(dur)
+					: Math.max(200, cue.endMs - cue.startMs);
+			if (i < sorted.length - 1) natural += breath;
+		}
+
+		const need = natural / target;
+		// Mild squeeze only (Align default max ≈ 1.05).
+		const rate =
+			Math.round(Math.min(Math.max(1, need), Math.min(ALIGN_MAX_TTS_RATE, maxRate)) * 1000) /
+			1000;
+		if (rate > 1.001) {
+			this.applySpeechAlignRate(rate);
+		} else {
+			this.tightenCueGaps({ maxGapMs: ALIGN_BREATH_MS, hangPadMs: ALIGN_HANG_PAD_MS });
+		}
+
+		let endMs = 0;
+		for (const cue of project.cues) {
+			endMs = Math.max(endMs, cueAudioEndMs(cue), cue.endMs);
+		}
+
+		// Force-fit is gated — default Align never chipmunks into a short video.
+		if (endMs > mediaMs + 400 && endMs > 0 && opts?.allowForceFit) {
+			const forced = this.forceFitCuesIntoMedia(mediaMs);
+			return { rate: Math.max(rate, forced.rate), endMs: forced.endMs };
+		}
+
+		this.syncTimelineDuration();
+		return { rate, endMs };
+	},
+
+	/**
+	 * Last resort: pack every cue into [0, mediaMs] with a uniform rate (and
+	 * shorter breath if needed). Guarantees content ends at/before the picture
+	 * without re-running tightenCueGaps (which would grow the timeline again).
+	 */
+	forceFitCuesIntoMedia(mediaMs: number): { rate: number; endMs: number } {
+		const target = Math.max(1000, Math.round(mediaMs) - 200);
+		const sorted = [...project.cues].sort(
+			(a, b) => a.startMs - b.startMs || a.index - b.index
+		);
+		if (!sorted.length || target < 500) {
+			return { rate: 1, endMs: this.syncTimelineDuration() };
+		}
+
+		const naturals = sorted.map((cue) => {
+			const dur = cue.assignedAudio?.durationMs;
+			return typeof dur === 'number' && dur > 80
+				? Math.round(dur)
+				: Math.max(200, cue.endMs - cue.startMs);
+		});
+		const speechSum = Math.max(
+			1,
+			naturals.reduce((a, b) => a + b, 0)
+		);
+		const n = sorted.length;
+		const gapCount = Math.max(0, n - 1);
+		const minBreath = 120;
+
+		// Shrink breath until speech fits at ≤ force-fit rate.
+		let breath = ALIGN_BREATH_MS;
+		while (breath > minBreath) {
+			const speechBudget = target - gapCount * breath;
+			if (speechBudget >= n * 120 && speechSum / speechBudget <= ALIGN_FORCE_FIT_MAX_TTS_RATE) {
+				break;
+			}
+			breath = Math.max(minBreath, Math.round(breath * 0.8));
+		}
+
+		const speechBudget = Math.max(n * 120, target - gapCount * breath);
+		let rate = Math.min(
+			ALIGN_FORCE_FIT_MAX_TTS_RATE,
+			Math.max(1, speechSum / speechBudget)
+		);
+		rate = Math.round(rate * 1000) / 1000;
+
+		const byId = new Map<
+			string,
+			{ startMs: number; endMs: number; fitPlaybackRate: number }
+		>();
+		let t = 0;
+		for (let i = 0; i < sorted.length; i++) {
+			const cue = sorted[i]!;
+			const natural = naturals[i]!;
+			const playMs = Math.max(120, Math.ceil(natural / rate));
+			byId.set(cue.id, {
+				startMs: t,
+				endMs: t + playMs,
+				fitPlaybackRate: rate
+			});
+			t += playMs;
+			if (i < sorted.length - 1) t += breath;
+		}
+
+		// Still over (extreme script): proportional slots inside target; rate matches slot.
+		if (t > target + 40) {
+			breath = minBreath;
+			const available = Math.max(n * 120, target - gapCount * breath);
+			t = 0;
+			for (let i = 0; i < sorted.length; i++) {
+				const cue = sorted[i]!;
+				const natural = naturals[i]!;
+				const share = Math.max(
+					120,
+					Math.round((available * natural) / speechSum)
+				);
+				const slotRate = Math.min(
+					ALIGN_FORCE_FIT_MAX_TTS_RATE,
+					Math.max(1, natural / share)
+				);
+				// Keep audio end = subtitle end inside the share.
+				const playMs = Math.min(share, Math.max(120, Math.ceil(natural / slotRate)));
+				const fitPlaybackRate = Math.min(
+					ALIGN_FORCE_FIT_MAX_TTS_RATE,
+					Math.max(1, natural / playMs)
+				);
+				byId.set(cue.id, {
+					startMs: t,
+					endMs: t + playMs,
+					fitPlaybackRate: Math.round(fitPlaybackRate * 1000) / 1000
+				});
+				t += playMs;
+				if (i < sorted.length - 1) t += breath;
+			}
+			// Hard scale if rounding still overshoots.
+			if (t > target + 40) {
+				const scale = target / t;
+				let cursor = 0;
+				for (let i = 0; i < sorted.length; i++) {
+					const cue = sorted[i]!;
+					const slot = byId.get(cue.id)!;
+					const playMs = Math.max(120, Math.round((slot.endMs - slot.startMs) * scale));
+					const natural = naturals[i]!;
+					const fitPlaybackRate = Math.min(
+						ALIGN_FORCE_FIT_MAX_TTS_RATE,
+						Math.max(1, natural / playMs)
+					);
+					byId.set(cue.id, {
+						startMs: cursor,
+						endMs: cursor + playMs,
+						fitPlaybackRate: Math.round(fitPlaybackRate * 1000) / 1000
+					});
+					cursor += playMs;
+					if (i < sorted.length - 1) {
+						cursor += Math.max(40, Math.round(breath * scale));
+					}
+				}
+			}
+		}
+
+		const nextCues = project.cues.map((cue) => {
+			const slot = byId.get(cue.id);
+			if (!slot) return cue;
+			const audio = cue.assignedAudio;
+			return {
+				...cue,
+				startMs: slot.startMs,
+				endMs: slot.endMs,
+				assignedAudio: audio
+					? { ...audio, fitPlaybackRate: slot.fitPlaybackRate }
+					: audio
+			};
+		});
+		project = touch({ ...project, cues: nextCues });
+
+		let endMs = 0;
+		for (const cue of project.cues) {
+			endMs = Math.max(endMs, cueAudioEndMs(cue), cue.endMs);
+		}
+		this.syncTimelineDuration();
+		return { rate, endMs };
 	},
 
 	/** Remove TTS audio from cues; keeps the subtitle rows. */
@@ -1316,6 +2044,7 @@ export const projectStore = {
 				}
 				cleared += 1;
 				delete nextWaveforms[cue.id];
+				notifyTtsInvalidate(cue.id);
 				return {
 					...cue,
 					status:
@@ -1330,12 +2059,35 @@ export const projectStore = {
 		return cleared;
 	},
 
-	/** True when the cue should show a clip on the TTS Audio track. */
-	cueHasTtsAudio(cue: { status: string; assignedAudio?: unknown }): boolean {
-		return cue.status === 'generated' || cue.assignedAudio != null;
+	/** True when the cue has a playable TTS clip that matches its current text. */
+	cueHasTtsAudio(cue: {
+		status: string;
+		translation?: string;
+		source?: string;
+		assignedAudio?: {
+			filePath?: string | null;
+			url?: string | null;
+			sourceText?: string;
+		} | null;
+	}): boolean {
+		return cueTtsMatchesText(cue);
+	},
+
+	/** Register mixer invalidate (VideoPreview). Pass null to clear. */
+	setTtsInvalidateHandler(handler: ((cueId: string | null) => void) | null) {
+		ttsInvalidateHandler = handler;
 	},
 
 	updateCue(id: string, patch: Partial<Omit<SubtitleCue, 'id' | 'index'>>) {
+		const speechKeys = [
+			'translation',
+			'source',
+			'voiceId',
+			'pitch',
+			'speed',
+			'volume',
+			'speaker'
+		] as const;
 		project = touch({
 			...project,
 			cues: project.cues.map((cue) => {
@@ -1344,53 +2096,200 @@ export const projectStore = {
 				if (typeof patch.voiceId === 'string') {
 					next.voiceId = migrateVoiceId(patch.voiceId);
 				}
+				if (typeof patch.speaker === 'string') {
+					const bank = (project.speakerBank ?? []).find(
+						(s) => s.id === patch.speaker!.trim()
+					);
+					if (bank?.voiceId) next.voiceId = bank.voiceId;
+				}
 				if (next.endMs < next.startMs) next.endMs = next.startMs;
+
+				const speechChanged = speechKeys.some((key) => {
+					if (!(key in patch)) return false;
+					return (patch as Record<string, unknown>)[key] !== cue[key];
+				});
+				if (speechChanged && cue.assignedAudio) {
+					next.assignedAudio = null;
+					if (next.status === 'generated' || next.status === 'error') {
+						next.status = 'ready';
+					}
+					dropTtsWaveforms([cue.id]);
+				}
 				return next;
 			})
 		});
 	},
 
 	/**
-	 * Assign pasted Khmer script lines to cues in timeline order (one non-empty line → one cue).
-	 * Extra lines become new cues after the last ASR window (estimated duration by length).
-	 * Clears TTS so Generate uses the new text. Existing cue start times stay put unless
-	 * extras grow the timeline past the picture (then use Fit video to dub).
+	 * Assign pasted Khmer script.
+	 * Default (`fitToExtractSpan`): rebuild cues so 1 script line = 1 cue inside the
+	 * Extract speech span (FunASR blobs are only a timeline; lines match hardsubs).
+	 * Opt-in `mergeExtraLines`: pack into existing ASR cue count (old glue).
+	 * Clears TTS so Generate uses the new text.
 	 */
-	applyScriptTranslations(script: string): {
+	applyScriptTranslations(
+		script: string,
+		opts?: {
+			createExtraCues?: boolean;
+			mergeExtraLines?: boolean;
+			/** Default true — carve N line windows from Extract span. */
+			fitToExtractSpan?: boolean;
+		}
+	): {
 		applied: number;
 		lineCount: number;
+		sentenceCount: number;
 		cueCount: number;
 		createdCues: number;
 		unfilledCues: number;
+		mergedExtraLines: number;
+		estimatedSpeechMs: number;
+		fittedToSpan: boolean;
+		extractCueCount: number;
 	} {
-		const lines = String(script ?? '')
-			.split(/\r?\n/)
-			.map((l) => l.trim())
-			.filter((l) => l.length > 0);
+		const lines = splitKhmerSentences(script);
 		const cues = [...project.cues].sort((a, b) => a.index - b.index || a.startMs - b.startMs);
 		const cueCount = cues.length;
 		const lineCount = lines.length;
-		if (lineCount === 0) {
-			return { applied: 0, lineCount: 0, cueCount, createdCues: 0, unfilledCues: cueCount };
+		const estimatedSpeechMs = lines.reduce((sum, s) => sum + estimateKhmerSpeechMs(s), 0);
+		const mergeExtra =
+			opts?.mergeExtraLines === true || opts?.createExtraCues === false;
+		const fitToSpan = !mergeExtra && opts?.fitToExtractSpan !== false;
+
+		const empty = {
+			applied: 0,
+			lineCount: 0,
+			sentenceCount: 0,
+			cueCount,
+			createdCues: 0,
+			unfilledCues: cueCount,
+			mergedExtraLines: 0,
+			estimatedSpeechMs: 0,
+			fittedToSpan: false,
+			extractCueCount: cueCount
+		};
+
+		if (lineCount === 0) return empty;
+
+		// No Extract / Import yet — create cues from the script so you can arrange on the timeline.
+		if (cueCount === 0) {
+			const startAt = Math.max(0, Math.round(playback.playheadMs));
+			const breath = 200;
+			const weights = lines.map((l) => Math.max(900, estimateKhmerSpeechMs(l)));
+			const span =
+				weights.reduce((s, w) => s + w, 0) + breath * Math.max(0, lineCount - 1);
+			const planned = planCuesFromScriptLines(
+				lines,
+				[{ startMs: startAt, endMs: startAt + Math.max(span, lineCount * 900), source: '' }],
+				{ breathMs: breath, minCueMs: 900 }
+			);
+			const nextCues = planned.cues.map((p, i) =>
+				createSubtitleCue(
+					i + 1,
+					{
+						startMs: p.startMs,
+						endMs: p.endMs,
+						pictureStartMs: p.startMs,
+						pictureEndMs: p.endMs,
+						source: '',
+						translation: p.translation,
+						status: 'ready',
+						speaker: 'Speaker 1',
+						voiceId,
+						pitch,
+						speed,
+						volume,
+						assignedAudio: null
+					},
+					{ voiceId, speaker: 'Speaker 1' }
+				)
+			);
+			dropTtsWaveforms([]);
+			project = touch({ ...project, cues: nextCues });
+			this.syncTimelineDuration();
+			return {
+				applied: nextCues.length,
+				lineCount,
+				sentenceCount: lineCount,
+				cueCount: nextCues.length,
+				createdCues: nextCues.length,
+				unfilledCues: 0,
+				mergedExtraLines: 0,
+				estimatedSpeechMs,
+				fittedToSpan: false,
+				extractCueCount: 0
+			};
 		}
 
-		/** Rough Khmer TTS length from character count (ms). */
-		const estimateLineMs = (text: string) =>
-			Math.max(1_400, Math.min(14_000, Math.round(text.length * 90)));
+		// Default: fit script lines into Extract speech span (1 line → 1 cue).
+		if (fitToSpan && cueCount > 0) {
+			const planned = planCuesFromScriptLines(lines, cues);
+			const template = cues[0]!;
+			const nextCues = planned.cues.map((p, i) =>
+				createSubtitleCue(
+					i + 1,
+					{
+						startMs: p.startMs,
+						endMs: p.endMs,
+						pictureStartMs: p.startMs,
+						pictureEndMs: p.endMs,
+						source: p.source,
+						translation: p.translation,
+						status: 'ready',
+						speaker: template.speaker ?? 'Speaker 1',
+						voiceId: template.voiceId ?? voiceId,
+						pitch: template.pitch ?? pitch,
+						speed: template.speed ?? speed,
+						volume: template.volume ?? volume,
+						assignedAudio: null
+					},
+					{ voiceId, speaker: template.speaker ?? 'Speaker 1' }
+				)
+			);
+
+			dropTtsWaveforms(project.cues.map((c) => c.id));
+			project = touch({ ...project, cues: nextCues });
+			this.syncTimelineDuration();
+
+			return {
+				applied: nextCues.length,
+				lineCount,
+				sentenceCount: lineCount,
+				cueCount: nextCues.length,
+				createdCues: Math.max(0, nextCues.length - cueCount),
+				unfilledCues: 0,
+				mergedExtraLines: 0,
+				estimatedSpeechMs,
+				fittedToSpan: true,
+				extractCueCount: planned.extractCueCount
+			};
+		}
 
 		const byId = new Map<string, string>();
-		const n = Math.min(lineCount, cueCount);
-		for (let i = 0; i < n; i++) {
-			byId.set(cues[i]!.id, lines[i]!);
-		}
-
+		let mergedExtraLines = 0;
 		const created: SubtitleCue[] = [];
-		if (lineCount > cueCount) {
+
+		if (mergeExtra && lineCount > cueCount) {
+			const slots = packLinesIntoCueSlots(lines, cueCount);
+			mergedExtraLines = Math.max(0, lineCount - cueCount);
+			for (let i = 0; i < cueCount; i++) {
+				const text = slots[i] ?? '';
+				if (!text) continue;
+				byId.set(cues[i]!.id, text);
+			}
+		} else if (lineCount <= cueCount) {
+			for (let i = 0; i < lineCount; i++) {
+				byId.set(cues[i]!.id, lines[i]!);
+			}
+		} else {
+			for (let i = 0; i < cueCount; i++) {
+				byId.set(cues[i]!.id, lines[i]!);
+			}
 			const last = cues[cues.length - 1];
 			let cursor = last ? last.endMs : 0;
 			for (let i = cueCount; i < lineCount; i++) {
 				const text = lines[i]!;
-				const dur = estimateLineMs(text);
+				const dur = estimateKhmerSpeechMs(text);
 				const startMs = cursor;
 				const endMs = startMs + dur;
 				created.push(
@@ -1435,20 +2334,26 @@ export const projectStore = {
 			.sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs)
 			.map((c, i) => ({ ...c, index: i + 1 }));
 
-		const maxEnd = nextCues.reduce((m, c) => Math.max(m, c.endMs), 0);
+		dropTtsWaveforms([...byId.keys()]);
 
 		project = touch({
 			...project,
-			cues: nextCues,
-			durationMs: Math.max(project.durationMs, maxEnd + 200)
+			cues: nextCues
 		});
+		this.syncTimelineDuration();
 
+		const applied = byId.size + created.length;
 		return {
-			applied: n + created.length,
+			applied,
 			lineCount,
+			sentenceCount: lineCount,
 			cueCount: nextCues.length,
 			createdCues: created.length,
-			unfilledCues: Math.max(0, cueCount - lineCount)
+			unfilledCues: Math.max(0, cueCount - byId.size),
+			mergedExtraLines,
+			estimatedSpeechMs,
+			fittedToSpan: false,
+			extractCueCount: cueCount
 		};
 	},
 
@@ -1655,6 +2560,8 @@ export const projectStore = {
 			.join(' ');
 		const remove = new Set(selected.slice(1).map((c) => c.id));
 
+		dropTtsWaveforms([keep.id, ...remove]);
+
 		project = touch({
 			...project,
 			cues: project.cues
@@ -1667,7 +2574,8 @@ export const projectStore = {
 								endMs: Math.max(startMs + 200, endMs),
 								translation: translation || c.translation,
 								source: source || c.source,
-								status: c.status === 'generated' ? ('ready' as const) : c.status
+								status: 'ready' as const,
+								assignedAudio: null
 							}
 						: c
 				)
@@ -1708,7 +2616,26 @@ export const projectStore = {
 
 	assignAudioToCue(targetCueId: string, sourceCueId: string) {
 		const source = project.cues.find((c) => c.id === sourceCueId);
-		if (!source) return;
+		const target = project.cues.find((c) => c.id === targetCueId);
+		if (!source || !target) return;
+
+		const sameText = cueSpeakText(target) === cueSpeakText(source);
+		const srcAudio = source.assignedAudio;
+		const canCopyClip =
+			sameText &&
+			!!srcAudio &&
+			!!(srcAudio.filePath || srcAudio.url);
+
+		if (canCopyClip) {
+			const peaks = ttsWaveforms[sourceCueId];
+			if (peaks?.length) {
+				ttsWaveforms = { ...ttsWaveforms, [targetCueId]: [...peaks] };
+			}
+		} else {
+			dropTtsWaveforms([targetCueId]);
+		}
+		notifyTtsInvalidate(targetCueId);
+
 		project = touch({
 			...project,
 			cues: project.cues.map((cue) => {
@@ -1719,11 +2646,21 @@ export const projectStore = {
 					pitch: source.pitch,
 					speed: source.speed,
 					volume: source.volume,
-					status: cue.status === 'draft' ? ('ready' as const) : cue.status,
-					assignedAudio: {
-						sourceCueId: source.id,
-						label: `TTS #${source.index}`
-					}
+					status: canCopyClip
+						? ('generated' as const)
+						: cue.status === 'generated'
+							? ('ready' as const)
+							: cue.status === 'draft'
+								? ('ready' as const)
+								: cue.status,
+					assignedAudio: canCopyClip
+						? {
+								...srcAudio!,
+								sourceCueId: source.id,
+								label: srcAudio!.label || `TTS #${source.index}`,
+								sourceText: srcAudio!.sourceText ?? cueSpeakText(source)
+							}
+						: null
 				};
 			})
 		});
@@ -1748,15 +2685,21 @@ export const projectStore = {
 		videoPath = filesystemPath?.trim() || null;
 		videoUrl = URL.createObjectURL(file);
 
-		const asset = createMediaAsset(file, 'video', project.durationMs);
+		const asset = createMediaAsset(file, 'video', 0);
 		if (videoPath) asset.path = videoPath;
 		const otherAssets = project.assets.filter((a) => a.id !== project.videoAssetId);
 		const syncTitle = options?.syncTitle !== false;
+		if (syncTitle) {
+			sourceVideoFile = file;
+			sourceVideoPath = videoPath;
+			sourceDurationMs = 0;
+		}
 		project = touch({
 			...project,
 			name: syncTitle ? titleFromMediaFileName(file.name) : project.name,
 			videoAssetId: asset.id,
-			assets: [asset, ...otherAssets]
+			assets: [asset, ...otherAssets],
+			mediaTempoFromSource: syncTitle ? 1 : (project.mediaTempoFromSource ?? 1)
 		});
 		playback.isPlaying = false;
 		playback.focusedCueId = null;
@@ -1785,12 +2728,19 @@ export const projectStore = {
 			asset.path = path;
 			const otherAssets = project.assets.filter((a) => a.id !== project.videoAssetId);
 			const syncTitle = options?.syncTitle !== false;
+			if (syncTitle) {
+				sourceVideoPath = path;
+				sourceVideoFile = null;
+				sourceDurationMs = 0;
+			}
 			project = touch(
 				{
 					...project,
 					name: syncTitle ? titleFromMediaFileName(name) : project.name,
 					videoAssetId: asset.id,
-					assets: [asset, ...otherAssets]
+					assets: [asset, ...otherAssets],
+					// New user media → source timeline. Remaster keeps prior factor until applyVideoTempo.
+					mediaTempoFromSource: syncTitle ? 1 : (project.mediaTempoFromSource ?? 1)
 				},
 				{ recordHistory: options?.recordHistory !== false }
 			);
@@ -1808,11 +2758,15 @@ export const projectStore = {
 	clearVideo() {
 		revokeVideoUrl();
 		resetOriginalAudio();
+		sourceVideoPath = null;
+		sourceVideoFile = null;
+		sourceDurationMs = 0;
 		const videoId = project.videoAssetId;
 		project = touch({
 			...project,
 			videoAssetId: null,
-			assets: videoId ? project.assets.filter((a) => a.id !== videoId) : project.assets
+			assets: videoId ? project.assets.filter((a) => a.id !== videoId) : project.assets,
+			mediaTempoFromSource: 1
 		});
 		playback.isPlaying = false;
 		playback.focusedCueId = null;
@@ -1821,48 +2775,167 @@ export const projectStore = {
 
 	/**
 	 * After FFmpeg pitch-safe remaster: swap video media, update duration.
-	 * By default scales cue times by 1/tempo and clears TTS.
-	 * Pass `scaleCues: false` for “fit video to dub” (keep cue/TTS timeline).
+	 * Picture-lock Align: remap cues from source anchors (anchors never scaled).
+	 * Manual Apply: `scaleCues: false` — subtitle times stay exactly as on the timeline;
+	 * only picture/audio media changes.
 	 */
 	async applyVideoTempo(
 		tempo: number,
 		outputPath: string,
 		durationMs: number,
-		opts?: { scaleCues?: boolean }
+		opts?: {
+			scaleCues?: boolean;
+			clearAudio?: boolean;
+			pictureLock?: boolean;
+			absoluteFromSource?: boolean;
+		}
 	): Promise<boolean> {
 		const t = Number(tempo);
 		if (!Number.isFinite(t) || t <= 0) return false;
 
 		pushUndoSnapshot();
 
+		const pictureLock = opts?.pictureLock === true;
+		const absoluteFromSource = opts?.absoluteFromSource === true;
 		const scaleCues = opts?.scaleCues !== false;
-		const nextCues = scaleCues
-			? scaleCueTimesForTempo(project.cues, t).map((cue) => ({
+		const clearAudio = opts?.clearAudio ?? (pictureLock ? false : scaleCues);
+
+		const prevTempo = Number.isFinite(project.mediaTempoFromSource)
+			? Math.max(0.25, project.mediaTempoFromSource!)
+			: 1;
+		// Absolute Manual Apply sets the factor vs original; relative remasters multiply.
+		const nextTempoFromSource = absoluteFromSource
+			? Math.round(Math.min(2, Math.max(0.25, t)) * 10000) / 10000
+			: Math.round(Math.min(2, Math.max(0.25, prevTempo * t)) * 10000) / 10000;
+
+		let nextCues = project.cues;
+		if (pictureLock) {
+			const anchored = withPictureAnchors(project.cues);
+			const patches = planPictureLockPatches(anchored, {
+				maxRate: ALIGN_MAX_TTS_RATE,
+				mediaTempoFromSource: nextTempoFromSource,
+				mediaDurationMs: Math.round(durationMs)
+			});
+			const byId = new Map(patches.map((p) => [p.id, p]));
+			nextCues = anchored.map((cue) => {
+				const p = byId.get(cue.id);
+				if (!p) return cue;
+				const audio = clearAudio ? null : cue.assignedAudio;
+				return {
 					...cue,
-					status: cue.status === 'generated' ? ('ready' as const) : cue.status,
-					assignedAudio: null
-				}))
-			: project.cues;
+					startMs: p.startMs,
+					endMs: p.endMs,
+					pictureStartMs: cue.pictureStartMs ?? pictureAnchorStart(cue),
+					pictureEndMs: cue.pictureEndMs ?? pictureAnchorEnd(cue),
+					status:
+						clearAudio && cue.status === 'generated' ? ('ready' as const) : cue.status,
+					assignedAudio: audio
+						? { ...audio, fitPlaybackRate: p.fitPlaybackRate }
+						: null
+				};
+			});
+		} else if (scaleCues) {
+			const cueScale = absoluteFromSource
+				? nextTempoFromSource / Math.max(0.25, prevTempo)
+				: t;
+			nextCues = scaleCueTimesForTempo(project.cues, cueScale).map((cue) => ({
+				...cue,
+				status:
+					clearAudio && cue.status === 'generated' ? ('ready' as const) : cue.status,
+				assignedAudio: clearAudio ? null : cue.assignedAudio
+			}));
+		}
 
 		const nextDuration = Math.max(
 			1000,
 			Math.round(durationMs) || Math.round((project.durationMs || 0) / t)
 		);
+		// When leaving cues alone, keep timeline long enough for existing subtitles.
+		const leaveCuesAlone = !pictureLock && !scaleCues;
+		let contentFloor = 0;
+		if (leaveCuesAlone) {
+			for (const cue of project.cues) {
+				contentFloor = Math.max(contentFloor, cueAudioEndMs(cue), cue.endMs);
+			}
+		}
+		const projectDuration = leaveCuesAlone
+			? Math.max(nextDuration, contentFloor > 0 ? contentFloor + 200 : 0)
+			: nextDuration;
 
-		// Load remastered file first (resets playhead); then restore cues + duration.
 		const ok = await this.setVideoFromPath(outputPath, {
 			syncTitle: false,
 			recordHistory: false
 		});
 		if (!ok) return false;
 
+		if (absoluteFromSource && sourceDurationMs < 1000) {
+			sourceDurationMs = Math.max(1000, Math.round(nextDuration * nextTempoFromSource));
+		}
+
 		project = touch(
 			{
 				...project,
 				cues: nextCues,
-				durationMs: nextDuration,
+				durationMs: projectDuration,
+				mediaTempoFromSource: nextTempoFromSource,
 				assets: project.assets.map((a) =>
-					a.id === project.videoAssetId ? { ...a, durationMs: nextDuration, path: outputPath } : a
+					a.id === project.videoAssetId
+						? { ...a, durationMs: nextDuration, path: outputPath }
+						: a
+				)
+			},
+			{ recordHistory: false }
+		);
+		playback.playheadMs = Math.min(playback.playheadMs, projectDuration);
+		playback.focusedCueId = null;
+		return true;
+	},
+
+	/**
+	 * Restore original source media at 1.00×. Subtitle cue times stay as-is.
+	 * Requires `sourceVideoPath` / `sourceVideoFile` from the user’s open.
+	 */
+	async restoreSourceVideoTempo(_opts?: { scaleCues?: boolean }): Promise<boolean> {
+		const path = sourceVideoPath?.trim() || null;
+		const file = sourceVideoFile;
+		if (!path && !file) return false;
+
+		pushUndoSnapshot();
+
+		const mediaDuration = Math.max(
+			1000,
+			sourceDurationMs ||
+				Math.round(
+					(project.durationMs || 0) * Math.max(0.25, project.mediaTempoFromSource ?? 1)
+				) ||
+				project.durationMs
+		);
+		let contentFloor = 0;
+		for (const cue of project.cues) {
+			contentFloor = Math.max(contentFloor, cueAudioEndMs(cue), cue.endMs);
+		}
+		const nextDuration = Math.max(
+			mediaDuration,
+			contentFloor > 0 ? contentFloor + 200 : 0
+		);
+
+		let ok = false;
+		if (path) {
+			ok = await this.setVideoFromPath(path, { syncTitle: false, recordHistory: false });
+		} else if (file) {
+			ok = this.setVideoFromFile(file, null, { syncTitle: false });
+		}
+		if (!ok) return false;
+
+		project = touch(
+			{
+				...project,
+				durationMs: nextDuration,
+				mediaTempoFromSource: 1,
+				assets: project.assets.map((a) =>
+					a.id === project.videoAssetId
+						? { ...a, durationMs: mediaDuration, path: path ?? a.path }
+						: a
 				)
 			},
 			{ recordHistory: false }
@@ -1898,6 +2971,10 @@ export const projectStore = {
 			durationMs = Math.max(durationMs, this.contentEndMs() + 200);
 		}
 		const videoId = project.videoAssetId;
+		const atSourceTempo = Math.abs((project.mediaTempoFromSource ?? 1) - 1) < 0.001;
+		if (atSourceTempo) {
+			sourceDurationMs = mediaMs;
+		}
 		project = touch(
 			{
 				...project,
@@ -1911,36 +2988,51 @@ export const projectStore = {
 		if (playback.playheadMs > durationMs) playback.playheadMs = durationMs;
 	},
 
-	importMediaFiles(files: File[]): number {
+	/**
+	 * Import dropped/picked media. Video opens as picture; `.srt` loads into the cue table.
+	 * Returns how many files were accepted as assets / subtitle imports.
+	 */
+	async importMediaFiles(files: File[]): Promise<number> {
 		let videoFile: File | null = null;
+		const subtitleFiles: File[] = [];
 		const added: ReturnType<typeof createMediaAsset>[] = [];
+		let accepted = 0;
 
 		for (const file of files) {
 			const kind = classifyMediaFile(file);
 			if (!kind) continue;
+			accepted += 1;
 			if (kind === 'video' && !videoFile) videoFile = file;
-			added.push(createMediaAsset(file, kind, kind === 'subtitle' ? 0 : project.durationMs));
+			if (kind === 'subtitle' && /\.srt$/i.test(file.name)) {
+				subtitleFiles.push(file);
+				continue;
+			}
+			if (kind === 'subtitle') {
+				// Non-SRT subtitle containers — keep as asset only for now.
+				added.push(createMediaAsset(file, kind, 0));
+				continue;
+			}
+			added.push(createMediaAsset(file, kind, project.durationMs));
 		}
 
-		if (!added.length) return 0;
+		if (!accepted) return 0;
 
 		if (videoFile) {
 			this.setVideoFromFile(videoFile);
-			const extras = added.filter((a) => a.kind !== 'video');
-			if (extras.length) {
-				project = touch({
-					...project,
-					assets: [...extras, ...project.assets]
-				});
-			}
-			return added.length;
+		}
+		if (added.length) {
+			project = touch({
+				...project,
+				assets: [...added, ...project.assets]
+			});
 		}
 
-		project = touch({
-			...project,
-			assets: [...added, ...project.assets]
-		});
-		return added.length;
+		// First .srt wins → cue table (replace). Extra .srt files are ignored for cues.
+		if (subtitleFiles[0]) {
+			await this.importSrtFile(subtitleFiles[0], { replace: true });
+		}
+
+		return accepted;
 	},
 
 	/**
@@ -1957,6 +3049,9 @@ export const projectStore = {
 		playback.playheadMs = start;
 		playback.focusedCueId = id;
 		playback.isPlaying = true;
+		void import('$lib/tts/voice-preview')
+			.then((m) => m.stopVoicePreview())
+			.catch(() => undefined);
 	},
 
 	/** Play/pause toggle for one cue (row Play button or TTS block). */
@@ -1964,7 +3059,7 @@ export const projectStore = {
 		const cue = project.cues.find((item) => item.id === id);
 		if (!cue) return;
 
-		const end = cueAudioEndMs(cue);
+		const end = cuePreviewEndMs(cue);
 		const inCue = playback.playheadMs >= cue.startMs && playback.playheadMs < end;
 		const isThisPlaying =
 			playback.isPlaying && (playback.focusedCueId === id || inCue);
@@ -1983,13 +3078,13 @@ export const projectStore = {
 		if (playback.focusedCueId === id) return true;
 		const cue = project.cues.find((item) => item.id === id);
 		if (!cue) return false;
-		const end = cueAudioEndMs(cue);
+		const end = cuePreviewEndMs(cue);
 		return playback.playheadMs >= cue.startMs && playback.playheadMs < end;
 	},
 
 	/**
-	 * When a cue-focused play runs past the (audio-aware) cue end, stop transport.
-	 * Called from the video clock so TTS preview doesn't keep rolling the whole timeline.
+	 * When a cue-focused play runs past the subtitle period, stop transport.
+	 * Called from the video clock so TTS preview stops at the window you arranged.
 	 */
 	finishFocusedCueIfPast(playheadMs: number) {
 		const id = playback.focusedCueId;
@@ -1999,7 +3094,7 @@ export const projectStore = {
 			playback.focusedCueId = null;
 			return;
 		}
-		const end = cueAudioEndMs(cue);
+		const end = cuePreviewEndMs(cue);
 		if (playheadMs >= end - 16) {
 			playback.isPlaying = false;
 			playback.focusedCueId = null;
@@ -2033,11 +3128,112 @@ export const projectStore = {
 	setDubTool(tool: string) {
 		activeDubTool = tool;
 	},
-	setVoiceId(id: string) {
-		const next = voicesStore.ensureVoicePresent(id);
+	setVoiceId(id: string, opts?: { applyToCues?: boolean }) {
+		const engine = getTtsEngineId();
+		const mapped = mapVoiceIdToEngine(id, engine);
+		const next =
+			engine === 'edge-tts' ? voicesStore.ensureVoicePresent(mapped) : mapped;
 		voiceId = next;
 		// Remember last selected voice across sessions.
 		preferencesStore.setDefaultVoiceId(next);
+		if (opts?.applyToCues !== false) {
+			// Default: stamp onto selected cues (or all if none selected), like Prosody.
+			this.applyVoiceToCues(next);
+		}
+	},
+
+	/**
+	 * Apply a voice id to selected subtitle rows (or all rows if none selected).
+	 * Clears TTS on changed cues so Generate uses the new voice.
+	 */
+	applyVoiceToCues(id: string): number {
+		const engine = getTtsEngineId();
+		const next =
+			engine === 'edge-tts'
+				? voicesStore.ensureVoicePresent(mapVoiceIdToEngine(id, engine))
+				: mapVoiceIdToEngine(id, engine);
+		const ids =
+			selectedCueIds.length > 0
+				? new Set(selectedCueIds)
+				: new Set(project.cues.map((c) => c.id));
+		if (!ids.size) return 0;
+
+		let changed = 0;
+		const nextWaveforms = { ...ttsWaveforms };
+		const nextCues = project.cues.map((cue) => {
+			if (!ids.has(cue.id)) return cue;
+			if (cue.voiceId === next && !cue.assignedAudio) return cue;
+			changed += 1;
+			delete nextWaveforms[cue.id];
+			return {
+				...cue,
+				voiceId: next,
+				status:
+					cue.status === 'generated' || cue.status === 'error'
+						? ('ready' as const)
+						: cue.status,
+				assignedAudio: null
+			};
+		});
+		if (!changed) return 0;
+		ttsWaveforms = nextWaveforms;
+		project = touch({ ...project, cues: nextCues });
+		return changed;
+	},
+
+	/**
+	 * Remap session + every cue (+ speaker bank) voices to the active TTS engine
+	 * (e.g. Edge Sreymom/Piseth ↔ VoxCPM presets), preserving gender. Clears TTS
+	 * so Generate uses the new engine voices.
+	 */
+	syncVoicesToTtsEngine(engine?: TtsEngineId): { cues: number; speakers: number } {
+		const eng = engine ?? getTtsEngineId();
+		const nextSession = mapVoiceIdToEngine(voiceId, eng);
+		voiceId =
+			eng === 'edge-tts' ? voicesStore.ensureVoicePresent(nextSession) : nextSession;
+		preferencesStore.setDefaultVoiceId(voiceId);
+
+		let cueCount = 0;
+		const nextCues = project.cues.map((cue) => {
+			const bank = (project.speakerBank ?? []).find(
+				(s) => s.id === (cue.speaker || '').trim()
+			);
+			const nextVoice = mapVoiceIdToEngine(
+				cue.voiceId || voiceId,
+				eng,
+				bank?.gender ?? null
+			);
+			const engineOk = voiceMatchesEngine(cue.voiceId, eng);
+			const same = engineOk && cue.voiceId === nextVoice;
+			if (same && !cue.assignedAudio) return cue;
+			cueCount += 1;
+			return {
+				...cue,
+				voiceId: nextVoice,
+				status:
+					cue.status === 'generated' || cue.status === 'error'
+						? ('ready' as const)
+						: cue.status,
+				assignedAudio: null
+			};
+		});
+
+		let speakerCount = 0;
+		const nextBank = (project.speakerBank ?? []).map((s) => {
+			const nextVoice = voiceIdForEngineGender(eng, s.gender);
+			if (s.voiceId === nextVoice && voiceMatchesEngine(s.voiceId, eng)) return s;
+			speakerCount += 1;
+			return { ...s, voiceId: nextVoice };
+		});
+
+		const waveforms: Record<string, number[]> = {};
+		project = touch({
+			...project,
+			cues: nextCues,
+			speakerBank: nextBank
+		});
+		ttsWaveforms = waveforms;
+		return { cues: cueCount, speakers: speakerCount };
 	},
 	/** Update target dub language on the open project + dub track label. */
 	setTargetLanguage(code: string) {
@@ -2154,6 +3350,99 @@ export const projectStore = {
 		this.applyProsodyToCues({ pitch, speed, volume });
 		const n = await this.generateCues(selectedCueIds);
 		return n;
+	},
+
+	/**
+	 * Cluster ASR cues into Speaker 1..N, write reference WAVs for VoxCPM cloning,
+	 * and lock each cue to that speaker's voice preset.
+	 */
+	async detectSpeakers(opts?: { maxSpeakers?: number }): Promise<number> {
+		if (speakersDetecting) return 0;
+		if (!isTauriRuntime()) {
+			speakersError = 'Speaker detect runs in the desktop app only.';
+			return 0;
+		}
+		const path = this.videoPath?.trim() || this.videoAsset?.path?.trim() || '';
+		if (!path) {
+			speakersError = 'Load a video first.';
+			return 0;
+		}
+		if (!project.cues.length) {
+			speakersError = 'Extract Subs first so cues have timing.';
+			return 0;
+		}
+
+		speakersDetecting = true;
+		speakersError = null;
+		try {
+			// Free VRAM — diarization + VoxCPM won't both fit on 8GB.
+			try {
+				const { invoke } = await import('@tauri-apps/api/core');
+				await invoke('stop_voxcpm_server').catch(() => undefined);
+			} catch {
+				/* optional */
+			}
+
+			const { invoke } = await import('@tauri-apps/api/core');
+			const result = await invoke<{
+				ok: boolean;
+				speakerCount: number;
+				message: string;
+				speakers: Array<{
+					id: string;
+					gender: string;
+					refWavPath: string;
+					cueCount: number;
+				}>;
+				assignments: Array<{ cueId: string; speaker: string }>;
+			}>('detect_speakers', {
+				args: {
+					videoPath: path,
+					projectId: project.id,
+					maxSpeakers: opts?.maxSpeakers ?? 0,
+					cues: project.cues.map((c) => ({
+						id: c.id,
+						startMs: c.startMs,
+						endMs: c.endMs
+					}))
+				}
+			});
+
+			const bank: SpeakerVoiceProfile[] = (result.speakers ?? []).map((s) => {
+				const gender =
+					s.gender === 'male' || s.gender === 'female' ? s.gender : ('neutral' as const);
+				return {
+					id: s.id,
+					gender,
+					refWavPath: s.refWavPath,
+					cueCount: s.cueCount,
+					voiceId: voiceIdForSpeakerGender(gender, getTtsEngineId())
+				};
+			});
+			const byCue = new Map(result.assignments.map((a) => [a.cueId, a.speaker]));
+			const voiceBySpeaker = new Map(bank.map((s) => [s.id, s.voiceId]));
+
+			project = touch({
+				...project,
+				speakerBank: bank,
+				cues: project.cues.map((c) => {
+					const spk = byCue.get(c.id) ?? c.speaker ?? 'Speaker 1';
+					return {
+						...c,
+						speaker: spk,
+						voiceId: voiceBySpeaker.get(spk) ?? c.voiceId
+					};
+				})
+			});
+			saveProjectToStorage(project);
+			return bank.length;
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			speakersError = msg;
+			return 0;
+		} finally {
+			speakersDetecting = false;
+		}
 	},
 
 	/** True when Khmer/TTS content runs past the source video picture. */

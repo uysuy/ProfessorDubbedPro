@@ -13,6 +13,7 @@
 		"ffmpeg:download": "node scripts/ensure-ffmpeg.mjs",
 		"whisper:download": "node scripts/ensure-whisper.mjs",
 		"funasr:setup": "node scripts/ensure-funasr.mjs",
+		"voxcpm:setup": "node scripts/ensure-voxcpm.mjs",
 		"prepare": "svelte-kit sync || echo ''",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",

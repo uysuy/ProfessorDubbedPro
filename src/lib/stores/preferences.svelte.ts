@@ -1,5 +1,7 @@
 import type { ExportMode } from '$lib/utils/export';
 import { DEFAULT_EDGE_VOICE_ID, migrateVoiceId } from '$lib/tts/edge-voices';
+import { isTtsEngineId, setTtsEngine as applyTtsEngine, type TtsEngineId } from '$lib/tts';
+import { DEFAULT_VOXCPM_VOICE_ID, isVoxcpmVoiceId } from '$lib/tts/voxcpm-voices';
 
 export const PREFERENCES_STORAGE_KEY = 'pdp.preferences';
 
@@ -52,6 +54,8 @@ export type AppPreferences = {
 	 * for overrun (speech is never rate-warped per cue anymore).
 	 */
 	ttsLipSync: boolean;
+	/** Active TTS backend — Edge (default) or optional local VoxCPM2. */
+	ttsEngine: TtsEngineId;
 };
 
 export const LANGUAGE_OPTIONS: {
@@ -125,6 +129,19 @@ export const FUNASR_MODEL_OPTIONS: {
 	{ value: 'fun-asr-nano', label: 'Fun-ASR-Nano', hint: 'Higher accuracy · slower' }
 ];
 
+export const TTS_ENGINE_OPTIONS: {
+	value: TtsEngineId;
+	label: string;
+	hint: string;
+}[] = [
+	{ value: 'edge-tts', label: 'Edge TTS', hint: 'Online · default · no GPU' },
+	{
+		value: 'voxcpm',
+		label: 'VoxCPM2 (local)',
+		hint: 'Natural KM · ~5GB download · ~8GB VRAM'
+	}
+];
+
 const DEFAULTS: AppPreferences = {
 	defaultVoiceId: DEFAULT_EDGE_VOICE_ID,
 	defaultLanguage: 'km',
@@ -139,7 +156,8 @@ const DEFAULTS: AppPreferences = {
 	whisperModel: 'small',
 	asrEngine: 'auto',
 	funasrModel: 'sensevoice',
-	ttsLipSync: true
+	ttsLipSync: true,
+	ttsEngine: 'edge-tts'
 };
 
 function isExportMode(v: unknown): v is ExportMode {
@@ -237,7 +255,8 @@ function parsePreferences(raw: unknown): AppPreferences {
 		whisperModel: isWhisperModel(o.whisperModel) ? o.whisperModel : DEFAULTS.whisperModel,
 		asrEngine: isAsrEngine(o.asrEngine) ? o.asrEngine : DEFAULTS.asrEngine,
 		funasrModel: isFunAsrModel(o.funasrModel) ? o.funasrModel : DEFAULTS.funasrModel,
-		ttsLipSync: typeof o.ttsLipSync === 'boolean' ? o.ttsLipSync : DEFAULTS.ttsLipSync
+		ttsLipSync: typeof o.ttsLipSync === 'boolean' ? o.ttsLipSync : DEFAULTS.ttsLipSync,
+		ttsEngine: isTtsEngineId(o.ttsEngine) ? o.ttsEngine : DEFAULTS.ttsEngine
 	};
 }
 
@@ -262,6 +281,7 @@ function persist(prefs: AppPreferences) {
 }
 
 let prefs = $state<AppPreferences>(readStored());
+applyTtsEngine(prefs.ttsEngine);
 
 function patch(partial: Partial<AppPreferences>) {
 	prefs = { ...prefs, ...partial };
@@ -333,6 +353,9 @@ export const preferencesStore = {
 	get ttsLipSync() {
 		return prefs.ttsLipSync;
 	},
+	get ttsEngine() {
+		return prefs.ttsEngine;
+	},
 	setDefaultVoiceId(id: string) {
 		const next = migrateVoiceId(id);
 		if (!next) return;
@@ -388,8 +411,21 @@ export const preferencesStore = {
 	setTtsLipSync(on: boolean) {
 		patch({ ttsLipSync: Boolean(on) });
 	},
+	setTtsEngine(engine: TtsEngineId) {
+		if (!isTtsEngineId(engine)) return;
+		applyTtsEngine(engine);
+		const next: Partial<AppPreferences> = { ttsEngine: engine };
+		// Keep voice id family aligned with the engine.
+		if (engine === 'voxcpm' && !isVoxcpmVoiceId(prefs.defaultVoiceId)) {
+			next.defaultVoiceId = DEFAULT_VOXCPM_VOICE_ID;
+		} else if (engine === 'edge-tts' && isVoxcpmVoiceId(prefs.defaultVoiceId)) {
+			next.defaultVoiceId = DEFAULT_EDGE_VOICE_ID;
+		}
+		patch(next);
+	},
 	/** Re-read from disk (e.g. after another tab). */
 	reload() {
 		prefs = readStored();
+		applyTtsEngine(prefs.ttsEngine);
 	}
 };

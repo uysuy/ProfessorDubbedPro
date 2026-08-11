@@ -52,8 +52,10 @@ export type ExportDubClip = {
 	startMs: number;
 	/** Linear 0–1 */
 	volume: number;
-	/** TTS clip length ms — keeps mix from chopping the end. */
+	/** Play-through length after tempo (ms) — keeps mix from chopping the end. */
 	durationMs?: number;
+	/** Align / fit tempo applied via FFmpeg atempo (1 = natural). */
+	playbackRate?: number;
 };
 
 export type RunExportOptions = {
@@ -200,6 +202,10 @@ export async function runProjectExport(opts: RunExportOptions): Promise<ExportPr
 					durationMs:
 						typeof c.durationMs === 'number' && c.durationMs > 0
 							? Math.round(c.durationMs)
+							: undefined,
+					playbackRate:
+						typeof c.playbackRate === 'number' && c.playbackRate > 0
+							? Math.max(0.5, Math.min(1.5, c.playbackRate))
 							: undefined
 				})),
 				subtitleStyle: {

@@ -1,28 +1,163 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
+	import { invoke } from '@tauri-apps/api/core';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Label } from '$lib/components/ui/label/index.js';
 	import { Slider } from '$lib/components/ui/slider/index.js';
 	import { Separator } from '$lib/components/ui/separator/index.js';
 	import { Progress } from '$lib/components/ui/progress/index.js';
+	import * as Select from '$lib/components/ui/select/index.js';
 	import VoiceSelect from '$lib/components/studio/VoiceSelect.svelte';
 	import { projectStore } from '$lib/stores/project.svelte';
 	import { dndStore } from '$lib/stores/dnd.svelte';
+	import { tempoStore } from '$lib/stores/tempo.svelte';
+	import {
+		preferencesStore,
+		TTS_ENGINE_OPTIONS
+	} from '$lib/stores/preferences.svelte';
+	import { getTtsEngine, type TtsEngineId } from '$lib/tts';
+	import { DEFAULT_VOXCPM_VOICE_ID, VOXCPM_VOICES } from '$lib/tts/voxcpm-voices';
+	import { voiceMatchesEngine } from '$lib/tts/voice-engine';
+	import { isTauriRuntime } from '$lib/utils/platform';
 	import { AudioLines, LoaderCircle, PanelRightClose, Sparkles } from '@lucide/svelte';
 
 	const selectedCount = $derived(projectStore.selectedCueIds.length);
 	const busy = $derived(projectStore.isGenerating);
+	const engineId = $derived(preferencesStore.ttsEngine);
+	const engineLabel = $derived(
+		TTS_ENGINE_OPTIONS.find((o) => o.value === engineId)?.label ?? getTtsEngine().label
+	);
+	const voiceList = $derived(engineId === 'voxcpm' ? VOXCPM_VOICES : undefined);
+
+	type VoxStatus = {
+		setupReady: boolean;
+		serverRunning: boolean;
+		modelLoaded: boolean;
+		weightsCached: boolean;
+		loading: boolean;
+		loadProgress: number;
+		loadStage: string;
+		model: string;
+		port: number;
+		message: string;
+	};
+
+	let voxStatus = $state<VoxStatus | null>(null);
+	let voxBusy = $state(false);
+	let voxError = $state<string | null>(null);
+	const voxCached = $derived(voxStatus?.weightsCached === true);
+	const voxRunning = $derived(voxStatus?.serverRunning === true);
+	const voxLoaded = $derived(voxStatus?.modelLoaded === true);
+	const voxLoading = $derived(voxBusy || voxStatus?.loading === true);
+	const voxProgress = $derived(
+		Math.max(0, Math.min(100, Number(voxStatus?.loadProgress ?? (voxLoading ? 5 : 0))))
+	);
+	const voxStageLabel = $derived.by(() => {
+		const stage = (voxStatus?.loadStage ?? '').toLowerCase();
+		if (stage === 'ready') return 'Ready';
+		if (stage === 'downloading') return 'Downloading weights';
+		if (stage === 'loading_weights' || stage === 'importing') return 'Loading weights';
+		if (stage === 'to_gpu') return 'Moving to GPU';
+		if (stage === 'resolving_cache' || stage === 'queued' || stage === 'starting') {
+			return voxCached ? 'Starting from local cache' : 'Starting';
+		}
+		if (voxLoading) return voxCached ? 'Loading into VRAM' : 'Working';
+		return '';
+	});
 
 	const generateStatus = $derived.by(() => {
 		if (busy) {
 			return selectedCount > 0
-				? `Generating ${selectedCount} segment${selectedCount === 1 ? '' : 's'} with Edge-TTS…`
+				? `Generating ${selectedCount} segment${selectedCount === 1 ? '' : 's'} with ${engineLabel}…`
 				: 'Generating audio…';
 		}
 		if (projectStore.generateError) return projectStore.generateError;
-		if (selectedCount === 1) return '1 segment selected — Khmer Edge-TTS';
-		if (selectedCount > 1) return `${selectedCount} segments selected — Khmer Edge-TTS`;
-		return 'Select subtitle(s) to generate Khmer speech';
+		if (selectedCount === 1) return `1 segment selected — ${engineLabel}`;
+		if (selectedCount > 1) return `${selectedCount} segments selected — ${engineLabel}`;
+		return `Select subtitle(s) to generate speech (${engineLabel})`;
 	});
+
+	async function refreshVoxStatus() {
+		if (!isTauriRuntime() || engineId !== 'voxcpm') {
+			voxStatus = null;
+			return;
+		}
+		try {
+			voxStatus = await invoke<VoxStatus>('voxcpm_status');
+		} catch {
+			voxStatus = null;
+		}
+	}
+
+	onMount(() => {
+		void refreshVoxStatus();
+	});
+
+	$effect(() => {
+		void engineId;
+		void refreshVoxStatus();
+		// Session default only — cue voices are remapped in onEngineChange / syncVoicesToTtsEngine.
+		if (!voiceMatchesEngine(projectStore.voiceId, engineId)) {
+			projectStore.setVoiceId(
+				engineId === 'voxcpm' ? DEFAULT_VOXCPM_VOICE_ID : preferencesStore.defaultVoiceId,
+				{ applyToCues: false }
+			);
+		}
+	});
+
+	function onEngineChange(value: string | undefined) {
+		if (!value || !TTS_ENGINE_OPTIONS.some((o) => o.value === value)) return;
+		const engine = value as TtsEngineId;
+		preferencesStore.setTtsEngine(engine);
+		const { cues } = projectStore.syncVoicesToTtsEngine(engine);
+		dndStore.flash(
+			cues > 0
+				? `Switched to ${TTS_ENGINE_OPTIONS.find((o) => o.value === engine)?.label ?? engine} — updated ${cues} subtitle voice${cues === 1 ? '' : 's'}`
+				: `Switched to ${TTS_ENGINE_OPTIONS.find((o) => o.value === engine)?.label ?? engine}`
+		);
+		void refreshVoxStatus();
+	}
+
+	/** Start server + load model (one click). */
+	async function onVoxStart() {
+		voxBusy = true;
+		voxError = null;
+		dndStore.flash(
+			voxCached
+				? 'Starting VoxCPM2 from local cache…'
+				: 'Starting VoxCPM2 (first time may download ~5GB)…'
+		);
+		const poll = setInterval(() => void refreshVoxStatus(), 1000);
+		try {
+			voxStatus = await invoke<VoxStatus>('load_voxcpm_model');
+			dndStore.flash('VoxCPM2 ready');
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			voxError = msg;
+			dndStore.flash(msg);
+			await refreshVoxStatus();
+		} finally {
+			clearInterval(poll);
+			voxBusy = false;
+			await refreshVoxStatus();
+		}
+	}
+
+	async function onVoxStop() {
+		voxBusy = true;
+		try {
+			voxStatus = await invoke<VoxStatus>('stop_voxcpm_server');
+			voxError = null;
+			dndStore.flash('VoxCPM stopped — VRAM freed');
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			voxError = msg;
+			dndStore.flash(msg);
+		} finally {
+			voxBusy = false;
+			await refreshVoxStatus();
+		}
+	}
 
 	async function onGenerate() {
 		if (!selectedCount) {
@@ -31,12 +166,16 @@
 		}
 		const n = await projectStore.generateSelected();
 		if (n > 0) {
-			dndStore.flash(
-				n === 1 ? 'Edge-TTS audio generated' : `Edge-TTS audio generated ×${n}`
-			);
+			const prompted = tempoStore.promptOverhangAfterTts();
+			if (!prompted) {
+				dndStore.flash(
+					n === 1 ? `${engineLabel} audio generated` : `${engineLabel} audio generated ×${n}`
+				);
+			}
 		} else if (projectStore.generateError) {
 			dndStore.flash(projectStore.generateError);
 		}
+		void refreshVoxStatus();
 	}
 </script>
 
@@ -59,13 +198,168 @@
 	<div class="min-h-0 flex-1 space-y-2.5 overflow-auto p-2.5">
 		<section class="space-y-1.5 rounded-md border border-border/70 bg-card p-2 shadow-[var(--elevation-panel)]">
 			<Label class="text-[10px] font-semibold tracking-[0.12em] text-foreground/75 uppercase"
+				>TTS engine</Label
+			>
+			<Select.Root type="single" value={engineId} onValueChange={onEngineChange}>
+				<Select.Trigger class="h-8 w-full text-[12px]" aria-label="TTS engine"
+					>{engineLabel}</Select.Trigger
+				>
+				<Select.Content>
+					{#each TTS_ENGINE_OPTIONS as opt (opt.value)}
+						<Select.Item value={opt.value} label={opt.label}>
+							<span class="flex w-full items-center justify-between gap-3">
+								<span>{opt.label}</span>
+								<span class="text-[10px] text-muted-foreground">{opt.hint}</span>
+							</span>
+						</Select.Item>
+					{/each}
+				</Select.Content>
+			</Select.Root>
+			{#if engineId === 'voxcpm'}
+				<p class="text-[10px] leading-snug text-muted-foreground">
+					{#if voxStatus}
+						{voxStatus.message}
+					{:else}
+						Optional local engine — run
+						<span class="font-mono">pnpm voxcpm:setup</span>
+						once.
+					{/if}
+				</p>
+				<div class="flex flex-wrap gap-1">
+					{#if voxRunning || voxLoaded || voxLoading}
+						<Button
+							size="sm"
+							variant="outline"
+							class="h-7 text-[10px]"
+							disabled={voxBusy && !voxRunning}
+							onclick={onVoxStop}
+							title="Stop server and free VRAM"
+						>
+							{voxBusy && voxRunning && !voxLoaded ? 'Stopping…' : 'Stop'}
+						</Button>
+					{:else}
+						<Button
+							size="sm"
+							variant="outline"
+							class="h-7 text-[10px]"
+							disabled={voxBusy}
+							onclick={onVoxStart}
+							title="Start server and load model into VRAM"
+						>
+							{voxBusy ? 'Starting…' : 'Start'}
+						</Button>
+					{/if}
+				</div>
+				{#if voxLoading || (voxBusy && !voxLoaded)}
+					<div class="space-y-1 rounded-md border border-primary/30 bg-primary/8 px-2 py-1.5">
+						<div class="flex items-center justify-between gap-2 text-[10px] text-primary">
+							<span class="truncate">{voxStageLabel || 'Loading…'}</span>
+							<span class="font-mono tabular-nums">{voxProgress}%</span>
+						</div>
+						<Progress value={voxProgress} max={100} class="h-1.5" />
+						<p class="text-[10px] leading-snug text-muted-foreground">
+							{#if voxCached}
+								No download — loading weights into GPU VRAM.
+							{:else}
+								First run may download ~5GB. Keep the terminal open with HF_TOKEN set.
+							{/if}
+						</p>
+					</div>
+				{/if}
+				{#if voxError}
+					<p
+						class="max-h-24 overflow-auto rounded border border-destructive/40 bg-destructive/10 px-1.5 py-1 text-[10px] leading-snug text-destructive whitespace-pre-wrap"
+					>
+						{voxError}
+					</p>
+				{/if}
+			{/if}
+		</section>
+
+		<section class="space-y-1.5 rounded-md border border-border/70 bg-card p-2 shadow-[var(--elevation-panel)]">
+			<Label class="text-[10px] font-semibold tracking-[0.12em] text-foreground/75 uppercase"
 				>Voice Selection</Label
 			>
 			<VoiceSelect
 				value={projectStore.voiceId}
-				onValueChange={(id) => projectStore.setVoiceId(id)}
+				voices={voiceList}
+				onValueChange={(id) => {
+					projectStore.setVoiceId(id);
+					const n = selectedCount || projectStore.current.cues.length;
+					dndStore.flash(
+						selectedCount > 0
+							? `Voice applied to ${selectedCount} selected subtitle${selectedCount === 1 ? '' : 's'}`
+							: n > 0
+								? `Voice applied to all ${n} subtitle${n === 1 ? '' : 's'}`
+								: 'Default voice updated'
+					);
+				}}
 			/>
+			<p class="text-[10px] leading-snug text-muted-foreground">
+				Applies to selected subtitles (or all if none selected). Re-Generate to hear the new
+				voice.
+			</p>
 		</section>
+
+		{#if engineId === 'voxcpm'}
+			<section
+				class="space-y-1.5 rounded-md border border-border/70 bg-card p-2 shadow-[var(--elevation-panel)]"
+			>
+				<div class="flex items-center justify-between gap-2">
+					<Label class="text-[10px] font-semibold tracking-[0.12em] text-foreground/75 uppercase"
+						>Speakers</Label
+					>
+					<Button
+						size="sm"
+						variant="outline"
+						class="h-7 text-[10px]"
+						disabled={projectStore.speakersDetecting}
+						onclick={async () => {
+							const n = await projectStore.detectSpeakers();
+							if (n > 0) {
+								dndStore.flash(
+									n === 1 ? '1 speaker locked' : `${n} speakers locked for clone`
+								);
+							} else if (projectStore.speakersError) {
+								dndStore.flash(projectStore.speakersError);
+							}
+						}}
+					>
+						{#if projectStore.speakersDetecting}
+							<LoaderCircle class="size-3 animate-spin" />
+							Detecting…
+						{:else}
+							Detect / rebuild
+						{/if}
+					</Button>
+				</div>
+				{#if projectStore.speakerBank.length}
+					<ul class="space-y-1">
+						{#each projectStore.speakerBank as sp (sp.id)}
+							<li
+								class="rounded border border-border/55 bg-muted/30 px-2 py-1.5 text-[10px] leading-snug"
+							>
+								<div class="font-medium text-foreground">{sp.id}</div>
+								<div class="text-muted-foreground">
+									{sp.gender} · {sp.cueCount} cues · {sp.refWavPath ? 'clone ref' : 'preset only'}
+								</div>
+							</li>
+						{/each}
+					</ul>
+					<p class="text-[10px] leading-snug text-muted-foreground">
+						Generate uses each cue’s Speaker + reference clip so boy/girl timbre stays stable.
+						Khmer script drives tone (questions, pace).
+					</p>
+				{:else}
+					<p class="text-[10px] leading-snug text-muted-foreground">
+						Extract Subs, then Detect Speakers. VoxCPM will clone each speaker from the video.
+					</p>
+				{/if}
+				{#if projectStore.speakersError}
+					<p class="text-[10px] text-destructive whitespace-pre-wrap">{projectStore.speakersError}</p>
+				{/if}
+			</section>
+		{/if}
 
 		<section
 			class="space-y-1.5 rounded-md border border-border/70 bg-card p-2 shadow-[var(--elevation-panel)]"
@@ -79,6 +373,11 @@
 					{selectedCount > 0 ? `${selectedCount} selected` : 'all cues'}
 				</span>
 				and is used when you Generate.
+				{#if engineId === 'voxcpm'}
+					<span class="text-muted-foreground/80">
+						(VoxCPM uses Voice Selection prompts for tone; pitch/volume mainly affect Edge TTS.)
+					</span>
+				{/if}
 			</p>
 
 			<div class="space-y-2 rounded-md border border-border/55 bg-muted/35 p-2">

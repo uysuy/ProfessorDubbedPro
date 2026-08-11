@@ -1,6 +1,6 @@
 /** Shared TTS contracts — swap engines without touching studio UI. */
 
-export type TtsEngineId = 'edge-tts';
+export type TtsEngineId = 'edge-tts' | 'voxcpm';
 
 export type TtsSynthesizeRequest = {
 	cueId: string;
@@ -15,6 +15,11 @@ export type TtsSynthesizeRequest = {
 	volume: number;
 	/** Target language code (`km` | `en`). */
 	language: string;
+	/**
+	 * Optional absolute path to a reference WAV for VoxCPM2 voice cloning.
+	 * When set, style prompts are suppressed so Khmer script prosody wins.
+	 */
+	referenceWavPath?: string;
 };
 
 export type TtsSynthesizeResult = {

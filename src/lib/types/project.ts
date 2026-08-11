@@ -3,6 +3,12 @@ export interface SubtitleCue {
 	index: number;
 	startMs: number;
 	endMs: number;
+	/**
+	 * Hardsub / ASR picture window (set on Extract). Align locks Khmer to these
+	 * so short holds like “哈哈哈” stay with CN–EN instead of packing the next line early.
+	 */
+	pictureStartMs?: number;
+	pictureEndMs?: number;
 	source: string;
 	translation: string;
 	speaker: string;
@@ -28,6 +34,11 @@ export interface SubtitleCue {
 		 * 1 = natural length; >1 = lip-sync squeeze.
 		 */
 		fitPlaybackRate?: number;
+		/**
+		 * Exact text used when this clip was synthesized. If the cue text changes,
+		 * the clip is treated as stale (avoids Hahaha row playing old speech).
+		 */
+		sourceText?: string;
 	} | null;
 }
 
@@ -105,6 +116,17 @@ export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
 	outlineWidth: 1
 };
 
+export interface SpeakerVoiceProfile {
+	/** e.g. "Speaker 1" */
+	id: string;
+	gender: 'female' | 'male' | 'neutral';
+	/** Absolute path to reference WAV for VoxCPM cloning. */
+	refWavPath: string;
+	cueCount: number;
+	/** Fallback VoxCPM preset id when no ref clip. */
+	voiceId: string;
+}
+
 export interface DubbingProject {
 	id: string;
 	name: string;
@@ -112,6 +134,11 @@ export interface DubbingProject {
 	targetLanguage: string;
 	fps: number;
 	durationMs: number;
+	/**
+	 * Product of pitch-safe video remasters since Extract (1 = source timeline).
+	 * Picture anchors stay in source time; cue start = pictureStart / mediaTempoFromSource.
+	 */
+	mediaTempoFromSource?: number;
 	/** Active source video asset id (if any). */
 	videoAssetId: string | null;
 	assets: MediaAsset[];
@@ -119,6 +146,8 @@ export interface DubbingProject {
 	cues: SubtitleCue[];
 	/** Burn-in / preview subtitle appearance. */
 	subtitleStyle: SubtitleStyle;
+	/** Per-speaker clone refs + gender (from Detect Speakers). */
+	speakerBank: SpeakerVoiceProfile[];
 	updatedAt: string;
 }
 

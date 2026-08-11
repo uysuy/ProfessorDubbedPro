@@ -31,6 +31,16 @@ export const TTS_FIT_END_PAD_MS = 60;
  * Kept gentle — heavy playbackRate sounds worse than a slightly longer cue.
  */
 export const TTS_FIT_MAX_PLAYBACK = 1.15;
+/**
+ * Preferred Align speech squeeze (legacy name — Align now prefers video slowdown).
+ * Mild pack after remaster uses ALIGN_MAX_TTS_RATE (1.05) instead.
+ */
+export const TTS_ALIGN_PREFERRED_MAX = 1.18;
+/**
+ * Absolute preview / export playback ceiling (force-fit last resort only).
+ * Must stay in sync with ALIGN_FORCE_FIT_MAX_TTS_RATE in video-tempo.
+ */
+export const TTS_ALIGN_MAX_PLAYBACK = 1.5;
 /** Combined Edge × Web Audio soft ceiling used when deciding to extend. */
 export const TTS_FIT_MAX_EFFECTIVE = 1.4;
 
@@ -185,36 +195,59 @@ export function resolveLipSyncEndMs(opts: {
 	return { endMs: startMs + playThroughMs, extendsCue: true };
 }
 
-/** Effective play end aligned to video when lip-synced; otherwise full audio. */
-export function cueAudioEndMs(cue: {
+type CueTimingInput = {
 	startMs: number;
 	endMs: number;
 	assignedAudio?: {
 		durationMs?: number | null;
 		fitPlaybackRate?: number | null;
 	} | null;
-}): number {
-	// Lip-sync generation always stores fitPlaybackRate (>=1) and locks to the cue window
-	// when it fits; when the cue was extended, endMs already covers full speech.
-	if (
-		typeof cue.assignedAudio?.fitPlaybackRate === 'number' &&
-		cue.assignedAudio.fitPlaybackRate > 0
-	) {
-		const dur = cue.assignedAudio.durationMs;
-		if (typeof dur === 'number' && dur > 0) {
-			const playThrough = Math.ceil(dur / cue.assignedAudio.fitPlaybackRate);
-			return Math.max(cue.endMs, cue.startMs + playThrough);
-		}
-		return cue.endMs;
+};
+
+/**
+ * Wall-clock speech length for a cue (natural TTS ÷ Align fit rate).
+ * Shared by packing, preview overlay, mixer, SRT, and export.
+ */
+export function cuePlayThroughMs(cue: CueTimingInput): number {
+	const dur = cue.assignedAudio?.durationMs;
+	if (typeof dur === 'number' && dur > 0) {
+		const rate =
+			typeof cue.assignedAudio?.fitPlaybackRate === 'number' &&
+			cue.assignedAudio.fitPlaybackRate > 0
+				? cue.assignedAudio.fitPlaybackRate
+				: 1;
+		return Math.max(200, Math.ceil(dur / rate));
 	}
-	const audioDur = cue.assignedAudio?.durationMs;
-	if (typeof audioDur === 'number' && audioDur > 0) {
-		return Math.max(cue.endMs, cue.startMs + Math.round(audioDur));
+	return Math.max(200, Math.round(cue.endMs - cue.startMs));
+}
+
+/**
+ * When Khmer audio ends — and when the subtitle should disappear.
+ * Always start + play-through when TTS exists (no hang/tail linger).
+ */
+export function cueAudioEndMs(cue: CueTimingInput): number {
+	const dur = cue.assignedAudio?.durationMs;
+	if (typeof dur === 'number' && dur > 0) {
+		return cue.startMs + cuePlayThroughMs(cue);
 	}
 	return cue.endMs;
 }
 
-/** Combined transport × lip-sync fit rate for Web Audio. */
+/**
+ * Preview / mixer / burn-in end — cover the full spoken Khmer when TTS exists,
+ * otherwise the subtitle period. Never shorter than cue.endMs (user trim wins upward).
+ */
+export function cuePreviewEndMs(cue: CueTimingInput): number {
+	const periodEnd = Math.max(cue.startMs + 120, Math.round(cue.endMs));
+	const dur = cue.assignedAudio?.durationMs;
+	if (typeof dur === 'number' && dur > 80) {
+		const spokenEnd = cue.startMs + cuePlayThroughMs(cue);
+		return Math.max(periodEnd, spokenEnd);
+	}
+	return periodEnd;
+}
+
+/** Combined transport × Align fit rate for Web Audio / export. */
 export function cueEffectivePlaybackRate(
 	cue: { assignedAudio?: { fitPlaybackRate?: number | null } | null },
 	transportRate = 1
@@ -223,7 +256,6 @@ export function cueEffectivePlaybackRate(
 		typeof cue.assignedAudio?.fitPlaybackRate === 'number' && cue.assignedAudio.fitPlaybackRate > 0
 			? cue.assignedAudio.fitPlaybackRate
 			: 1;
-	// Keep stacked rate listenable even if an old project stored a high fit value.
-	const cappedFit = Math.min(fit, TTS_FIT_MAX_PLAYBACK);
-	return Math.max(0.5, Math.min(2.0, transportRate * cappedFit));
+	const cappedFit = Math.min(fit, TTS_ALIGN_MAX_PLAYBACK);
+	return Math.max(0.5, Math.min(TTS_ALIGN_MAX_PLAYBACK, transportRate * cappedFit));
 }

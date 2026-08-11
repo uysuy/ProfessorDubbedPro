@@ -18,6 +18,8 @@ src-tauri/models/*
 
 # FunASR local venv (Python SenseVoice)
 .venv-funasr/
+# VoxCPM2 local venv (optional TTS)
+.venv-voxcpm/
 
 # OS
 .DS_Store
@@ -32,3 +34,7 @@ Thumbs.db
 # Vite
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+__pycache__/
+*.pyc
+voxcpm-out.log

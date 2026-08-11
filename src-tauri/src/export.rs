@@ -27,13 +27,20 @@ pub struct ExportDubClip {
 	/// Linear gain 0–1 (from cue volume %).
 	#[serde(default = "default_clip_volume")]
 	pub volume: f64,
-	/// Clip length in ms (from TTS). Used so mix/pad isn’t cut short.
+	/// Play-through length in ms after tempo. Used so mix/pad isn’t cut short.
 	#[serde(default)]
 	pub duration_ms: Option<u64>,
+	/// Align / fit tempo (FFmpeg atempo). 1.0 = natural speed.
+	#[serde(default = "default_playback_rate")]
+	pub playback_rate: f64,
 }
 
 fn default_clip_volume() -> f64 {
 	0.8
+}
+
+fn default_playback_rate() -> f64 {
+	1.0
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1025,7 +1032,33 @@ fn dub_content_end_ms(clips: &[ExportDubClip], video_ms: u64) -> u64 {
 	end
 }
 
-/// Build filter chain piece for one dub clip (delay onto timeline, no early cutoff).
+/// Build FFmpeg atempo chain (each stage must be in 0.5..=2.0).
+fn atempo_filter_chain(rate: f64) -> String {
+	let mut r = rate;
+	if !r.is_finite() || (r - 1.0).abs() < 0.001 {
+		return String::new();
+	}
+	r = r.clamp(0.5, 2.5);
+	let mut parts: Vec<String> = Vec::new();
+	while r > 2.0 + 1e-6 {
+		parts.push("atempo=2.0".into());
+		r /= 2.0;
+	}
+	while r < 0.5 - 1e-6 {
+		parts.push("atempo=0.5".into());
+		r /= 0.5;
+	}
+	if (r - 1.0).abs() >= 0.001 {
+		parts.push(format!("atempo={r:.4}"));
+	}
+	if parts.is_empty() {
+		String::new()
+	} else {
+		format!(",{}", parts.join(","))
+	}
+}
+
+/// Build filter chain piece for one dub clip (tempo → trim → delay onto timeline).
 fn dub_clip_filter(input_index: usize, clip: &ExportDubClip, out_label: &str) -> Result<String, String> {
 	let path = PathBuf::from(clip.path.trim());
 	if !path.is_file() {
@@ -1033,13 +1066,91 @@ fn dub_clip_filter(input_index: usize, clip: &ExportDubClip, out_label: &str) ->
 	}
 	let delay = clip.start_ms;
 	let vol = clamp_gain(clip.volume);
+	let tempo = atempo_filter_chain(clip.playback_rate);
+	let trim = match clip.duration_ms {
+		Some(ms) if ms > 0 => {
+			let sec = (ms as f64) / 1000.0;
+			format!(",atrim=0:{sec:.3},asetpts=PTS-STARTPTS")
+		}
+		_ => String::new(),
+	};
 	// adelay is per-channel ms; stereo needs delay|delay.
 	Ok(format!(
-		"[{input_index}:a]aformat=sample_rates=44100:channel_layouts=stereo,aresample=44100,adelay={delay}|{delay}:all=1,volume={vol:.4}[{out_label}]"
+		"[{input_index}:a]aformat=sample_rates=44100:channel_layouts=stereo,aresample=44100{tempo}{trim},adelay={delay}|{delay}:all=1,volume={vol:.4}[{out_label}]"
 	))
 }
 
+fn dub_clip_filter_legacy(input_index: usize, clip: &ExportDubClip, out_label: &str) -> String {
+	let delay = clip.start_ms;
+	let vol = clamp_gain(clip.volume);
+	let tempo = atempo_filter_chain(clip.playback_rate);
+	let trim = match clip.duration_ms {
+		Some(ms) if ms > 0 => {
+			let sec = (ms as f64) / 1000.0;
+			format!(",atrim=0:{sec:.3},asetpts=PTS-STARTPTS")
+		}
+		_ => String::new(),
+	};
+	format!(
+		"[{input_index}:a]aformat=sample_rates=44100:channel_layouts=stereo,aresample=44100{tempo}{trim},adelay={delay}|{delay},volume={vol:.4}[{out_label}]"
+	)
+}
+
+/// Hard-link or copy a TTS file to a short name (avoids Windows CreateProcess limit).
+fn link_or_copy(src: &Path, dst: &Path) -> Result<(), String> {
+	if dst.exists() {
+		let _ = fs::remove_file(dst);
+	}
+	if fs::hard_link(src, dst).is_ok() {
+		return Ok(());
+	}
+	fs::copy(src, dst)
+		.map(|_| ())
+		.map_err(|e| format!("Could not stage dub clip:\n{}\n{e}", src.display()))
+}
+
+/// Stage each dub clip as `d0.mp3`, `d1.mp3`, … under `work` for short `-i` args.
+fn stage_dub_clips(work: &Path, clips: &[ExportDubClip]) -> Result<Vec<String>, String> {
+	fs::create_dir_all(work).map_err(|e| format!("Could not create export mix dir: {e}"))?;
+	let mut names = Vec::with_capacity(clips.len());
+	for (i, clip) in clips.iter().enumerate() {
+		let src = PathBuf::from(clip.path.trim());
+		if !src.is_file() {
+			return Err(format!("Dub audio missing (generate TTS first):\n{}", clip.path));
+		}
+		let ext = src
+			.extension()
+			.and_then(|e| e.to_str())
+			.filter(|e| !e.is_empty())
+			.unwrap_or("mp3");
+		let name = format!("d{i}.{ext}");
+		link_or_copy(&src, &work.join(&name))?;
+		names.push(name);
+	}
+	Ok(names)
+}
+
+/// Write filtergraph to a file and return a path relative to `work` (cwd).
+fn write_filter_complex_script(work: &Path, filter_complex: &str) -> Result<String, String> {
+	let path = work.join("fc.txt");
+	fs::write(&path, filter_complex)
+		.map_err(|e| format!("Could not write FFmpeg filter script: {e}"))?;
+	Ok("fc.txt".into())
+}
+
+fn mix_export_work_dir(app: &AppHandle) -> Result<PathBuf, String> {
+	let stamp = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_millis())
+		.unwrap_or(0);
+	let dir = export_temp_dir(app)?.join(format!("mix-{stamp}"));
+	fs::create_dir_all(&dir).map_err(|e| format!("Could not create mix work dir: {e}"))?;
+	Ok(dir)
+}
+
 /// Remix original audio (gain/mute) + TTS clips; optionally burn or soft-mux SRT.
+/// Stages clips to short paths and uses `-filter_complex_script` so Windows does not
+/// hit CreateProcess error 206 (command line too long) with 50+ TTS inputs.
 fn export_video_with_audio_mix(
 	app: &AppHandle,
 	mode: &ExportMode,
@@ -1050,16 +1161,60 @@ fn export_video_with_audio_mix(
 	clips: &[ExportDubClip],
 	style: &ExportSubtitleStyle,
 ) -> Result<(), String> {
+	export_video_with_audio_mix_inner(
+		app,
+		mode,
+		video_path,
+		srt_path,
+		output_path,
+		original_gain,
+		clips,
+		style,
+		true,
+	)
+}
+
+/// Fallback mix without `adelay=...:all=1` for older FFmpeg sidecars.
+fn export_video_with_audio_mix_legacy(
+	app: &AppHandle,
+	mode: &ExportMode,
+	video_path: &Path,
+	srt_path: &Path,
+	output_path: &Path,
+	original_gain: f64,
+	clips: &[ExportDubClip],
+	style: &ExportSubtitleStyle,
+) -> Result<(), String> {
+	export_video_with_audio_mix_inner(
+		app,
+		mode,
+		video_path,
+		srt_path,
+		output_path,
+		original_gain,
+		clips,
+		style,
+		false,
+	)
+}
+
+fn export_video_with_audio_mix_inner(
+	app: &AppHandle,
+	mode: &ExportMode,
+	video_path: &Path,
+	srt_path: &Path,
+	output_path: &Path,
+	original_gain: f64,
+	clips: &[ExportDubClip],
+	style: &ExportSubtitleStyle,
+	adelay_all: bool,
+) -> Result<(), String> {
 	let ffmpeg = find_ffmpeg(app)?;
 	ensure_parent_dir(output_path)?;
 	let gain = clamp_gain(original_gain);
 
-	for clip in clips {
-		let p = PathBuf::from(clip.path.trim());
-		if !p.is_file() {
-			return Err(format!("Dub audio missing (generate TTS first):\n{}", clip.path));
-		}
-	}
+	let work = mix_export_work_dir(app)?;
+	let staged_names = stage_dub_clips(&work, clips)?;
 
 	let srt_dir = srt_path
 		.parent()
@@ -1067,15 +1222,14 @@ fn export_video_with_audio_mix(
 		.map(|p| p.to_path_buf())
 		.unwrap_or_else(|| PathBuf::from("."));
 
+	// Run from the mix work dir so `-i d0.mp3` and `fc.txt` stay short on Windows.
 	let mut cmd = Command::new(&ffmpeg);
-	cmd.current_dir(&srt_dir);
+	cmd.current_dir(&work);
 	cmd.args(["-hide_banner", "-y", "-i", &ffmpeg_path_arg(video_path)]);
-
-	for clip in clips {
-		cmd.args(["-i", &ffmpeg_path_arg(Path::new(clip.path.trim()))]);
+	for name in &staged_names {
+		cmd.args(["-i", name]);
 	}
 
-	// Soft-sub mode: SRT is an extra input for mov_text mux.
 	let soft = matches!(mode, ExportMode::VideoSoftSubs);
 	if soft {
 		cmd.args(["-i", &ffmpeg_path_arg(srt_path)]);
@@ -1089,7 +1243,6 @@ fn export_video_with_audio_mix(
 	let pad_ms = content_ms.saturating_sub(video_ms);
 	let pad_sec = (pad_ms as f64) / 1000.0;
 
-	// amix duration=longest pads shorter inputs; do not use bare apad (infinite).
 	let content_sec = (content_ms as f64 / 1000.0).max(0.2);
 	filters.push(format!(
 		"[0:a]aformat=sample_rates=44100:channel_layouts=stereo,aresample=44100,apad=whole_dur={content_sec:.3},volume={gain:.4}[orig]"
@@ -1099,7 +1252,11 @@ fn export_video_with_audio_mix(
 	for (i, clip) in clips.iter().enumerate() {
 		let in_idx = i + 1;
 		let label = format!("d{i}");
-		filters.push(dub_clip_filter(in_idx, clip, &label)?);
+		if adelay_all {
+			filters.push(dub_clip_filter(in_idx, clip, &label)?);
+		} else {
+			filters.push(dub_clip_filter_legacy(in_idx, clip, &label));
+		}
 		mix_labels.push(label);
 	}
 
@@ -1108,7 +1265,6 @@ fn export_video_with_audio_mix(
 		.map(|l| format!("[{l}]"))
 		.collect::<String>();
 	let n = mix_labels.len();
-	// longest keeps full TTS; dropout_transition softens clip edges (avoids choppy cuts).
 	filters.push(format!(
 		"{mix_inputs}amix=inputs={n}:duration=longest:dropout_transition=2:normalize=0[aout]"
 	));
@@ -1126,9 +1282,10 @@ fn export_video_with_audio_mix(
 			};
 			filters.insert(0, vchain);
 			let fc = filters.join(";");
+			let script = write_filter_complex_script(&work, &fc)?;
 			cmd.args([
-				"-filter_complex",
-				&fc,
+				"-filter_complex_script",
+				&script,
 				"-map",
 				"[vout]",
 				"-map",
@@ -1158,10 +1315,11 @@ fn export_video_with_audio_mix(
 			};
 			filters.insert(0, vchain);
 			let fc = filters.join(";");
+			let script = write_filter_complex_script(&work, &fc)?;
 			let srt_input_idx = 1 + clips.len();
 			cmd.args([
-				"-filter_complex",
-				&fc,
+				"-filter_complex_script",
+				&script,
 				"-map",
 				"[vout]",
 				"-map",
@@ -1174,6 +1332,8 @@ fn export_video_with_audio_mix(
 				"veryfast",
 				"-crf",
 				"20",
+				"-pix_fmt",
+				"yuv420p",
 				"-c:a",
 				"aac",
 				"-b:a",
@@ -1194,12 +1354,14 @@ fn export_video_with_audio_mix(
 		.output()
 		.map_err(|e| format!("Failed to start FFmpeg: {e}"))?;
 
+	// Best-effort cleanup of staged clips (keep failures from masking FFmpeg errors).
+	let _ = fs::remove_dir_all(&work);
+
 	if status.status.success() {
 		return Ok(());
 	}
-	// Older FFmpeg builds may not accept adelay `all=1` — retry without it.
 	let err = ffmpeg_fail_message(&status);
-	if err.contains("all") || err.to_lowercase().contains("adelay") {
+	if adelay_all && (err.contains("all") || err.to_lowercase().contains("adelay")) {
 		return export_video_with_audio_mix_legacy(
 			app,
 			mode,
@@ -1212,151 +1374,6 @@ fn export_video_with_audio_mix(
 		);
 	}
 	Err(err)
-}
-
-/// Fallback mix without `adelay=...:all=1` for older FFmpeg sidecars.
-fn export_video_with_audio_mix_legacy(
-	app: &AppHandle,
-	mode: &ExportMode,
-	video_path: &Path,
-	srt_path: &Path,
-	output_path: &Path,
-	original_gain: f64,
-	clips: &[ExportDubClip],
-	style: &ExportSubtitleStyle,
-) -> Result<(), String> {
-	// Re-enter with filters that use classic adelay=ms|ms only by temporarily
-	// rewriting clip filters via a local helper path: call the same structure
-	// but force classic adelay through a patched copy of the command build.
-	let ffmpeg = find_ffmpeg(app)?;
-	ensure_parent_dir(output_path)?;
-	let gain = clamp_gain(original_gain);
-	let srt_dir = srt_path
-		.parent()
-		.filter(|p| !p.as_os_str().is_empty())
-		.map(|p| p.to_path_buf())
-		.unwrap_or_else(|| PathBuf::from("."));
-
-	let mut cmd = Command::new(&ffmpeg);
-	cmd.current_dir(&srt_dir);
-	cmd.args(["-hide_banner", "-y", "-i", &ffmpeg_path_arg(video_path)]);
-	for clip in clips {
-		cmd.args(["-i", &ffmpeg_path_arg(Path::new(clip.path.trim()))]);
-	}
-	let soft = matches!(mode, ExportMode::VideoSoftSubs);
-	if soft {
-		cmd.args(["-i", &ffmpeg_path_arg(srt_path)]);
-	}
-
-	let video_ms = probe_media_duration_ms(&ffmpeg, video_path);
-	let content_ms = dub_content_end_ms(clips, video_ms);
-	let pad_sec = (content_ms.saturating_sub(video_ms) as f64) / 1000.0;
-
-	let mut filters: Vec<String> = Vec::new();
-	let content_sec = (content_ms as f64 / 1000.0).max(0.2);
-	filters.push(format!(
-		"[0:a]aformat=sample_rates=44100:channel_layouts=stereo,aresample=44100,apad=whole_dur={content_sec:.3},volume={gain:.4}[orig]"
-	));
-	let mut mix_labels = vec!["orig".to_string()];
-	for (i, clip) in clips.iter().enumerate() {
-		let label = format!("d{i}");
-		let delay = clip.start_ms;
-		let vol = clamp_gain(clip.volume);
-		filters.push(format!(
-			"[{}:a]aformat=sample_rates=44100:channel_layouts=stereo,aresample=44100,adelay={delay}|{delay},volume={vol:.4}[{label}]",
-			i + 1
-		));
-		mix_labels.push(label);
-	}
-	let mix_inputs = mix_labels.iter().map(|l| format!("[{l}]")).collect::<String>();
-	filters.push(format!(
-		"{mix_inputs}amix=inputs={}:duration=longest:dropout_transition=2:normalize=0[aout]",
-		mix_labels.len()
-	));
-
-	let (fonts_dir, ass_path) =
-		write_burn_in_ass(app, &ffmpeg, video_path, srt_path, &srt_dir, style)?;
-	match mode {
-		ExportMode::VideoBurnedIn => {
-			let sub = burn_in_ass_filter(&ass_path, &fonts_dir);
-			let vchain = if pad_sec > 0.05 {
-				format!("[0:v]{sub},tpad=stop_mode=clone:stop_duration={pad_sec:.3}[vout]")
-			} else {
-				format!("[0:v]{sub}[vout]")
-			};
-			filters.insert(0, vchain);
-			let fc = filters.join(";");
-			cmd.args([
-				"-filter_complex",
-				&fc,
-				"-map",
-				"[vout]",
-				"-map",
-				"[aout]",
-				"-c:v",
-				"libx264",
-				"-preset",
-				"medium",
-				"-crf",
-				"16",
-				"-pix_fmt",
-				"yuv420p",
-				"-c:a",
-				"aac",
-				"-b:a",
-				"192k",
-				"-movflags",
-				"+faststart",
-				&ffmpeg_path_arg(output_path),
-			]);
-		}
-		ExportMode::VideoSoftSubs => {
-			let vchain = if pad_sec > 0.05 {
-				format!("[0:v]tpad=stop_mode=clone:stop_duration={pad_sec:.3}[vout]")
-			} else {
-				"[0:v]null[vout]".to_string()
-			};
-			filters.insert(0, vchain);
-			let fc = filters.join(";");
-			let srt_input_idx = 1 + clips.len();
-			cmd.args([
-				"-filter_complex",
-				&fc,
-				"-map",
-				"[vout]",
-				"-map",
-				"[aout]",
-				"-map",
-				&format!("{srt_input_idx}:0"),
-				"-c:v",
-				"libx264",
-				"-preset",
-				"veryfast",
-				"-crf",
-				"20",
-				"-pix_fmt",
-				"yuv420p",
-				"-c:a",
-				"aac",
-				"-b:a",
-				"192k",
-				"-c:s",
-				"mov_text",
-				"-movflags",
-				"+faststart",
-				&ffmpeg_path_arg(output_path),
-			]);
-		}
-		ExportMode::Srt => return Err("Internal: SRT mode has no audio mix.".into()),
-	}
-
-	let status = cmd
-		.output()
-		.map_err(|e| format!("Failed to start FFmpeg: {e}"))?;
-	if status.status.success() {
-		return Ok(());
-	}
-	Err(ffmpeg_fail_message(&status))
 }
 
 /// Duck/mute original only (no TTS clips) — lighter than full mix graph.

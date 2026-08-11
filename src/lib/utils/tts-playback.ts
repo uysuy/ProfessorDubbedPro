@@ -1,9 +1,14 @@
 /**
  * TTS clip mixer using Web Audio (not HTMLAudioElement) so it does not
  * compete with <video> playback in WebView2 / Chromium.
+ *
+ * After Align, cues store fitPlaybackRate so speech fits the subtitle window.
+ * Playback applies that rate once per cue (no mid-clip restarts) so the burned
+ * title and audio start/finish together — without syllable chopping from drift
+ * re-seeks.
  */
 
-import { cueEffectivePlaybackRate } from '$lib/utils/tts-fit';
+import { cuePreviewEndMs, cueEffectivePlaybackRate, TTS_ALIGN_MAX_PLAYBACK } from '$lib/utils/tts-fit';
 
 export type TtsPlayableCue = {
 	id: string;
@@ -18,22 +23,18 @@ export type TtsPlayableCue = {
 	} | null;
 };
 
-/** Inclusive play window end — lip-synced clips stay on the video cue; else full audio. */
-function playEndMs(cue: TtsPlayableCue): number {
-	const fit = cue.assignedAudio?.fitPlaybackRate;
-	if (typeof fit === 'number' && fit > 0) {
-		return cue.endMs;
-	}
-	const audioDur = cue.assignedAudio?.durationMs;
-	if (typeof audioDur === 'number' && audioDur > 0) {
-		return Math.max(cue.endMs, cue.startMs + Math.round(audioDur));
-	}
-	return cue.endMs;
+function hasAudio(cue: TtsPlayableCue): boolean {
+	return !!(cue.assignedAudio && (cue.assignedAudio.url || cue.assignedAudio.filePath));
 }
 
 function cueFitRate(cue: TtsPlayableCue): number {
 	const fit = cue.assignedAudio?.fitPlaybackRate;
 	return typeof fit === 'number' && fit > 0 ? fit : 1;
+}
+
+/** Subtitle period on the timeline — TTS never plays past this. */
+function cueWindowEndMs(cue: TtsPlayableCue): number {
+	return cuePreviewEndMs(cue);
 }
 
 type ClipBuffer = {
@@ -48,12 +49,8 @@ export class TtsPlaybackMixer {
 	private source: AudioBufferSourceNode | null = null;
 	private gain: GainNode | null = null;
 	private activeId: string | null = null;
-	/** Context time when the current source started. */
-	private startedAt = 0;
-	/** Offset (sec) into the buffer when the source started. */
-	private startOffset = 0;
-	/** Effective rate used for the active source (transport × fit). */
 	private activeRate = 1;
+	private lastPlayheadMs = -1;
 	private resolveUrl: ((filePath: string) => string | null) | null = null;
 
 	get playingCueId(): string | null {
@@ -152,19 +149,28 @@ export class TtsPlaybackMixer {
 
 	pauseAll() {
 		this.stopSource();
+		this.lastPlayheadMs = -1;
 	}
 
 	dispose() {
 		this.stopSource();
 		this.buffers.clear();
 		this.loading.clear();
+		this.lastPlayheadMs = -1;
 		if (this.ctx) {
 			void this.ctx.close().catch(() => undefined);
 			this.ctx = null;
 		}
 	}
 
-	private startCue(cue: TtsPlayableCue, buffer: AudioBuffer, offsetSec: number, rate: number) {
+	private startCue(
+		cue: TtsPlayableCue,
+		buffer: AudioBuffer,
+		offsetSec: number,
+		rate: number,
+		/** Real-time seconds left in the subtitle window (clip so audio cannot bleed). */
+		remainWindowSec?: number
+	) {
 		this.stopSource();
 		const ctx = this.getCtx();
 		if (ctx.state === 'suspended') void ctx.resume();
@@ -176,13 +182,25 @@ export class TtsPlaybackMixer {
 
 		const source = ctx.createBufferSource();
 		source.buffer = buffer;
-		const safeRate = Math.max(0.5, Math.min(2.5, rate));
+		// Align fit × transport — keep audio length matched to subtitle window.
+		const safeRate = Math.max(0.85, Math.min(TTS_ALIGN_MAX_PLAYBACK, rate));
 		source.playbackRate.value = safeRate;
 		source.connect(gain);
 
-		const safeOffset = Math.max(0, Math.min(Math.max(0, buffer.duration - 0.01), offsetSec));
+		const safeOffset = Math.max(0, Math.min(Math.max(0, buffer.duration - 0.02), offsetSec));
+		const bufferLeft = Math.max(0.02, buffer.duration - safeOffset);
+		// Prefer the full decoded clip so long Khmer lines are not cut mid-word.
+		// Soft-cap only when the remaining subtitle window is clearly shorter.
+		let playDur = bufferLeft;
+		if (typeof remainWindowSec === 'number' && remainWindowSec > 0) {
+			const windowBuf = Math.max(0.02, remainWindowSec * safeRate);
+			// Allow ~120ms slop so rounding / waveform probe never chops the tail.
+			if (windowBuf + 0.12 < bufferLeft) {
+				playDur = windowBuf;
+			}
+		}
 		try {
-			source.start(0, safeOffset);
+			source.start(0, safeOffset, playDur);
 		} catch {
 			gain.disconnect();
 			return;
@@ -191,8 +209,6 @@ export class TtsPlaybackMixer {
 		this.source = source;
 		this.gain = gain;
 		this.activeId = cue.id;
-		this.startedAt = ctx.currentTime;
-		this.startOffset = safeOffset;
 		this.activeRate = safeRate;
 
 		source.onended = () => {
@@ -205,16 +221,36 @@ export class TtsPlaybackMixer {
 		};
 	}
 
+	private pickCue(
+		cues: TtsPlayableCue[],
+		playheadMs: number,
+		preferredCueId: string | null
+	): TtsPlayableCue | null {
+		const candidates = cues.filter(
+			(c) => hasAudio(c) && playheadMs >= c.startMs && playheadMs < cueWindowEndMs(c)
+		);
+		if (!candidates.length) {
+			const upcoming = cues
+				.filter((c) => hasAudio(c) && c.startMs >= playheadMs && c.startMs <= playheadMs + 80)
+				.sort((a, b) => a.startMs - b.startMs)[0];
+			return upcoming ?? null;
+		}
+		if (preferredCueId) {
+			const hit = candidates.find((c) => c.id === preferredCueId);
+			if (hit) return hit;
+		}
+		return [...candidates].sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs)[0] ?? null;
+	}
+
 	/**
-	 * Keep the active TTS clip aligned with the playhead.
-	 * Safe to call every animation frame (no HTMLAudioElement).
+	 * Drive TTS from the video playhead. Safe every animation frame.
+	 * Starts once per cue at Align rate — no drift re-seeks (no syllable chop).
 	 */
 	sync(opts: {
 		playheadMs: number;
 		isPlaying: boolean;
 		cues: TtsPlayableCue[];
 		playbackRate?: number;
-		/** Prefer this cue when playhead sits on overlapping clips. */
 		preferredCueId?: string | null;
 	}) {
 		const { playheadMs, isPlaying, cues, playbackRate = 1, preferredCueId = null } = opts;
@@ -224,60 +260,90 @@ export class TtsPlaybackMixer {
 			return;
 		}
 
-		const playable = cues.filter(
-			(c) =>
-				c.assignedAudio &&
-				(c.assignedAudio.url || c.assignedAudio.filePath) &&
-				playheadMs >= c.startMs &&
-				playheadMs < playEndMs(c)
-		);
+		const prev = this.lastPlayheadMs;
+		const seekJump = prev >= 0 && (playheadMs - prev > 450 || playheadMs - prev < -120);
+		this.lastPlayheadMs = playheadMs;
 
-		const active =
-			(preferredCueId ? playable.find((c) => c.id === preferredCueId) : undefined) ??
-			playable[0];
+		// Play-through lock: keep one line going, but stop when playhead left the window
+		// (seek / next cue) and keep transport × fit rate live so picture ↔ TTS stay matched.
+		if (this.source && this.activeId && !seekJump) {
+			const live = cues.find((c) => c.id === this.activeId);
+			const stillInWindow =
+				live &&
+				playheadMs >= live.startMs - 40 &&
+				playheadMs < cueWindowEndMs(live) + 80;
+			if (stillInWindow && live) {
+				if (this.gain) {
+					this.gain.gain.value = Math.max(0, Math.min(1, (live.volume ?? 80) / 100));
+				}
+				const wantRate = cueEffectivePlaybackRate(live, playbackRate);
+				const safeRate = Math.max(0.85, Math.min(TTS_ALIGN_MAX_PLAYBACK, wantRate));
+				if (Math.abs(safeRate - this.activeRate) > 0.02) {
+					try {
+						this.source.playbackRate.value = safeRate;
+						this.activeRate = safeRate;
+					} catch {
+						/* ignore */
+					}
+				}
+				return;
+			}
+			this.stopSource();
+		}
 
-		if (!active) {
-			this.pauseAll();
+		const cue = this.pickCue(cues, playheadMs, preferredCueId);
+		if (!cue) {
+			if (!(this.source && this.activeId && !seekJump)) this.pauseAll();
 			return;
 		}
 
-		const url = this.resolveCueUrl(active);
+		if (this.activeId === cue.id && this.source && !seekJump) {
+			if (this.gain) {
+				this.gain.gain.value = Math.max(0, Math.min(1, (cue.volume ?? 80) / 100));
+			}
+			const wantRate = cueEffectivePlaybackRate(cue, playbackRate);
+			const safeRate = Math.max(0.85, Math.min(TTS_ALIGN_MAX_PLAYBACK, wantRate));
+			if (this.source && Math.abs(safeRate - this.activeRate) > 0.02) {
+				try {
+					this.source.playbackRate.value = safeRate;
+					this.activeRate = safeRate;
+				} catch {
+					/* ignore */
+				}
+			}
+			return;
+		}
+
+		// Wait for current line to finish before starting the next (unless seek).
+		if (this.source && this.activeId && this.activeId !== cue.id && !seekJump) {
+			return;
+		}
+
+		const url = this.resolveCueUrl(cue);
 		if (!url) {
 			this.pauseAll();
 			return;
 		}
 
-		const fit = cueFitRate(active);
-		// Video time → buffer time: when squeezed, 1s of video advances `fit` seconds of audio.
-		const videoOffsetSec = Math.max(0, (playheadMs - active.startMs) / 1000);
-		const offsetSec = videoOffsetSec * fit;
-		const effectiveRate = cueEffectivePlaybackRate(active, playbackRate);
-		const cached = this.buffers.get(active.id);
-
+		const cached = this.buffers.get(cue.id);
 		if (!cached || cached.url !== url) {
-			void this.loadBuffer(active.id, url);
+			void this.loadBuffer(cue.id, url);
 			if (!cached) return;
 		}
-
-		const buffer = this.buffers.get(active.id)?.buffer;
+		const buffer = this.buffers.get(cue.id)?.buffer;
 		if (!buffer) return;
 
-		const ctx = this.getCtx();
-		if (ctx.state === 'suspended') void ctx.resume();
+		const fit = cueFitRate(cue);
+		const rate = cueEffectivePlaybackRate(cue, playbackRate);
 
-		const needRestart =
-			this.activeId !== active.id ||
-			!this.source ||
-			Math.abs(this.activeRate - effectiveRate) > 0.04 ||
-			Math.abs(
-				this.startOffset + (ctx.currentTime - this.startedAt) * this.activeRate - offsetSec
-			) > 0.22;
+		// Seek: map video time → buffer time with fit. Fresh cue enter: start at 0.
+		const nearStart = playheadMs <= cue.startMs + 280;
+		const offsetSec =
+			seekJump && !nearStart
+				? Math.max(0, ((playheadMs - cue.startMs) / 1000) * fit)
+				: 0;
 
-		if (needRestart) {
-			this.startCue(active, buffer, offsetSec, effectiveRate);
-		} else if (this.gain) {
-			const vol = Math.max(0, Math.min(1, (active.volume ?? 80) / 100));
-			this.gain.gain.value = vol;
-		}
+		const remainWindowSec = Math.max(0.05, (cueWindowEndMs(cue) - playheadMs) / 1000);
+		this.startCue(cue, buffer, offsetSec, rate, remainWindowSec);
 	}
 }

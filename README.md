@@ -68,14 +68,14 @@ Real app UI — works on GitHub.com and the GitHub mobile app (images scale to y
 - **Extract Subs** — local ASR from the audio track (FunASR SenseVoice for Chinese · Whisper.cpp fallback)
 - **Translate ZH → KM** — Fast (Azure / Google) or High Quality (DeepSeek / Qwen / Gemini) with slang glossary
 - **Paste Khmer script** — one line per cue; extra lines create new cues (skips auto-translate)
-- **Generate TTS** — Edge Read Aloud Khmer voices; natural pace (no chipmunk lip-sync)
+- **Generate TTS** — Edge Read Aloud Khmer voices (default); optional **VoxCPM2** local engine for more natural KM (`pnpm voxcpm:setup`)
 - **Tighten silent gaps** — packs TTS back-to-back (~0.1s breath); drops long Chinese ASR dead air
 - **Tempo / Fit video to dub** — pitch-safe stretch or shorten so picture length matches Khmer TTS
 - **Original Audio mixer** — mute / volume fader on the timeline (preview + export mix)
 - **Studio** — timeline, preview, subtitle table, project save
 - **Export** — `.srt`, soft-sub video, or burn-in with system/Khmer fonts (preview-matched wrap + position) and TTS + original mix
 
-> **v0.2.1** — Preview-matched Khmer burn-in wrap, subtitle styling, and Fit video to dub in both directions.  
+> **v0.2.1** — Preview-matched Khmer burn-in wrap, subtitle styling, Fit video to dub both ways, optional VoxCPM2 TTS.  
 > See [Changelog](#changelog).
 
 ---
@@ -88,6 +88,7 @@ Real app UI — works on GitHub.com and the GitHub mobile app (images scale to y
 - **Subtitle style** — system font picker, outline/box look, size, outline thickness, max width (~96%), bottom-anchored Khmer under CN/EN hardsubs
 - **Fit video to dub (both ways)** — stretch when Khmer is longer **or** speed up (pitch-safe) when the picture outlasts the dub; sync banner for either case
 - **Preview overlay** — drag to move; handles for size / width; burn-in text tracks the visual playhead
+- **Optional VoxCPM2 TTS** — local natural Khmer engine (`pnpm voxcpm:setup`); Edge TTS stays default (no GPU / no ~5GB download until you opt in)
 
 ### v0.2.0 — 2026-08-04
 

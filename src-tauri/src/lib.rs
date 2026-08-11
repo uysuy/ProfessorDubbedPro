@@ -4,9 +4,11 @@ mod asr_funasr;
 mod export;
 mod fonts;
 mod media_tempo;
+mod speakers;
 mod transcribe;
 mod translate;
 mod tts;
+mod tts_voxcpm;
 
 /// reqwest + msedge-tts both use rustls. If aws-lc-rs and ring are both linked,
 /// rustls 0.23 panics unless a process-level CryptoProvider is installed first.
@@ -34,9 +36,15 @@ pub fn run() {
 			media_tempo::cancel_video_tempo,
 			tts::synthesize_speech,
 			tts::list_edge_voices,
+			tts_voxcpm::voxcpm_status,
+			tts_voxcpm::start_voxcpm_server,
+			tts_voxcpm::stop_voxcpm_server,
+			tts_voxcpm::load_voxcpm_model,
+			tts_voxcpm::synthesize_voxcpm_speech,
 			transcribe::transcribe_video,
 			transcribe::cancel_transcription,
 			translate::translate_texts,
+			speakers::detect_speakers,
 		])
 		.setup(|app| {
 			if cfg!(debug_assertions) {

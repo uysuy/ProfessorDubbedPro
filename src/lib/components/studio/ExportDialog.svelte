@@ -7,6 +7,7 @@
 	import { runProjectExport, type ExportMode } from '$lib/utils/export';
 	import { preferencesStore } from '$lib/stores/preferences.svelte';
 	import { isTauriRuntime } from '$lib/utils/platform';
+	import { cueEffectivePlaybackRate } from '$lib/utils/tts-fit';
 
 	interface Props {
 		open?: boolean;
@@ -34,12 +35,18 @@
 	const needsVideo = $derived(mode === 'videoSoftSubs' || mode === 'videoBurnedIn');
 	const canExport = $derived(exportableCount > 0 && !busy && (mode === 'srt' || hasVideo));
 
+	/** Export mirrors Align state — same rate / play-through as preview (no re-tempo). */
 	function collectDubClips() {
 		return projectStore.current.cues
 			.filter((c) => Boolean(c.assignedAudio?.filePath?.trim()))
 			.map((c) => {
-				const audioDur = c.assignedAudio?.durationMs;
 				const span = Math.max(200, c.endMs - c.startMs);
+				const audioDur =
+					typeof c.assignedAudio?.durationMs === 'number' && c.assignedAudio.durationMs > 0
+						? c.assignedAudio.durationMs
+						: span;
+				const playbackRate = cueEffectivePlaybackRate(c, 1);
+				const durationMs = Math.max(200, Math.ceil(audioDur / playbackRate));
 				return {
 					path: c.assignedAudio!.filePath!.trim(),
 					startMs: c.startMs,
@@ -47,10 +54,8 @@
 						0,
 						Math.min(1, (Number.isFinite(c.volume) ? c.volume : projectStore.volume) / 100)
 					),
-					durationMs:
-						typeof audioDur === 'number' && audioDur > 0
-							? Math.round(audioDur)
-							: span
+					durationMs,
+					playbackRate: Math.round(playbackRate * 1000) / 1000
 				};
 			});
 	}

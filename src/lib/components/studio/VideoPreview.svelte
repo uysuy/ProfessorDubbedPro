@@ -10,7 +10,7 @@
 	import { usesKhmerScript, normalizeDubLanguage } from '$lib/stores/preferences.svelte';
 	import { formatClock, formatTimecode } from '$lib/utils/time';
 	import { TtsPlaybackMixer } from '$lib/utils/tts-playback';
-	import { cueAudioEndMs } from '$lib/utils/tts-fit';
+	import { cuePreviewEndMs } from '$lib/utils/tts-fit';
 	import { isTauriRuntime } from '$lib/utils/platform';
 	import {
 		FolderOpen,
@@ -44,8 +44,18 @@
 
 	const ttsMixer = new TtsPlaybackMixer();
 	let ttsResolverReady = false;
-	/** User Original Audio fader (0 when muted) — TTS ducking multiplies this. */
+	/** User Original Audio fader (0 when muted) — silenced while TTS is active (no double dialogue). */
 	const baseVideoVolume = $derived(projectStore.originalAudioEffectiveGain);
+	/** After timeline scrub, hold publishing stale video.currentTime so TTS does not restart twice. */
+	let seekHoldUntil = 0;
+	let seekHoldTargetMs: number | null = null;
+
+	$effect(() => {
+		projectStore.setTtsInvalidateHandler((id) => {
+			if (id) ttsMixer.invalidate(id);
+		});
+		return () => projectStore.setTtsInvalidateHandler(null);
+	});
 
 	async function ensureTtsResolver() {
 		if (ttsResolverReady || !isTauriRuntime()) return;
@@ -64,6 +74,26 @@
 		}
 	}
 
+	function cueHasTtsInWindow(playheadMs: number, playing: boolean): boolean {
+		if (!playing) return false;
+		return projectStore.current.cues.some((c) => {
+			if (!c.assignedAudio || !(c.assignedAudio.url || c.assignedAudio.filePath)) {
+				return false;
+			}
+			return playheadMs >= c.startMs && playheadMs < cuePreviewEndMs(c);
+		});
+	}
+
+	/** Mute original bed under TTS so preview is not Chinese + Khmer together. */
+	function applyVideoDuck(playheadMs: number, playing: boolean) {
+		if (!videoEl) return;
+		const hasTts = cueHasTtsInWindow(playheadMs, playing);
+		const target = hasTts ? 0 : baseVideoVolume;
+		if (Math.abs(videoEl.volume - target) > 0.01) {
+			videoEl.volume = Math.max(0, Math.min(1, target));
+		}
+	}
+
 	function syncTts(playheadMs: number, playing: boolean) {
 		void ensureTtsResolver();
 		ttsMixer.sync({
@@ -73,21 +103,7 @@
 			preferredCueId: playback.focusedCueId,
 			cues: projectStore.current.cues
 		});
-
-		if (videoEl) {
-			const hasTts =
-				playing &&
-				projectStore.current.cues.some((c) => {
-					if (!c.assignedAudio || !(c.assignedAudio.url || c.assignedAudio.filePath)) {
-						return false;
-					}
-					return playheadMs >= c.startMs && playheadMs < cueAudioEndMs(c);
-				});
-			const target = hasTts ? baseVideoVolume * 0.28 : baseVideoVolume;
-			if (Math.abs(videoEl.volume - target) > 0.02) {
-				videoEl.volume = Math.max(0, Math.min(1, target));
-			}
-		}
+		applyVideoDuck(playheadMs, playing);
 	}
 
 	/** Apply fader immediately when mute/gain changes (including while paused). */
@@ -97,17 +113,9 @@
 		if (!el) return;
 		untrack(() => {
 			const playing = playback.isPlaying;
-			const ms = playback.playheadMs;
-			const hasTts =
-				playing &&
-				projectStore.current.cues.some((c) => {
-					if (!c.assignedAudio || !(c.assignedAudio.url || c.assignedAudio.filePath)) {
-						return false;
-					}
-					return ms >= c.startMs && ms < cueAudioEndMs(c);
-				});
-			const target = hasTts ? gain * 0.28 : gain;
-			el.volume = Math.max(0, Math.min(1, target));
+			const ms = getVisualPlayheadMs() || playback.playheadMs;
+			const hasTts = cueHasTtsInWindow(ms, playing);
+			el.volume = Math.max(0, Math.min(1, hasTts ? 0 : gain));
 		});
 	});
 
@@ -135,7 +143,8 @@
 
 	function resolveOverlayText(ms: number): string | null {
 		const cues = projectStore.current.cues;
-		const cue = cues.find((c) => ms >= c.startMs && ms < cueAudioEndMs(c));
+		// Same window as TTS mixer (Align fit-aware) so title ↔ audio match.
+		const cue = cues.find((c) => ms >= c.startMs && ms < cuePreviewEndMs(c));
 		if (!cue) return null;
 		const text = cue.translation?.trim() || cue.source?.trim();
 		return text ? text : null;
@@ -429,19 +438,41 @@
 
 		const videoMs = videoEl.currentTime * 1000;
 		const requested = consumeMediaSeekMs();
+		const now = performance.now();
 
-		// Honor an intentional scrub/jump once, then resume following the media clock.
+		// Honor an intentional scrub/jump once, then hold until <video> catches up
+		// so we never publish stale currentTime (that restarted TTS as a double attack).
 		if (requested != null && Number.isFinite(requested)) {
 			const dur = videoDurationSec();
 			if (dur) {
 				videoEl.currentTime = Math.min(dur, Math.max(0, requested / 1000));
 			}
-			publishClock(requested, performance.now(), true);
+			seekHoldTargetMs = requested;
+			seekHoldUntil = now + 140;
+			publishClock(requested, now, true);
 			return;
 		}
 
+		if (seekHoldTargetMs != null && now < seekHoldUntil) {
+			const delta = Math.abs(videoMs - seekHoldTargetMs);
+			if (delta > 60) {
+				// Keep visual/TTS on the requested time; re-nudge media if it slipped.
+				if (delta > 250 && videoDurationSec()) {
+					try {
+						videoEl.currentTime = Math.max(0, seekHoldTargetMs / 1000);
+					} catch {
+						/* ignore */
+					}
+				}
+				publishClock(seekHoldTargetMs, now, forceStore);
+				return;
+			}
+			seekHoldTargetMs = null;
+			seekHoldUntil = 0;
+		}
+
 		// While playing, the <video> element is the source of truth.
-		publishClock(videoMs, performance.now(), forceStore);
+		publishClock(videoMs, now, forceStore);
 
 		if (playback.isPlaying && isNearEnd(videoEl)) {
 			finishPlayback();
@@ -540,10 +571,19 @@
 		untrack(() => ensureMediaDuration());
 		applyPlaybackRate(el);
 
+		try {
+			const { stopVoicePreview } = await import('$lib/tts/voice-preview');
+			stopVoicePreview();
+		} catch {
+			/* ignore */
+		}
+
 		// Apply any pending timeline scrub before starting.
 		const requested = consumeMediaSeekMs();
 		if (requested != null && Number.isFinite(requested)) {
 			applyVideoCurrentTime(requested);
+			seekHoldTargetMs = requested;
+			seekHoldUntil = performance.now() + 140;
 			publishClock(requested, performance.now(), true);
 		} else if (isNearEnd(el)) {
 			el.currentTime = 0;
@@ -596,6 +636,8 @@
 				} catch {
 					/* ignore */
 				}
+				seekHoldTargetMs = null;
+				seekHoldUntil = 0;
 				syncClockFromMedia(true);
 				ttsMixer.pauseAll();
 				if (videoEl) videoEl.volume = baseVideoVolume;
@@ -629,6 +671,8 @@
 			durationChecked = false;
 			transportMs = 0;
 			lastStorePushAt = 0;
+			seekHoldTargetMs = null;
+			seekHoldUntil = 0;
 			setVisualPlayheadMs(0);
 			paintTransport(0);
 			ttsMixer.pauseAll();
@@ -667,10 +711,9 @@
 	}
 
 	function onTimeUpdate() {
-		// While paused the store owns the playhead (timeline / transport seeks).
-		// Syncing from video here snaps the needle back to the end after `ended`.
-		if (!playback.isPlaying || isSeeking) return;
-		pushPlayheadFromVideo();
+		// rAF owns the clock while playing — also syncing here fought seeks and
+		// restarted TTS (duplicate syllable). Paused seeks use the store effect.
+		if (playback.isPlaying || isSeeking) return;
 	}
 
 	function onRateChange() {
@@ -732,6 +775,8 @@
 	function seekTo(ms: number) {
 		const maxMs = Math.max(durationMs, projectStore.current.durationMs, 1);
 		const clamped = Math.max(0, Math.min(maxMs, ms));
+		seekHoldTargetMs = clamped;
+		seekHoldUntil = performance.now() + 140;
 		setVisualPlayheadMs(clamped, { seekMedia: true });
 		publishClock(clamped, performance.now(), true);
 		applyVideoCurrentTime(clamped);
@@ -841,6 +886,7 @@
 				if (!selected || Array.isArray(selected)) return;
 				const ok = await projectStore.setVideoFromPath(selected);
 				if (ok) {
+					tempoStore.syncFromProject();
 					const name = selected.split(/[/\\]/).pop() || 'video';
 					dndStore.flash(`Loaded ${name}`);
 				} else {
@@ -861,7 +907,10 @@
 			return;
 		}
 		const ok = projectStore.setVideoFromFile(file);
-		if (ok) dndStore.flash(`Loaded ${file.name}`);
+		if (ok) {
+			tempoStore.syncFromProject();
+			dndStore.flash(`Loaded ${file.name}`);
+		}
 	}
 
 	function onFileInputChange(e: Event) {
@@ -1103,20 +1152,28 @@
 					variant="secondary"
 					class="shrink-0"
 					disabled={tempoStore.isRemastering ||
-						!tempoStore.fitToDubPlan ||
-						tempoStore.fitToDubPlan.alreadyFits ||
-						tempoStore.fitToDubPlan.tooExtreme}
+						tempoStore.mediaDurationMs < 500 ||
+						!projectStore.current.cues.length ||
+						(!!tempoStore.fitToDubPlan?.alreadyFits &&
+							tempoStore.dubOverhangMs <= 400 &&
+							tempoStore.videoUnderhangMs <= 800 &&
+							!tempoStore.hasOverhangPrompt)}
 					onclick={() => {
 						projectStore.setVideoTool('tempo');
 						void tempoStore.fitToDub();
 					}}
 				>
 					{#if tempoStore.isRemastering}
-						Fitting…
+						Aligning…
 					{:else if tempoStore.fitToDubPlan && !tempoStore.fitToDubPlan.alreadyFits}
-						Fit video to dub ({tempoStore.fitToDubPlan.tempo.toFixed(2)}×)
+						{#if tempoStore.fitToDubPlan.strategy === 'hybrid'}
+							Align ({tempoStore.fitToDubPlan.ttsRate.toFixed(2)}× +
+							{tempoStore.fitToDubPlan.tempo.toFixed(2)}×)
+						{:else}
+							Align ({tempoStore.fitToDubPlan.tempo.toFixed(2)}×)
+						{/if}
 					{:else}
-						Fit video to dub
+						Align script ↔ video
 					{/if}
 				</Button>
 			</div>

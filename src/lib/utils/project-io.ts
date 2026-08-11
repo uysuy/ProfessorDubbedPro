@@ -3,10 +3,14 @@ import type {
 	DubbingTrack,
 	MediaAsset,
 	MediaKind,
+	SpeakerVoiceProfile,
 	SubtitleCue,
 	SubtitleStyle
 } from '$lib/types/project';
 import { DEFAULT_SUBTITLE_STYLE } from '$lib/types/project';
+import { DEFAULT_EDGE_VOICE_ID } from '$lib/tts/edge-voices';
+import { voiceIdForEngineGender } from '$lib/tts/voice-engine';
+import type { TtsEngineId } from '$lib/tts/types';
 
 export const PROJECT_STORAGE_KEY = 'pdp.currentProject';
 
@@ -82,11 +86,13 @@ export function createEmptyProject(
 		targetLanguage,
 		fps: 24,
 		durationMs: 60_000,
+		mediaTempoFromSource: 1,
 		videoAssetId: null,
 		assets: [],
 		tracks,
 		cues: [],
 		subtitleStyle: { ...DEFAULT_SUBTITLE_STYLE },
+		speakerBank: [],
 		updatedAt: new Date().toISOString()
 	};
 }
@@ -103,12 +109,22 @@ export function createSubtitleCue(
 ): SubtitleCue {
 	const startMs = Math.max(0, Math.round(input.startMs ?? 0));
 	const endMs = Math.max(startMs + 200, Math.round(input.endMs ?? startMs + 2000));
+	const pictureStartMs =
+		typeof input.pictureStartMs === 'number' && Number.isFinite(input.pictureStartMs)
+			? Math.max(0, Math.round(input.pictureStartMs))
+			: startMs;
+	const pictureEndMs =
+		typeof input.pictureEndMs === 'number' && Number.isFinite(input.pictureEndMs)
+			? Math.max(pictureStartMs + 120, Math.round(input.pictureEndMs))
+			: endMs;
 
 	return {
 		id: input.id ?? uid('cue'),
 		index,
 		startMs,
 		endMs,
+		pictureStartMs,
+		pictureEndMs,
 		source: input.source ?? '',
 		translation: input.translation ?? '',
 		speaker: input.speaker ?? defaults?.speaker ?? 'Speaker 1',
@@ -151,6 +167,12 @@ function normalizeCue(raw: unknown, index: number): SubtitleCue | null {
 		id,
 		startMs,
 		endMs,
+		pictureStartMs: Number.isFinite(Number(raw.pictureStartMs))
+			? Number(raw.pictureStartMs)
+			: startMs,
+		pictureEndMs: Number.isFinite(Number(raw.pictureEndMs))
+			? Number(raw.pictureEndMs)
+			: endMs,
 		source: typeof raw.source === 'string' ? raw.source : '',
 		translation: typeof raw.translation === 'string' ? raw.translation : '',
 		speaker: typeof raw.speaker === 'string' ? raw.speaker : 'Speaker 1',
@@ -176,7 +198,11 @@ function normalizeCue(raw: unknown, index: number): SubtitleCue | null {
 					engine: typeof raw.assignedAudio.engine === 'string' ? raw.assignedAudio.engine : undefined,
 					fitPlaybackRate: Number.isFinite(Number(raw.assignedAudio.fitPlaybackRate))
 						? Math.max(0.5, Math.min(2.5, Number(raw.assignedAudio.fitPlaybackRate)))
-						: undefined
+						: undefined,
+					sourceText:
+						typeof raw.assignedAudio.sourceText === 'string'
+							? raw.assignedAudio.sourceText
+							: undefined
 				}
 			: null
 	});
@@ -220,6 +246,36 @@ function normalizeSubtitleStyle(raw: unknown): SubtitleStyle {
 	return { fontFamily, fontFile, fontSizePx, x, y, look, maxWidthPct, outlineWidth };
 }
 
+/** Default voice for a speaker gender on the active TTS engine. */
+export function voiceIdForSpeakerGender(
+	gender: string,
+	engine: TtsEngineId | string = 'edge-tts'
+): string {
+	const eng: TtsEngineId = engine === 'voxcpm' ? 'voxcpm' : 'edge-tts';
+	return voiceIdForEngineGender(eng, gender) || DEFAULT_EDGE_VOICE_ID;
+}
+
+function normalizeSpeakerBank(raw: unknown): SpeakerVoiceProfile[] {
+	if (!Array.isArray(raw)) return [];
+	const out: SpeakerVoiceProfile[] = [];
+	for (const item of raw) {
+		if (!isRecord(item)) continue;
+		const id = typeof item.id === 'string' ? item.id.trim() : '';
+		if (!id) continue;
+		const genderRaw = typeof item.gender === 'string' ? item.gender.toLowerCase() : 'neutral';
+		const gender: SpeakerVoiceProfile['gender'] =
+			genderRaw === 'male' || genderRaw === 'female' ? genderRaw : 'neutral';
+		const refWavPath = typeof item.refWavPath === 'string' ? item.refWavPath : '';
+		const cueCount = Number.isFinite(Number(item.cueCount)) ? Number(item.cueCount) : 0;
+		const voiceId =
+			typeof item.voiceId === 'string' && item.voiceId
+				? item.voiceId
+				: voiceIdForSpeakerGender(gender);
+		out.push({ id, gender, refWavPath, cueCount, voiceId });
+	}
+	return out;
+}
+
 /** Validate / normalize a persisted project payload. */
 export function parseProject(raw: unknown): DubbingProject | null {
 	if (!isRecord(raw)) return null;
@@ -261,11 +317,15 @@ export function parseProject(raw: unknown): DubbingProject | null {
 		durationMs: Number.isFinite(Number(raw.durationMs))
 			? Math.max(1000, Number(raw.durationMs))
 			: base.durationMs,
+		mediaTempoFromSource: Number.isFinite(Number(raw.mediaTempoFromSource))
+			? Math.max(0.25, Math.min(2, Number(raw.mediaTempoFromSource)))
+			: 1,
 		videoAssetId: typeof raw.videoAssetId === 'string' ? raw.videoAssetId : null,
 		assets,
 		tracks: Array.isArray(raw.tracks) && raw.tracks.length ? (raw.tracks as DubbingTrack[]) : base.tracks,
 		cues,
 		subtitleStyle: normalizeSubtitleStyle(raw.subtitleStyle),
+		speakerBank: normalizeSpeakerBank(raw.speakerBank),
 		updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : new Date().toISOString()
 	};
 }
@@ -280,6 +340,7 @@ export function serializeProject(project: DubbingProject): DubbingProject {
 		tracks: [...project.tracks],
 		cues: project.cues.map((c) => ({ ...c })),
 		subtitleStyle: { ...project.subtitleStyle },
+		speakerBank: (project.speakerBank ?? []).map((s) => ({ ...s })),
 		updatedAt: new Date().toISOString()
 	};
 	return JSON.parse(JSON.stringify(plain)) as DubbingProject;

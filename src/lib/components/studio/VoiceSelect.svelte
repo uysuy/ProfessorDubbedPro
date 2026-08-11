@@ -7,6 +7,7 @@
 	import { voicesStore } from '$lib/stores/voices.svelte';
 	import { dndStore } from '$lib/stores/dnd.svelte';
 	import { migrateVoiceId } from '$lib/tts/edge-voices';
+	import { isVoxcpmVoiceId } from '$lib/tts/voxcpm-voices';
 	import { previewEdgeVoice, stopVoicePreview } from '$lib/tts/voice-preview';
 	import { Check, ChevronsUpDown, LoaderCircle, Pause, Play, Volume2 } from '@lucide/svelte';
 
@@ -38,6 +39,9 @@
 			null
 	);
 	const loadingVoices = $derived(voicesStore.status === 'loading');
+	const listIsVoxcpm = $derived(list.length > 0 && list.every((v) => isVoxcpmVoiceId(v.id)));
+	const engineBadge = $derived(listIsVoxcpm ? 'VoxCPM2' : 'Edge TTS');
+	const listTitle = $derived(listIsVoxcpm ? 'Khmer VoxCPM2 voices' : 'Khmer Edge-TTS voices');
 
 	const typeStyles: Record<VoiceProfile['type'], string> = {
 		Neural:
@@ -89,6 +93,11 @@
 	async function previewVoice(voice: VoiceProfile, e: MouseEvent) {
 		e.preventDefault();
 		e.stopPropagation();
+
+		if (isVoxcpmVoiceId(voice.id)) {
+			dndStore.flash('Preview uses Generate with VoxCPM (no Edge sample).');
+			return;
+		}
 
 		if (previewingId === voice.id || previewLoadingId === voice.id) {
 			stopPreview();
@@ -168,7 +177,7 @@
 							<span class="mt-0.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
 								<span class="font-medium text-foreground/70">{genderLabel[selected.gender]}</span>
 								<span class="text-border">·</span>
-								<span>Edge TTS</span>
+								<span>{engineBadge}</span>
 								<span class="text-border">·</span>
 								<span class="uppercase">{selected.language}</span>
 							</span>
@@ -192,7 +201,7 @@
 	>
 		<div class="flex items-center justify-between gap-2 px-2 py-1.5">
 			<p class="text-[10px] font-semibold tracking-[0.14em] text-muted-foreground uppercase">
-				Khmer Edge-TTS voices
+				{listTitle}
 			</p>
 			{#if loadingVoices}
 				<span class="text-[10px] text-muted-foreground">Loading…</span>

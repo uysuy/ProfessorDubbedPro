@@ -9,6 +9,8 @@
 	import { playback, projectStore } from '$lib/stores/project.svelte';
 	import { tempoStore } from '$lib/stores/tempo.svelte';
 	import { voicesStore } from '$lib/stores/voices.svelte';
+	import { VOXCPM_VOICES } from '$lib/tts/voxcpm-voices';
+	import { voicesForEngine } from '$lib/tts/voice-engine';
 	import { setVisualPlayheadMs } from '$lib/stores/playback-clock';
 	import {
 		dndStore,
@@ -20,6 +22,7 @@
 	import { formatTimecode, parseTimecode } from '$lib/utils/time';
 	import type { SubtitleCue } from '$lib/types/project';
 	import {
+		preferencesStore,
 		languageLabel,
 		usesKhmerScript,
 		normalizeDubLanguage
@@ -93,8 +96,15 @@
 	const dropTarget = $derived(dndStore.dropTarget);
 
 	function voiceName(id: string) {
+		if (preferencesStore.ttsEngine === 'voxcpm') {
+			return VOXCPM_VOICES.find((v) => v.id === id)?.name ?? id;
+		}
 		return voicesStore.displayName(id);
 	}
+
+	const cueVoiceOptions = $derived(
+		voicesForEngine(preferencesStore.ttsEngine, voicesStore.voices)
+	);
 
 	function flashRows(ids: string[]) {
 		if (flashTimer) clearTimeout(flashTimer);
@@ -174,13 +184,7 @@
 		const n = await projectStore.generateCues([cue.id]);
 		if (n > 0) {
 			flashRows([cue.id]);
-			const overhang = tempoStore.dubOverhangMs;
-			if (overhang > 800) {
-				dndStore.flash(
-					`Edge-TTS · cue #${cue.index} — Khmer runs ~${Math.round(overhang / 1000)}s past video. Click Fit video to dub.`
-				);
-				projectStore.setVideoTool('tempo');
-			} else {
+			if (!tempoStore.promptOverhangAfterTts()) {
 				dndStore.flash(`Edge-TTS · cue #${cue.index}`);
 			}
 		} else if (projectStore.generateError) {
@@ -207,17 +211,9 @@
 		const n = await projectStore.generateCues(ids);
 		if (n > 0) {
 			flashRows(ids);
-			const overhang = tempoStore.dubOverhangMs;
-			if (overhang > 800) {
+			if (!tempoStore.promptOverhangAfterTts()) {
 				dndStore.flash(
-					`TTS ×${n} done · gaps tightened — Khmer runs ~${Math.round(overhang / 1000)}s past video. Click Fit video to dub.`
-				);
-				projectStore.setVideoTool('tempo');
-			} else {
-				dndStore.flash(
-					n === 1
-						? 'Edge-TTS generated · gaps tightened'
-						: `Edge-TTS ×${n} · gaps tightened`
+					n === 1 ? 'Edge-TTS generated' : `Edge-TTS ×${n} generated`
 				);
 			}
 		} else if (projectStore.generateError) {
@@ -1015,7 +1011,7 @@
 											<span class="truncate">{voiceName(cue.voiceId)}</span>
 										</Select.Trigger>
 										<Select.Content>
-											{#each voicesStore.voices as voice}
+											{#each cueVoiceOptions as voice}
 												<Select.Item
 													value={voice.id}
 													label="{voice.name} · {voice.gender === 'female'

@@ -16,6 +16,7 @@
 		WHISPER_MODEL_OPTIONS,
 		ASR_ENGINE_OPTIONS,
 		FUNASR_MODEL_OPTIONS,
+		TTS_ENGINE_OPTIONS,
 		type AutoSaveIntervalSec,
 		type DubLanguageCode,
 		type TranslationQuality,
@@ -27,6 +28,8 @@
 	import { autosaveStore } from '$lib/stores/autosave.svelte';
 	import { projectStore } from '$lib/stores/project.svelte';
 	import { voicesStore } from '$lib/stores/voices.svelte';
+	import { VOXCPM_VOICES } from '$lib/tts/voxcpm-voices';
+	import type { TtsEngineId } from '$lib/tts';
 	import type { ExportMode } from '$lib/utils/export';
 
 	const voiceName = $derived(voicesStore.displayName(preferencesStore.defaultVoiceId));
@@ -57,6 +60,12 @@
 		FUNASR_MODEL_OPTIONS.find((o) => o.value === preferencesStore.funasrModel)?.label ??
 			'SenseVoice-Small'
 	);
+	const ttsEngineLabel = $derived(
+		TTS_ENGINE_OPTIONS.find((o) => o.value === preferencesStore.ttsEngine)?.label ?? 'Edge TTS'
+	);
+	const voiceList = $derived(
+		preferencesStore.ttsEngine === 'voxcpm' ? VOXCPM_VOICES : undefined
+	);
 	const translatorHint = $derived(
 		preferencesStore.translationQuality === 'high'
 			? preferencesStore.llmTranslateApiKey.trim()
@@ -69,7 +78,7 @@
 
 	function onVoiceChange(id: string) {
 		preferencesStore.setDefaultVoiceId(id);
-		projectStore.setVoiceId(id);
+		projectStore.setVoiceId(id, { applyToCues: false });
 	}
 
 	function onLanguageChange(value: string | undefined) {
@@ -115,6 +124,13 @@
 		if (!value || !FUNASR_MODEL_OPTIONS.some((o) => o.value === value)) return;
 		preferencesStore.setFunasrModel(value as FunAsrModel);
 	}
+
+	function onTtsEngineChange(value: string | undefined) {
+		if (!value || !TTS_ENGINE_OPTIONS.some((o) => o.value === value)) return;
+		const engine = value as TtsEngineId;
+		preferencesStore.setTtsEngine(engine);
+		projectStore.syncVoicesToTtsEngine(engine);
+	}
 </script>
 
 <div
@@ -125,7 +141,11 @@
 		class="flex min-w-0 flex-col gap-1.5 rounded-md border border-border/70 bg-muted/15 p-3 shadow-[var(--elevation-panel)]"
 	>
 		<Label class="text-xs" for="pref-voice">Default Voice</Label>
-		<VoiceSelect value={preferencesStore.defaultVoiceId} onValueChange={onVoiceChange} />
+		<VoiceSelect
+			value={preferencesStore.defaultVoiceId}
+			voices={voiceList}
+			onValueChange={onVoiceChange}
+		/>
 		<p class="mt-auto text-[11px] leading-snug text-muted-foreground">
 			New cues &amp; Voice panel. <span class="text-foreground/80">{voiceName}</span>
 		</p>
@@ -240,6 +260,37 @@
 			default: FunASR SenseVoice. Setup once with
 			<span class="font-mono text-[10px]">pnpm funasr:setup</span>. For tougher Mandarin,
 			try Paraformer-ZH. Whisper stays as fallback.
+		</p>
+	</section>
+
+	<section
+		class="flex min-w-0 flex-col gap-1.5 rounded-md border border-border/70 bg-muted/15 p-3 shadow-[var(--elevation-panel)] sm:col-span-2"
+	>
+		<div class="flex min-w-0 flex-col gap-1.5">
+			<Label class="text-xs" for="pref-tts-engine">TTS engine</Label>
+			<Select.Root
+				type="single"
+				value={preferencesStore.ttsEngine}
+				onValueChange={onTtsEngineChange}
+			>
+				<Select.Trigger id="pref-tts-engine" class="h-8 w-full">{ttsEngineLabel}</Select.Trigger>
+				<Select.Content>
+					{#each TTS_ENGINE_OPTIONS as opt (opt.value)}
+						<Select.Item value={opt.value} label={opt.label}>
+							<span class="flex w-full items-center justify-between gap-3">
+								<span>{opt.label}</span>
+								<span class="text-[10px] text-muted-foreground">{opt.hint}</span>
+							</span>
+						</Select.Item>
+					{/each}
+				</Select.Content>
+			</Select.Root>
+		</div>
+		<p class="text-[11px] leading-snug text-muted-foreground">
+			Edge TTS is online and default. VoxCPM2 is optional local Khmer TTS — setup once with
+			<span class="font-mono text-[10px]">pnpm voxcpm:setup</span>
+			(~5GB model on first Generate, ~8GB VRAM). RTX 1070 is tight; switch back to Edge if it
+			runs out of memory.
 		</p>
 	</section>
 
