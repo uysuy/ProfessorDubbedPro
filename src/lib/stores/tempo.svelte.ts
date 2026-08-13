@@ -196,11 +196,10 @@ export const tempoStore = {
 		const tooExtreme = plan.strategy === 'overhang';
 		let strategy: 'none' | 'tts-only' | 'video-only' | 'hybrid' = 'none';
 		if (plan.strategy === 'mild') {
-			if (plan.ttsRate > 1.001 && plan.videoTempo < 0.995) strategy = 'hybrid';
-			else if (plan.ttsRate > 1.001) strategy = 'tts-only';
-			else if (plan.videoTempo < 0.995) strategy = 'video-only';
+			if (plan.videoTempo < 0.995) strategy = 'video-only';
+			else strategy = 'none';
 		} else if (plan.strategy === 'gap-expand') {
-			strategy = 'tts-only';
+			strategy = 'none';
 		} else if (plan.strategy === 'overhang') {
 			strategy = 'video-only';
 		}
@@ -387,8 +386,8 @@ export const tempoStore = {
 	/**
 	 * Align script ↔ video (Extract → Paste path).
 	 * Keeps Extract picture anchors when possible; expands gaps for long Khmer;
-	 * mild path may nudge speech ≤~1.08× and/or pitch-safe video slowdown.
-	 * Generate still does not retime — only Align places TTS against picture.
+	 * may pitch-safe-extend video. Never auto-changes TTS pitch/speed — Prosody
+	 * stays manual. Generate still does not retime — only Align places TTS against picture.
 	 */
 	async fitToDub(): Promise<boolean> {
 		if (isRemastering) return false;
@@ -520,7 +519,7 @@ export const tempoStore = {
 	},
 
 	/**
-	 * Overhang option: force-fit into picture (may nudge starts + mild TTS rate).
+	 * Overhang option: force-fit into picture (clips windows; does not speed TTS).
 	 */
 	async resolveOverhangTrim(): Promise<boolean> {
 		const videoMs = videoDurationMs();

@@ -1,6 +1,6 @@
 import { formatClock } from '$lib/utils/time';
 
-export type TimelineTrackKind = 'subtitles' | 'tts' | 'original';
+export type TimelineTrackKind = 'video' | 'subtitles' | 'tts' | 'original';
 
 export interface TimelineTrackDef {
 	id: string;
@@ -28,6 +28,14 @@ export const TIMELINE_TRACKS: TimelineTrackDef[] = [
 		role: 'Voice',
 		color: 'var(--track-tts)',
 		height: 80
+	},
+	{
+		id: 'trk-video',
+		kind: 'video',
+		name: 'Original Video',
+		role: 'Picture',
+		color: 'var(--track-video)',
+		height: 72
 	},
 	{
 		id: 'trk-original',

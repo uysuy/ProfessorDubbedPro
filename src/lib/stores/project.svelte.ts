@@ -14,6 +14,13 @@ import {
 	type NewCueInput
 } from '$lib/utils/project-io';
 import {
+	clearSpeakerLockInVault,
+	mergeBankWithVault,
+	persistSpeakerBankToVault,
+	renameSpeakerInVault,
+	speakerBankFromVault
+} from '$lib/utils/speaker-vault';
+import {
 	buildRecoveryDocument,
 	saveRecoveryToLocalStorage
 } from '$lib/utils/project-file';
@@ -596,24 +603,37 @@ export const projectStore = {
 		revokeVideoUrl();
 		resetOriginalAudio();
 		const scrubbed = scrubMismatchedTts(loaded.cues);
-		project = scrubbed.clearedIds.length
+		let next = scrubbed.clearedIds.length
 			? { ...loaded, cues: scrubbed.cues }
 			: loaded;
+		const bank = next.speakerBank?.length
+			? mergeBankWithVault(next.speakerBank)
+			: speakerBankFromVault();
+		next = { ...next, speakerBank: bank };
+		project = next;
 		if (scrubbed.clearedIds.length) dropTtsWaveforms(scrubbed.clearedIds);
+		persistSpeakerBankToVault(bank);
 		projectFilePath = null;
 		clearHistory();
 		resetPlayback();
 		markClean(loaded.updatedAt);
 	},
 
-	/** Create a fresh empty project (clears video + cues). */
+	/** Create a fresh empty project (clears video + cues). Keeps locked speakers from vault. */
 	createProject(name?: string) {
 		revokeVideoUrl();
 		resetOriginalAudio();
-		project = createEmptyProject(name, {
-			sourceLanguage: 'en',
-			targetLanguage: preferencesStore.defaultLanguage
-		});
+		sourceVideoPath = null;
+		sourceVideoFile = null;
+		sourceDurationMs = 0;
+		const vaultBank = speakerBankFromVault();
+		project = {
+			...createEmptyProject(name, {
+				sourceLanguage: 'en',
+				targetLanguage: preferencesStore.defaultLanguage
+			}),
+			speakerBank: vaultBank
+		};
 		projectFilePath = null;
 		voiceId = migrateVoiceId(preferencesStore.defaultVoiceId);
 		originalAudioGain = 1;
@@ -941,10 +961,16 @@ export const projectStore = {
 		revokeVideoUrl();
 		resetOriginalAudio();
 		const scrubbed = scrubMismatchedTts(loaded.cues);
-		project = scrubbed.clearedIds.length
+		let next = scrubbed.clearedIds.length
 			? { ...loaded, cues: scrubbed.cues }
 			: loaded;
+		const bank = next.speakerBank?.length
+			? mergeBankWithVault(next.speakerBank)
+			: speakerBankFromVault();
+		next = { ...next, speakerBank: bank };
+		project = next;
 		if (scrubbed.clearedIds.length) dropTtsWaveforms(scrubbed.clearedIds);
+		persistSpeakerBankToVault(bank);
 		projectFilePath = null;
 		clearHistory();
 		resetPlayback();
@@ -1022,7 +1048,11 @@ export const projectStore = {
 	},
 	selectCueAt(id: string, opts?: { toggle?: boolean; range?: boolean }) {
 		if (opts?.range && selectionAnchorId) {
-			const ids = project.cues.map((cue) => cue.id);
+			// Range by timeline order (startMs), not raw array index — matches Shift+click in NLEs.
+			const sorted = [...project.cues].sort(
+				(a, b) => a.startMs - b.startMs || a.index - b.index
+			);
+			const ids = sorted.map((c) => c.id);
 			const a = ids.indexOf(selectionAnchorId);
 			const b = ids.indexOf(id);
 			if (a >= 0 && b >= 0) {
@@ -1693,22 +1723,32 @@ export const projectStore = {
 	},
 
 	/**
-	 * Apply Smart Align timing patches (start/end + fitPlaybackRate).
-	 * Preserves pictureStartMs / pictureEndMs anchors from Extract.
+	 * Apply Smart Align timing patches (start/end).
+	 * Always resets fitPlaybackRate to 1 — Align must not auto-speed/pitch TTS.
+	 * Prosody pitch/speed stay under manual user control.
 	 */
 	applySmartAlignPatches(patches: SmartAlignPatch[]): { changed: number } {
-		if (!patches.length) return { changed: 0 };
 		const byId = new Map(patches.map((p) => [p.id, p]));
 		let changed = 0;
 		const nextCues = withPictureAnchors(project.cues).map((cue) => {
 			const p = byId.get(cue.id);
-			if (!p) return cue;
 			const audio = cue.assignedAudio;
 			const prevRate = audio?.fitPlaybackRate ?? 1;
+			const needsRateReset = Boolean(audio) && Math.abs(prevRate - 1) >= 0.001;
+
+			if (!p) {
+				if (!needsRateReset) return cue;
+				changed += 1;
+				return {
+					...cue,
+					assignedAudio: audio ? { ...audio, fitPlaybackRate: 1 } : audio
+				};
+			}
+
 			if (
 				p.startMs === cue.startMs &&
 				p.endMs === cue.endMs &&
-				Math.abs(prevRate - p.fitPlaybackRate) < 0.001
+				!needsRateReset
 			) {
 				return cue;
 			}
@@ -1717,9 +1757,7 @@ export const projectStore = {
 				...cue,
 				startMs: p.startMs,
 				endMs: p.endMs,
-				assignedAudio: audio
-					? { ...audio, fitPlaybackRate: p.fitPlaybackRate }
-					: audio
+				assignedAudio: audio ? { ...audio, fitPlaybackRate: 1 } : audio
 			};
 		});
 		if (!changed) return { changed: 0 };
@@ -2454,6 +2492,76 @@ export const projectStore = {
 	},
 
 	/**
+	 * Nudge selected cues for keyboard arrangement.
+	 * `both` = slide window; `start` / `end` = trim that edge.
+	 */
+	nudgeSelectedCues(
+		deltaMs: number,
+		mode: 'both' | 'start' | 'end' = 'both'
+	): number {
+		const ids = new Set(selectedCueIds);
+		if (!ids.size || !Number.isFinite(deltaMs) || deltaMs === 0) return 0;
+		const minDur = 200;
+		const maxEnd = Math.max(1000, project.durationMs);
+		let changed = 0;
+		project = touch({
+			...project,
+			cues: project.cues.map((c) => {
+				if (!ids.has(c.id)) return c;
+				changed += 1;
+				if (mode === 'both') {
+					const dur = Math.max(minDur, c.endMs - c.startMs);
+					let start = Math.round(c.startMs + deltaMs);
+					let end = start + dur;
+					if (start < 0) {
+						start = 0;
+						end = dur;
+					}
+					if (end > maxEnd) {
+						end = maxEnd;
+						start = Math.max(0, end - dur);
+					}
+					return { ...c, startMs: start, endMs: end };
+				}
+				if (mode === 'start') {
+					const start = Math.max(
+						0,
+						Math.min(c.endMs - minDur, Math.round(c.startMs + deltaMs))
+					);
+					return { ...c, startMs: start };
+				}
+				const end = Math.min(
+					maxEnd,
+					Math.max(c.startMs + minDur, Math.round(c.endMs + deltaMs))
+				);
+				return { ...c, endMs: end };
+			})
+		});
+		return changed;
+	},
+
+	/** Select previous/next cue by timeline order. */
+	selectAdjacentCue(dir: -1 | 1): string | null {
+		const sorted = [...project.cues].sort(
+			(a, b) => a.startMs - b.startMs || a.index - b.index
+		);
+		if (!sorted.length) return null;
+		const currentId = selectedCueIds[0] ?? selectionAnchorId;
+		const idx = sorted.findIndex((c) => c.id === currentId);
+		const nextIdx =
+			idx < 0
+				? dir > 0
+					? 0
+					: sorted.length - 1
+				: Math.max(0, Math.min(sorted.length - 1, idx + dir));
+		const next = sorted[nextIdx];
+		if (!next) return null;
+		selectedCueIds = [next.id];
+		selectionAnchorId = next.id;
+		return next.id;
+	},
+
+	/**
 	 * Translator timing: set selected cue's start to the playhead.
 	 * Keeps a minimum duration by pushing the end if needed.
 	 */
@@ -2499,17 +2607,17 @@ export const projectStore = {
 	},
 
 	/**
-	 * Split a cue at the playhead into two segments.
+	 * Split a cue at `atMs` (default: playhead) into two segments.
 	 * Left keeps original text; right duplicates text (editable). Returns new cue id.
 	 */
-	splitCueAtPlayhead(id?: string): string | null {
+	splitCueAtMs(id: string | undefined, atMs: number): string | null {
 		const cueId = id ?? selectedCueIds[0];
 		if (!cueId) return null;
 		const cue = project.cues.find((c) => c.id === cueId);
 		if (!cue) return null;
 		const minDur = 200;
-		const ph = Math.round(playback.playheadMs);
-		if (ph < cue.startMs + minDur || ph > cue.endMs - minDur) return null;
+		const cut = Math.round(atMs);
+		if (cut < cue.startMs + minDur || cut > cue.endMs - minDur) return null;
 
 		const idx = project.cues.findIndex((c) => c.id === cueId);
 		if (idx < 0) return null;
@@ -2517,7 +2625,7 @@ export const projectStore = {
 		const right = createSubtitleCue(
 			cue.index + 1,
 			{
-				startMs: ph,
+				startMs: cut,
 				endMs: cue.endMs,
 				source: cue.source,
 				translation: cue.translation,
@@ -2532,15 +2640,66 @@ export const projectStore = {
 		);
 
 		const cues = [...project.cues];
-		cues[idx] = { ...cue, endMs: ph };
+		cues[idx] = {
+			...cue,
+			endMs: cut,
+			// Split invalidates TTS for both halves — re-Generate after arrange.
+			assignedAudio: null,
+			status:
+				cue.status === 'generated' || cue.status === 'error' ? ('ready' as const) : cue.status
+		};
 		cues.splice(idx + 1, 0, right);
 		project = touch({
 			...project,
 			cues: cues.map((c, i) => ({ ...c, index: i + 1 }))
 		});
+		dropTtsWaveforms([cue.id]);
 		selectedCueIds = [cue.id, right.id];
 		selectionAnchorId = right.id;
 		return right.id;
+	},
+
+	/** Split at playhead (legacy helper). */
+	splitCueAtPlayhead(id?: string): string | null {
+		return this.splitCueAtMs(id, playback.playheadMs);
+	},
+
+	/**
+	 * Split every selected cue that contains `atMs` (default playhead).
+	 * If nothing selected, split the cue under that time.
+	 * Returns number of successful cuts.
+	 */
+	splitCuesAtMs(atMs?: number): number {
+		const cut = Math.round(atMs ?? playback.playheadMs);
+		const minDur = 200;
+		const contains = (c: { startMs: number; endMs: number }) =>
+			cut >= c.startMs + minDur && cut <= c.endMs - minDur;
+
+		let targets = project.cues.filter(
+			(c) => selectedCueIds.includes(c.id) && contains(c)
+		);
+		if (!targets.length) {
+			const under = project.cues.find((c) => contains(c));
+			if (under) targets = [under];
+		}
+		if (!targets.length) return 0;
+
+		// Cut from right to left so indices stay stable while inserting.
+		targets.sort((a, b) => b.startMs - a.startMs || b.index - a.index);
+		let n = 0;
+		const keepSelected: string[] = [];
+		for (const t of targets) {
+			const rightId = this.splitCueAtMs(t.id, cut);
+			if (rightId) {
+				n += 1;
+				keepSelected.push(t.id, rightId);
+			}
+		}
+		if (keepSelected.length) {
+			selectedCueIds = [...new Set(keepSelected)];
+			selectionAnchorId = keepSelected[keepSelected.length - 1] ?? null;
+		}
+		return n;
 	},
 
 	/**
@@ -3367,8 +3526,80 @@ export const projectStore = {
 	},
 
 	/**
+	 * Manually create Speaker 1..N (no auto-detect). Preserves matching speakers'
+	 * gender / preset / lock when the count still includes them.
+	 */
+	setManualSpeakers(count: number): number {
+		const n = Math.max(1, Math.min(8, Math.round(Number(count)) || 1));
+		speakersError = null;
+		const eng = getTtsEngineId();
+		const prevById = new Map(
+			mergeBankWithVault(project.speakerBank ?? []).map((s) => [s.id, s] as const)
+		);
+		const validIds = new Set<string>();
+
+		const bank: SpeakerVoiceProfile[] = [];
+		for (let i = 1; i <= n; i++) {
+			const id = `Speaker ${i}`;
+			validIds.add(id);
+			const prev = prevById.get(id);
+			const gender: SpeakerVoiceProfile['gender'] =
+				prev?.gender === 'male' || prev?.gender === 'female' || prev?.gender === 'neutral'
+					? prev.gender
+					: i % 2 === 1
+						? 'female'
+						: 'male';
+			const rawVoice = prev?.voiceId || voiceIdForSpeakerGender(gender, eng);
+			const nextVoiceId =
+				eng === 'voxcpm'
+					? matchVoxcpmVoiceToGender(rawVoice, gender)
+					: voiceIdForSpeakerGender(gender, eng);
+			const keepLock =
+				Boolean(prev?.locked && prev.refWavPath) &&
+				prev.voiceId === nextVoiceId &&
+				prev.gender === gender;
+			bank.push({
+				id,
+				gender,
+				voiceId: nextVoiceId,
+				locked: keepLock,
+				refWavPath: keepLock ? prev!.refWavPath : '',
+				cueCount: 0,
+				...(prev?.videoRefWavPath ? { videoRefWavPath: prev.videoRefWavPath } : {})
+			});
+		}
+
+		const defaultId = bank[0]!.id;
+		const voiceBySpeaker = new Map(bank.map((s) => [s.id, s.voiceId]));
+		const cues = project.cues.map((c) => {
+			const raw = (c.speaker || '').trim();
+			const spk = raw && validIds.has(raw) ? raw : defaultId;
+			const nextVoice = voiceBySpeaker.get(spk) ?? c.voiceId;
+			if (spk === (c.speaker || '').trim() && nextVoice === c.voiceId) return c;
+			return {
+				...c,
+				speaker: spk,
+				voiceId: nextVoice
+			};
+		});
+
+		for (const s of bank) {
+			s.cueCount = cues.filter((c) => (c.speaker || '').trim() === s.id).length;
+		}
+
+		project = touch({
+			...project,
+			speakerBank: bank,
+			cues
+		});
+		persistSpeakerBankToVault(bank);
+		saveProjectToStorage(project);
+		return bank.length;
+	},
+
+	/**
 	 * Cluster ASR cues into Speaker 1..N (neural embeddings), estimate gender,
-	 * and assign cues. Does not lock a Khmer voice — use lockSpeakerVoice for that.
+	 * and assign cues. Prefer setManualSpeakers for the Studio UI.
 	 */
 	async detectSpeakers(opts?: { maxSpeakers?: number }): Promise<number> {
 		if (speakersDetecting) return 0;
@@ -3554,7 +3785,9 @@ export const projectStore = {
 				return next;
 			})
 		});
+		if (renamed) renameSpeakerInVault(prev.id, nextId);
 		saveProjectToStorage(project);
+		persistSpeakerBankToVault(project.speakerBank ?? []);
 		return true;
 	},
 
@@ -3566,7 +3799,7 @@ export const projectStore = {
 		const id = speakerId.trim();
 		const bank = (project.speakerBank ?? []).find((s) => s.id === id);
 		if (!bank) {
-			speakersError = 'Speaker not found — run Detect Speakers first.';
+			speakersError = 'Speaker not found — set speakers first.';
 			return false;
 		}
 		if (!isTauriRuntime()) {
@@ -3642,6 +3875,7 @@ export const projectStore = {
 			});
 			if (cueIds.length) dropTtsWaveforms(cueIds);
 			saveProjectToStorage(project);
+			persistSpeakerBankToVault(project.speakerBank ?? []);
 			return true;
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
@@ -3660,7 +3894,14 @@ export const projectStore = {
 		project = touch({
 			...project,
 			speakerBank: bank.map((s) =>
-				s.id === id ? { ...s, locked: false, refWavPath: '' } : s
+				s.id === id
+					? {
+							...s,
+							locked: false,
+							refWavPath: '',
+							videoRefWavPath: undefined
+						}
+					: s
 			),
 			cues: project.cues.map((c) => {
 				if ((c.speaker || '').trim() !== id || !c.assignedAudio) return c;
@@ -3677,10 +3918,10 @@ export const projectStore = {
 		});
 		if (cueIds.length) dropTtsWaveforms(cueIds);
 		saveProjectToStorage(project);
+		clearSpeakerLockInVault(id);
+		persistSpeakerBankToVault(project.speakerBank ?? []);
 		return true;
 	},
-
-	/** True when Khmer/TTS content runs past the source video picture. */
 	get dubOverhangMs() {
 		const media =
 			originalAudio.durationMs > 1000

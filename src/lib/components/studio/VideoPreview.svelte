@@ -5,7 +5,7 @@
 	import * as Tooltip from '$lib/components/ui/tooltip/index.js';
 	import { playback, projectStore } from '$lib/stores/project.svelte';
 	import { tempoStore } from '$lib/stores/tempo.svelte';
-	import { getVisualPlayheadMs, setVisualPlayheadMs, consumeMediaSeekMs } from '$lib/stores/playback-clock';
+	import { getVisualPlayheadMs, setVisualPlayheadMs, consumeMediaSeekMs, onMediaSeekRequest, isTimelineScrubbing } from '$lib/stores/playback-clock';
 	import { classifyMediaFile, dndStore, isFileDrag } from '$lib/stores/dnd.svelte';
 	import { usesKhmerScript, normalizeDubLanguage } from '$lib/stores/preferences.svelte';
 	import { formatClock, formatTimecode } from '$lib/utils/time';
@@ -748,18 +748,78 @@
 
 	/** Seek the media element; clears `ended` so scrubbing after finish works. */
 	function applyVideoCurrentTime(ms: number) {
+		queueProgramSeek(ms, true);
+	}
+
+	/**
+	 * Latest-wins seek queue. Spamming `currentTime` every pointer move makes
+	 * WebView2/Chromium backlog seeks for seconds — wait for `seeked`, then jump
+	 * straight to the newest target.
+	 */
+	let programSeekTargetSec: number | null = null;
+	let programSeekInFlight = false;
+	let programSeekSafetyTimer = 0;
+	let programSeekEpoch = 0;
+
+	function clearProgramSeekSafety() {
+		if (programSeekSafetyTimer) {
+			clearTimeout(programSeekSafetyTimer);
+			programSeekSafetyTimer = 0;
+		}
+	}
+
+	function queueProgramSeek(ms: number, forceImmediate = false) {
 		if (!videoEl) return;
 		const dur = videoDurationSec();
 		if (!dur) return;
 		const t = Math.min(dur, Math.max(0, ms / 1000));
+		programSeekTargetSec = t;
+		if (forceImmediate && !programSeekInFlight) {
+			kickProgramSeek();
+			return;
+		}
+		kickProgramSeek();
+	}
+
+	function kickProgramSeek() {
+		const el = videoEl;
+		if (!el || programSeekTargetSec == null) return;
+		if (programSeekInFlight) return;
+
+		const t = programSeekTargetSec;
+		programSeekTargetSec = null;
+
+		if (Math.abs(el.currentTime - t) < 0.035) {
+			if (programSeekTargetSec != null) kickProgramSeek();
+			return;
+		}
+
+		programSeekInFlight = true;
+		const epoch = ++programSeekEpoch;
+
+		const finish = () => {
+			if (epoch !== programSeekEpoch) return;
+			clearProgramSeekSafety();
+			el.removeEventListener('seeked', finish);
+			el.removeEventListener('error', finish);
+			programSeekInFlight = false;
+			if (programSeekTargetSec != null) kickProgramSeek();
+		};
+
+		el.addEventListener('seeked', finish, { once: true });
+		el.addEventListener('error', finish, { once: true });
+		clearProgramSeekSafety();
+		// If seeked never fires (some WebView2 edge cases), unblock quickly.
+		programSeekSafetyTimer = window.setTimeout(finish, 180);
+
 		try {
-			// Leaving `ended` requires an accepted currentTime assignment.
-			if (videoEl.ended) videoEl.pause();
-			videoEl.currentTime = t;
-			// WebView2 sometimes ignores the first seek while ended — retry once.
-			if (videoEl.ended && t < dur - 0.05) {
+			if (el.ended) el.pause();
+			const fast = (el as HTMLVideoElement & { fastSeek?: (sec: number) => void }).fastSeek;
+			if (typeof fast === 'function') fast.call(el, t);
+			else el.currentTime = t;
+			if (el.ended && t < (videoDurationSec() || t) - 0.05) {
 				requestAnimationFrame(() => {
-					if (!videoEl) return;
+					if (!videoEl || epoch !== programSeekEpoch) return;
 					try {
 						videoEl.currentTime = t;
 					} catch {
@@ -768,7 +828,7 @@
 				});
 			}
 		} catch {
-			/* ignore seek errors from some engines */
+			finish();
 		}
 	}
 
@@ -779,7 +839,7 @@
 		seekHoldUntil = performance.now() + 140;
 		setVisualPlayheadMs(clamped, { seekMedia: true });
 		publishClock(clamped, performance.now(), true);
-		applyVideoCurrentTime(clamped);
+		queueProgramSeek(clamped);
 		syncTts(clamped, playback.isPlaying);
 	}
 
@@ -793,17 +853,59 @@
 
 		untrack(() => {
 			const videoMs = el.currentTime * 1000;
-			const delta = targetMs - videoMs;
-			// Paused: ignore tiny lag; never yank the frame backward for throttle noise.
-			if (delta < 0 && delta >= -160) return;
-			if (Math.abs(delta) <= 40) return;
+			const delta = Math.abs(targetMs - videoMs);
+			// Paused: ignore tiny lag / throttle noise.
+			if (delta <= 40) return;
 			if (!videoDurationSec()) return;
 
-			applyVideoCurrentTime(targetMs);
+			queueProgramSeek(targetMs);
 			setVisualPlayheadMs(targetMs);
 			paintTransport(targetMs);
+			paintOverlay(targetMs);
 			syncTts(targetMs, false);
 		});
+	});
+
+	/**
+	 * Timeline scrub sets seekMedia every move — drain with a latest-wins seek
+	 * queue so the program monitor stays live without seek backlog.
+	 */
+	$effect(() => {
+		const el = videoEl;
+		if (!el) return;
+
+		let uiMs: number | null = null;
+		let uiRaf = 0;
+
+		const paintUi = () => {
+			uiRaf = 0;
+			const ms = uiMs;
+			uiMs = null;
+			if (ms == null) return;
+			transportMs = ms;
+			paintTransport(ms);
+			paintOverlay(ms);
+			// Skip TTS while scrubbing — mixer work was adding seek lag.
+			if (!playback.isPlaying && !isSeeking && !isTimelineScrubbing()) syncTts(ms, false);
+		};
+
+		const unsub = onMediaSeekRequest((ms) => {
+			// While playing, the rAF clock owns seeks via consumeMediaSeekMs().
+			if (isSeeking || playback.isPlaying) return;
+			consumeMediaSeekMs();
+			uiMs = ms;
+			if (!uiRaf) uiRaf = requestAnimationFrame(paintUi);
+			queueProgramSeek(ms);
+		});
+
+		return () => {
+			unsub();
+			if (uiRaf) cancelAnimationFrame(uiRaf);
+			clearProgramSeekSafety();
+			programSeekEpoch += 1;
+			programSeekInFlight = false;
+			programSeekTargetSec = null;
+		};
 	});
 
 	function msFromScrubPointer(clientX: number) {
@@ -1166,11 +1268,10 @@
 					{#if tempoStore.isRemastering}
 						Aligning…
 					{:else if tempoStore.fitToDubPlan && !tempoStore.fitToDubPlan.alreadyFits}
-						{#if tempoStore.fitToDubPlan.strategy === 'hybrid'}
-							Align ({tempoStore.fitToDubPlan.ttsRate.toFixed(2)}× +
-							{tempoStore.fitToDubPlan.tempo.toFixed(2)}×)
+						{#if tempoStore.fitToDubPlan.tempo < 0.995}
+							Align (video {tempoStore.fitToDubPlan.tempo.toFixed(2)}×)
 						{:else}
-							Align ({tempoStore.fitToDubPlan.tempo.toFixed(2)}×)
+							Align script ↔ video
 						{/if}
 					{:else}
 						Align script ↔ video

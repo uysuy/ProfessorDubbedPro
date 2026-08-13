@@ -15,7 +15,7 @@
 			</Resizable.Pane>
 			<Resizable.Handle withHandle class="split-handle" />
 			<Resizable.Pane defaultSize={42} minSize={20} maxSize={65} class="min-h-0 overflow-hidden">
-				<div class="h-full min-h-0 overflow-hidden">
+				<div class="h-full min-h-0 overflow-hidden bg-transparent p-0">
 					<TimelineEditor />
 				</div>
 			</Resizable.Pane>

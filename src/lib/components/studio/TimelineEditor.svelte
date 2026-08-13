@@ -4,8 +4,15 @@
 	import { Slider } from '$lib/components/ui/slider/index.js';
 	import * as Tooltip from '$lib/components/ui/tooltip/index.js';
 	import Waveform from '$lib/components/studio/Waveform.svelte';
+	import VideoFilmstrip from '$lib/components/studio/VideoFilmstrip.svelte';
 	import { playback, projectStore } from '$lib/stores/project.svelte';
-	import { getVisualPlayheadMs, setVisualPlayheadMs } from '$lib/stores/playback-clock';
+	import {
+		getVisualPlayheadMs,
+		setVisualPlayheadMs,
+		consumeMediaSeekMs,
+		onMediaSeekRequest,
+		setTimelineScrubbing
+	} from '$lib/stores/playback-clock';
 	import { formatTimecode } from '$lib/utils/time';
 	import { usesKhmerScript, normalizeDubLanguage } from '$lib/stores/preferences.svelte';
 	import {
@@ -20,11 +27,28 @@
 		snapCueStartMs,
 		timelineWidthPx,
 		xToMs,
-		deltaXToMs
+		deltaXToMs,
+		type TimelineTrackKind
 	} from '$lib/utils/timeline';
 	import { resamplePeaks } from '$lib/utils/audio-waveform';
 	import { cuePreviewEndMs } from '$lib/utils/tts-fit';
-	import { Pause, Play, Scan, Volume2, VolumeX, ZoomIn, ZoomOut } from '@lucide/svelte';
+	import { timelineUi } from '$lib/stores/timeline-ui.svelte';
+	import {
+		Eye,
+		EyeOff,
+		Magnet,
+		Pause,
+		Play,
+		Scan,
+		Scissors,
+		MousePointer2,
+		AlignHorizontalSpaceAround,
+		CircleHelp,
+		Volume2,
+		VolumeX,
+		ZoomIn,
+		ZoomOut
+	} from '@lucide/svelte';
 	import { dndStore, MIME_TTS_AUDIO } from '$lib/stores/dnd.svelte';
 	import { onDestroy } from 'svelte';
 
@@ -42,11 +66,20 @@
 	let isScrubbing = $state(false);
 	/** Local scrub position — keeps the red line 1:1 with the pointer (like a slider thumb). */
 	let scrubMs = $state<number | null>(null);
-	let pendingCommitMs: number | null = null;
-	let commitRaf = 0;
 	/** Latest pointer X while scrubbing — drives edge auto-pan (Shift+wheel feel). */
 	let scrubPointerClientX = 0;
 	let scrubPanRaf = 0;
+
+	/** Select-tool empty-lane drag → marquee time range (not playhead scrub). */
+	type MarqueeState = {
+		pointerId: number;
+		originClientX: number;
+		originMs: number;
+		currentMs: number;
+		moved: boolean;
+		additive: boolean;
+	};
+	let marquee = $state<MarqueeState | null>(null);
 
 	/** Playhead-anchored zoom — capture once per gesture so slider drag stays fluid. */
 	let zoomAnchorMs = 0;
@@ -96,19 +129,95 @@
 	const duration = $derived(projectStore.current.durationMs);
 	/** Scroller width minus sticky labels — used for fit / min zoom. */
 	let viewportContentPx = $state(900);
-	/** Visual timeline width (scrollbar / playhead space). */
-	const widthPx = $derived(timelineWidthPx(duration, zoom));
+	/** Media length at current zoom. */
+	const mediaWidthPx = $derived(timelineWidthPx(duration, zoom));
+	/** Lane width fills the viewport so empty projects aren’t a short strip on the left. */
+	const widthPx = $derived(Math.max(mediaWidthPx, viewportContentPx));
 	/** Layout width under the scale layer (frozen while dragging the zoom slider). */
-	const layoutWidthPx = $derived(timelineWidthPx(duration, layoutZoom));
+	const layoutMediaWidthPx = $derived(timelineWidthPx(duration, layoutZoom));
+	const layoutWidthPx = $derived(Math.max(layoutMediaWidthPx, viewportContentPx));
 	const zoomScale = $derived(zoom / layoutZoom);
 	const ticks = $derived(buildRulerTicks(duration, layoutZoom));
 	const displayMs = $derived(scrubMs ?? playback.playheadMs);
-	const tracksHeight = $derived(TIMELINE_TRACKS.reduce((sum, t) => sum + t.height, 0));
+	const visibleTracks = $derived(
+		TIMELINE_TRACKS.map((t) => {
+			const shown = timelineUi.isTrackShown(t.kind);
+			return {
+				...t,
+				shown,
+				height: shown ? timelineUi.trackHeight(t.kind, t.height) : 30
+			};
+		})
+	);
+	const tracksHeight = $derived(visibleTracks.reduce((sum, t) => sum + t.height, 0));
 	const originalAudio = $derived(projectStore.originalAudio);
 	/** Zoom out until the full project fits (was a fixed 0.5× that still scrolled). */
 	const effectiveMinZoom = $derived(minZoomForView(duration, viewportContentPx));
 
 	const isClipMoving = $derived(clipDrag != null || clipTrim != null);
+	const arrangeOn = $derived(timelineUi.arrangeMode);
+	/** Local mirrors so toolbar + cursor stay reactive to store changes. */
+	const activeTool = $derived(timelineUi.tool);
+	const snapOn = $derived(timelineUi.snapEnabled);
+
+	/** Blade hover: preview cut line under the cursor. */
+	let bladeHoverMs = $state<number | null>(null);
+	let sectionEl: HTMLElement | undefined = $state();
+
+	function focusTimeline() {
+		sectionEl?.focus({ preventScroll: true });
+	}
+
+	function chooseTool(next: 'select' | 'blade') {
+		timelineUi.setTool(next);
+		bladeHoverMs = next === 'blade' ? bladeHoverMs : null;
+		focusTimeline();
+		dndStore.flash(next === 'blade' ? 'Blade — hover to preview cut, click to split' : 'Select tool');
+	}
+
+	function toggleSnapUi() {
+		const on = timelineUi.toggleSnap();
+		focusTimeline();
+		dndStore.flash(on ? 'Snap on' : 'Snap off');
+	}
+
+	function toggleArrangeUi() {
+		const on = timelineUi.toggleArrangeMode();
+		bladeHoverMs = null;
+		focusTimeline();
+		dndStore.flash(on ? 'Arrange — TTS hidden, Video + Subs + Original' : 'Arrange off');
+	}
+
+	function updateBladeHover(clientX: number, target: EventTarget | null) {
+		if (activeTool !== 'blade') {
+			bladeHoverMs = null;
+			return;
+		}
+		const el = target as HTMLElement | null;
+		if (!el?.closest?.('[data-slot="timeline-editor"]')) {
+			bladeHoverMs = null;
+			return;
+		}
+		// Preview over lanes/clips; hide over headers/toolbar.
+		if (el.closest('[data-track-label], .panel-header, .timeline-ruler-corner')) {
+			bladeHoverMs = null;
+			return;
+		}
+		if (!el.closest('.timeline-track-lane, [data-clip], .timeline-content')) {
+			bladeHoverMs = null;
+			return;
+		}
+		bladeHoverMs = clientXToTimelineMs(clientX);
+	}
+
+	function bladeHoverValid(): boolean {
+		if (bladeHoverMs == null) return false;
+		const cut = bladeHoverMs;
+		const minDur = 200;
+		return projectStore.current.cues.some(
+			(c) => cut >= c.startMs + minDur && cut <= c.endMs - minDur
+		);
+	}
 
 	function clampZoom(value: number) {
 		return Math.min(MAX_ZOOM, Math.max(effectiveMinZoom, Number(value.toFixed(3))));
@@ -153,7 +262,8 @@
 
 	function setContentWidthForZoom(z: number) {
 		if (!contentEl) return;
-		const w = `${LABEL_WIDTH + timelineWidthPx(duration, z)}px`;
+		const lane = Math.max(timelineWidthPx(duration, z), viewportContentPx);
+		const w = `${LABEL_WIDTH + lane}px`;
 		contentEl.style.width = w;
 		contentEl.style.minWidth = w;
 	}
@@ -322,7 +432,7 @@
 		playheadEl.style.height = `${RULER_HEIGHT + tracksHeight}px`;
 		if (playheadLabelEl) {
 			playheadLabelEl.textContent = formatTimecode(ms, projectStore.current.fps);
-			const width = timelineWidthPx(duration, z);
+			const width = Math.max(timelineWidthPx(duration, z), viewportContentPx);
 			playheadLabelEl.classList.toggle(
 				'timeline-playhead-label-left',
 				msToX(ms, z) > width - 72
@@ -363,8 +473,9 @@
 	}
 
 	function ensureTimelineWidth(z = zoom) {
-		if (!contentEl) return LABEL_WIDTH + timelineWidthPx(duration, z);
-		const contentW = LABEL_WIDTH + timelineWidthPx(duration, z);
+		const lane = Math.max(timelineWidthPx(duration, z), viewportContentPx);
+		const contentW = LABEL_WIDTH + lane;
+		if (!contentEl) return contentW;
 		const nextW = `${contentW}px`;
 		if (contentEl.style.width !== nextW) {
 			contentEl.style.width = nextW;
@@ -456,51 +567,49 @@
 	function applyClipDragVisual(clientX: number) {
 		if (!clipDrag) return;
 		const dx = clientX - clipDrag.originClientX;
-		if (!clipDrag.moved && Math.abs(dx) < 3) return;
+		if (!clipDrag.moved && Math.abs(dx) < 6) return;
 
 		const deltaMs = deltaXToMs(dx, zoom);
 		const rawStart = clipDrag.originStartMs + deltaMs;
 		const others = projectStore.current.cues
 			.filter((c) => c.id !== clipDrag!.id)
 			.map((c) => ({ startMs: c.startMs, endMs: c.endMs }));
-		const snapped = snapCueStartMs({
-			startMs: rawStart,
-			durationMs: clipDrag.durationMs,
-			timelineDurationMs: duration,
-			zoom,
-			playheadMs: playback.playheadMs,
-			others
-		});
 
-		const playhead = playback.playheadMs;
-		const snapKind: ClipDragState['snapKind'] =
-			snapped.guideMs == null
-				? null
-				: Math.abs(snapped.guideMs - playhead) < 1
-					? 'playhead'
-					: 'edge';
+		let startMs: number;
+		let guideMs: number | null = null;
+		let snapKind: ClipDragState['snapKind'] = null;
+
+		if (snapOn) {
+			const snapped = snapCueStartMs({
+				startMs: rawStart,
+				durationMs: clipDrag.durationMs,
+				timelineDurationMs: duration,
+				zoom,
+				playheadMs: playback.playheadMs,
+				others
+			});
+			startMs = snapped.startMs;
+			guideMs = snapped.guideMs;
+			const playhead = playback.playheadMs;
+			snapKind =
+				guideMs == null
+					? null
+					: Math.abs(guideMs - playhead) < 1
+						? 'playhead'
+						: 'edge';
+		} else {
+			const maxStart = Math.max(0, duration - clipDrag.durationMs);
+			startMs = Math.max(0, Math.min(maxStart, Math.round(rawStart)));
+		}
 
 		clipDrag = {
 			...clipDrag,
 			moved: true,
-			startMs: snapped.startMs,
-			endMs: snapped.startMs + clipDrag.durationMs,
-			guideMs: snapped.guideMs,
+			startMs,
+			endMs: startMs + clipDrag.durationMs,
+			guideMs,
 			snapKind
 		};
-	}
-
-	function commitPlayhead(ms: number) {
-		pendingCommitMs = ms;
-		setVisualPlayheadMs(ms, { seekMedia: true });
-		if (commitRaf) return;
-		commitRaf = requestAnimationFrame(() => {
-			commitRaf = 0;
-			if (pendingCommitMs == null) return;
-			projectStore.setPlayhead(pendingCommitMs);
-			setVisualPlayheadMs(pendingCommitMs, { seekMedia: true });
-			pendingCommitMs = null;
-		});
 	}
 
 	function seekFromClientX(clientX: number, immediate = false) {
@@ -508,12 +617,13 @@
 		const rect = scrollEl.getBoundingClientRect();
 		const x = Math.max(0, clientX - rect.left + scrollEl.scrollLeft - LABEL_WIDTH);
 		const ms = xToMs(x, zoom, duration);
+		// Always drive the program monitor via seekMedia — do not thrash the
+		// Svelte store every pointer move (that delayed video seeks by seconds).
 		setVisualPlayheadMs(ms, { seekMedia: true });
 		paintPlayhead(ms);
 		if (isScrubbing) {
 			scrubMs = ms;
 			if (immediate) projectStore.setPlayhead(ms);
-			else commitPlayhead(ms);
 			return;
 		}
 		projectStore.setPlayhead(ms);
@@ -571,37 +681,109 @@
 		scrubPanRaf = requestAnimationFrame(scrubEdgePanTick);
 	}
 
-	function onContentPointerDown(e: PointerEvent & { currentTarget: HTMLElement }) {
-		const target = e.target as HTMLElement;
-		// Don't start scrub on interactive clips — original-audio is decorative only.
-		if (target.closest('[data-track-label]')) return;
-		if (target.closest('[data-clip]:not(.timeline-clip-original)')) return;
-
-		if (isZoomLive) endZoomGesture();
-
-		// Empty-lane click clears selection (UI only), then scrubs playhead.
-		if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
-			projectStore.selectAllCues(false);
-		}
-
+	function beginScrub(e: PointerEvent & { currentTarget: HTMLElement }) {
 		e.preventDefault();
 		suppressChase(600);
 		isScrubbing = true;
+		setTimelineScrubbing(true);
 		scrubPointerClientX = e.clientX;
 		e.currentTarget.setPointerCapture(e.pointerId);
 		seekFromClientX(e.clientX, true);
 		startScrubEdgePan();
 	}
 
+	function onContentPointerDown(e: PointerEvent & { currentTarget: HTMLElement }) {
+		const target = e.target as HTMLElement;
+		// Don't start scrub/marquee on interactive clips — original-audio is decorative only.
+		if (target.closest('[data-track-label]')) return;
+		if (target.closest('[data-clip]:not(.timeline-clip-original):not(.timeline-clip-video)')) return;
+
+		if (isZoomLive) endZoomGesture();
+
+		// Blade on empty lane: seek to click, then cut.
+		if (activeTool === 'blade') {
+			e.preventDefault();
+			seekFromClientX(e.clientX, true);
+			const cutMs = scrubMs ?? playback.playheadMs;
+			const n = projectStore.splitCuesAtMs(cutMs);
+			if (n > 0) {
+				dndStore.flash(n === 1 ? 'Split at playhead' : `Split ${n} cues at playhead`);
+			} else {
+				dndStore.flash('No cue covers this time (need ≥200ms on each side)');
+			}
+			return;
+		}
+
+		// Scrub on the time ruler, Alt-drag anywhere, or on reference media lanes
+		// (Original Video / Original Audio) — Select tool marquee stays on Subs/TTS.
+		const onRuler = Boolean(target.closest('.timeline-ruler-lane, .timeline-ruler'));
+		const onReferenceLane = Boolean(
+			target.closest(
+				'.timeline-track-row[data-track-kind="video"] .timeline-track-lane, .timeline-track-row[data-track-kind="original"] .timeline-track-lane'
+			)
+		);
+		if (onRuler || onReferenceLane || e.altKey) {
+			beginScrub(e);
+			return;
+		}
+
+		// Select tool: empty lane → marquee (drag) or click-seek (no drag).
+		e.preventDefault();
+		suppressChase(600);
+		const originMs = clientXToTimelineMs(e.clientX);
+		marquee = {
+			pointerId: e.pointerId,
+			originClientX: e.clientX,
+			originMs,
+			currentMs: originMs,
+			moved: false,
+			additive: e.shiftKey || e.ctrlKey || e.metaKey
+		};
+		try {
+			e.currentTarget.setPointerCapture(e.pointerId);
+		} catch {
+			/* ignore */
+		}
+	}
+
 	function onContentPointerMove(e: PointerEvent) {
-		if (!isScrubbing) return;
-		scrubPointerClientX = e.clientX;
-		seekFromClientX(e.clientX);
+		updateBladeHover(e.clientX, e.target);
+		if (isScrubbing) {
+			scrubPointerClientX = e.clientX;
+			seekFromClientX(e.clientX);
+			return;
+		}
+		if (!marquee || e.pointerId !== marquee.pointerId) return;
+		const currentMs = clientXToTimelineMs(e.clientX);
+		const moved =
+			marquee.moved ||
+			Math.abs(e.clientX - marquee.originClientX) > 4 ||
+			Math.abs(currentMs - marquee.originMs) > 30;
+		marquee = { ...marquee, currentMs, moved };
 	}
 
 	function onContentPointerUp(e: PointerEvent & { currentTarget: HTMLElement }) {
+		if (marquee && e.pointerId === marquee.pointerId) {
+			const state = marquee;
+			marquee = null;
+			try {
+				e.currentTarget.releasePointerCapture(e.pointerId);
+			} catch {
+				/* ignore */
+			}
+			if (state.moved) {
+				selectCuesInTimeRange(state.originMs, state.currentMs, state.additive);
+			} else {
+				// Plain click: clear selection (unless additive) + move playhead.
+				if (!state.additive) projectStore.selectAllCues(false);
+				seekFromClientX(e.clientX, true);
+			}
+			return;
+		}
+
 		if (!isScrubbing) return;
 		isScrubbing = false;
+		setTimelineScrubbing(false);
 		stopScrubEdgePan();
 		if (scrubMs != null) {
 			setVisualPlayheadMs(scrubMs, { seekMedia: true });
@@ -609,16 +791,34 @@
 			paintPlayhead(scrubMs);
 			scrubMs = null;
 		}
-		pendingCommitMs = null;
-		if (commitRaf) {
-			cancelAnimationFrame(commitRaf);
-			commitRaf = 0;
-		}
 		try {
 			e.currentTarget.releasePointerCapture(e.pointerId);
 		} catch {
 			/* already released */
 		}
+	}
+
+	/** Select subtitle cues overlapping [a,b] ms (timeline order). */
+	function selectCuesInTimeRange(msA: number, msB: number, additive: boolean) {
+		const a = Math.min(msA, msB);
+		const b = Math.max(msA, msB);
+		if (b - a < 40) return;
+		const hits = projectStore.current.cues
+			.filter((c) => c.endMs > a && c.startMs < b)
+			.sort((x, y) => x.startMs - y.startMs || x.index - y.index)
+			.map((c) => c.id);
+		if (!hits.length) {
+			if (!additive) projectStore.selectAllCues(false);
+			return;
+		}
+		const first = hits[0]!;
+		const last = hits[hits.length - 1]!;
+		if (additive) {
+			for (const id of hits) projectStore.setCueSelected(id, true);
+			return;
+		}
+		projectStore.selectCueAt(first);
+		if (hits.length > 1) projectStore.selectCueAt(last, { range: true });
 	}
 
 	/** Shared selection API with the subtitle table (visual only). */
@@ -640,6 +840,97 @@
 		row?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 	}
 
+	/** Frame / half-second nudge; Alt trims start, Ctrl/Meta trims end. */
+	function onTimelineKeyDown(e: KeyboardEvent) {
+		const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase();
+		if (tag === 'input' || tag === 'textarea' || (e.target as HTMLElement)?.isContentEditable) {
+			return;
+		}
+
+		if (e.key === 'a' || e.key === 'A') {
+			if (!e.ctrlKey && !e.metaKey) {
+				e.preventDefault();
+				toggleArrangeUi();
+			}
+			return;
+		}
+		if (e.key === 'v' || e.key === 'V') {
+			if (!e.ctrlKey && !e.metaKey) {
+				e.preventDefault();
+				chooseTool('select');
+			}
+			return;
+		}
+		if (e.key === 'b' || e.key === 'B') {
+			if (!e.ctrlKey && !e.metaKey) {
+				e.preventDefault();
+				chooseTool('blade');
+			}
+			return;
+		}
+		if (e.key === 'n' || e.key === 'N') {
+			if (!e.ctrlKey && !e.metaKey) {
+				e.preventDefault();
+				toggleSnapUi();
+			}
+			return;
+		}
+		if (e.key === '[' || e.key === ']') {
+			e.preventDefault();
+			const ok =
+				e.key === '['
+					? projectStore.setCueStartAtPlayhead()
+					: projectStore.setCueEndAtPlayhead();
+			dndStore.flash(ok ? (e.key === '[' ? 'Start → playhead' : 'End → playhead') : 'Select a cue');
+			return;
+		}
+
+		if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+			e.preventDefault();
+			const id = projectStore.selectAdjacentCue(e.key === 'ArrowDown' ? 1 : -1);
+			if (id) revealCueInTable(id);
+			return;
+		}
+
+		if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+			const dir = e.key === 'ArrowRight' ? 1 : -1;
+			// With selection + no modifier scrub intent: nudge clips.
+			if (projectStore.selectedCueIds.length > 0 && !e.ctrlKey && !e.metaKey) {
+				e.preventDefault();
+				// Shift = 0.5s slide; Alt = trim start; Alt+Shift = trim end.
+				const step = e.shiftKey && !e.altKey ? 500 : 40;
+				const mode = e.altKey ? (e.shiftKey ? 'end' : 'start') : 'both';
+				projectStore.nudgeSelectedCues(dir * step, mode);
+				return;
+			}
+			e.preventDefault();
+			const step = e.shiftKey ? 1000 : 100;
+			const ms = playback.playheadMs + dir * step;
+			setVisualPlayheadMs(ms, { seekMedia: true });
+			projectStore.setPlayhead(ms);
+			return;
+		}
+
+		if ((e.key === 'c' || e.key === 'C') && !e.ctrlKey && !e.metaKey) {
+			e.preventDefault();
+			const n = projectStore.splitCuesAtMs(playback.playheadMs);
+			dndStore.flash(
+				n > 0
+					? n === 1
+						? 'Split at playhead'
+						: `Split ${n} cues at playhead`
+					: 'Playhead must sit inside a cue (≥200ms padding)'
+			);
+		}
+	}
+
+	function clientXToTimelineMs(clientX: number): number {
+		if (!scrollEl) return playback.playheadMs;
+		const rect = scrollEl.getBoundingClientRect();
+		const x = Math.max(0, clientX - rect.left + scrollEl.scrollLeft - LABEL_WIDTH);
+		return xToMs(x, zoom, duration);
+	}
+
 	function onClipPointerDown(
 		e: PointerEvent & { currentTarget: HTMLElement },
 		cueId: string,
@@ -657,6 +948,29 @@
 
 		e.preventDefault();
 		e.stopPropagation();
+
+		// Blade tool: cut at the click time on this clip (Premiere-style razor).
+		if (activeTool === 'blade' && trackKind === 'subtitles') {
+			const cutMs = clientXToTimelineMs(e.clientX);
+			setVisualPlayheadMs(cutMs, { seekMedia: true });
+			projectStore.setPlayhead(cutMs);
+			// Keep multi-select: cut this clip, or all selected that contain the cut.
+			if (
+				projectStore.selectedCueIds.length > 1 &&
+				projectStore.selectedCueIds.includes(cueId)
+			) {
+				const n = projectStore.splitCuesAtMs(cutMs);
+				if (n > 0) dndStore.flash(n === 1 ? 'Split' : `Split ${n} cues`);
+				else dndStore.flash('Cut needs ≥200ms on each side of the click');
+			} else {
+				projectStore.selectCue(cueId);
+				revealCueInTable(cueId);
+				const id = projectStore.splitCueAtMs(cueId, cutMs);
+				if (id) dndStore.flash('Split at click');
+				else dndStore.flash('Cut needs ≥200ms on each side of the click');
+			}
+			return;
+		}
 
 		const mode = applyClipSelection(e, cueId);
 		revealCueInTable(cueId);
@@ -686,6 +1000,7 @@
 	}
 
 	function onClipPointerMove(e: PointerEvent) {
+		updateBladeHover(e.clientX, e.target);
 		if (!clipDrag || e.pointerId !== clipDrag.pointerId) return;
 		pendingDragClientX = e.clientX;
 		if (clipDragMoveRaf) return;
@@ -705,8 +1020,15 @@
 			cancelAnimationFrame(clipDragMoveRaf);
 			clipDragMoveRaf = 0;
 		}
-		pendingDragClientX = null;
+		if (pendingDragClientX != null) {
+			applyClipDragVisual(pendingDragClientX);
+			pendingDragClientX = null;
+		}
 		clipDrag = null;
+
+		if (drag.moved && drag.trackKind === 'subtitles') {
+			projectStore.moveCueTiming(drag.id, drag.startMs);
+		}
 
 		// Plain click on a timeline clip only selects — do not move the playhead.
 		// Seeking to cue start is handled by the subtitle table (top panel) on row select.
@@ -890,6 +1212,7 @@
 		if (!el || typeof ResizeObserver === 'undefined') return;
 		const measure = () => {
 			viewportContentPx = Math.max(120, el.clientWidth - LABEL_WIDTH);
+			setContentWidthForZoom(zoom);
 		};
 		measure();
 		const ro = new ResizeObserver(measure);
@@ -976,7 +1299,7 @@
 	});
 
 	onDestroy(() => {
-		if (commitRaf) cancelAnimationFrame(commitRaf);
+		setTimelineScrubbing(false);
 		if (clipDragMoveRaf) cancelAnimationFrame(clipDragMoveRaf);
 		if (clipTrimMoveRaf) cancelAnimationFrame(clipTrimMoveRaf);
 		if (zoomVisualRaf) cancelAnimationFrame(zoomVisualRaf);
@@ -985,16 +1308,145 @@
 	});
 </script>
 
-<section class="flex h-full min-h-0 flex-col bg-transparent" data-slot="timeline-editor">
-	<div class="panel-header gap-3">
+<section
+	bind:this={sectionEl}
+	class="timeline-shell flex h-full min-h-0 flex-col bg-transparent"
+	data-slot="timeline-editor"
+	class:timeline-arrange={arrangeOn}
+	class:timeline-blade-cursor={activeTool === 'blade'}
+	tabindex="0"
+	onkeydown={onTimelineKeyDown}
+	onpointerleave={() => {
+		bladeHoverMs = null;
+	}}
+>
+	<div class="timeline-toolbar panel-header gap-3">
 		<span>Timeline Editor</span>
+		{#if arrangeOn}
+			<Badge variant="secondary" class="text-[10px] tracking-normal">Arrange</Badge>
+		{/if}
 
-		<div class="flex flex-1 items-center justify-end gap-2 normal-case tracking-normal">
-			<span class="hidden text-[10px] text-muted-foreground sm:inline">
-				Ctrl+scroll zoom · Fit button = full project in view · Scroll / Shift+scroll pan · Drag playhead
-			</span>
+		<div class="flex min-w-0 flex-1 items-center justify-end gap-1.5 normal-case tracking-normal">
 			<Tooltip.Provider>
-				<div class="flex items-center gap-1 rounded-md border border-border/60 bg-[var(--surface-toolbar)] p-0.5">
+				<Tooltip.Root>
+					<Tooltip.Trigger class="inline-flex shrink-0">
+						{#snippet child({ props })}
+							<Button
+								{...props}
+								type="button"
+								variant="ghost"
+								size="icon-xs"
+								aria-label="Timeline shortcuts"
+								class="text-muted-foreground"
+							>
+								<CircleHelp class="size-3.5" />
+							</Button>
+						{/snippet}
+					</Tooltip.Trigger>
+					<Tooltip.Content class="max-w-64 text-left text-[11px] leading-relaxed normal-case tracking-normal">
+						<div class="font-semibold">Shortcuts</div>
+						<div>A arrange · V select · B blade · N snap</div>
+						<div>Drag ruler / video / original = scrub</div>
+						<div>Drag Subs/TTS lane = marquee</div>
+						<div>C split at playhead · [ ] nudge</div>
+					</Tooltip.Content>
+				</Tooltip.Root>
+				<div class="timeline-tool-cluster flex shrink-0 items-center gap-0.5 rounded-xl border border-border/50 bg-[var(--surface-toolbar)] p-0.5 shadow-[var(--elevation-panel)]">
+					<Tooltip.Root>
+						<Tooltip.Trigger class="inline-flex">
+							{#snippet child({ props })}
+								<Button
+									{...props}
+									type="button"
+									variant={activeTool === 'select' ? 'secondary' : 'ghost'}
+									size="icon-xs"
+									aria-label="Select tool"
+									aria-pressed={activeTool === 'select'}
+									onpointerdown={(e) => e.stopPropagation()}
+									onclick={(e) => {
+										e.preventDefault();
+										e.stopPropagation();
+										chooseTool('select');
+									}}
+								>
+									<MousePointer2 class="size-3.5" />
+								</Button>
+							{/snippet}
+						</Tooltip.Trigger>
+						<Tooltip.Content>Select (V)</Tooltip.Content>
+					</Tooltip.Root>
+					<Tooltip.Root>
+						<Tooltip.Trigger class="inline-flex">
+							{#snippet child({ props })}
+								<Button
+									{...props}
+									type="button"
+									variant={activeTool === 'blade' ? 'secondary' : 'ghost'}
+									size="icon-xs"
+									aria-label="Blade tool"
+									aria-pressed={activeTool === 'blade'}
+									onpointerdown={(e) => e.stopPropagation()}
+									onclick={(e) => {
+										e.preventDefault();
+										e.stopPropagation();
+										chooseTool('blade');
+									}}
+								>
+									<Scissors class="size-3.5" />
+								</Button>
+							{/snippet}
+						</Tooltip.Trigger>
+						<Tooltip.Content>Blade / split (B)</Tooltip.Content>
+					</Tooltip.Root>
+					<Tooltip.Root>
+						<Tooltip.Trigger class="inline-flex">
+							{#snippet child({ props })}
+								<Button
+									{...props}
+									type="button"
+									variant={snapOn ? 'secondary' : 'ghost'}
+									size="icon-xs"
+									aria-label="Toggle snap"
+									aria-pressed={snapOn}
+									onpointerdown={(e) => e.stopPropagation()}
+									onclick={(e) => {
+										e.preventDefault();
+										e.stopPropagation();
+										toggleSnapUi();
+									}}
+								>
+									<Magnet class="size-3.5" />
+								</Button>
+							{/snippet}
+						</Tooltip.Trigger>
+						<Tooltip.Content>Snap {snapOn ? 'on' : 'off'} (N)</Tooltip.Content>
+					</Tooltip.Root>
+					<Tooltip.Root>
+						<Tooltip.Trigger class="inline-flex">
+							{#snippet child({ props })}
+								<Button
+									{...props}
+									type="button"
+									variant={arrangeOn ? 'secondary' : 'ghost'}
+									size="icon-xs"
+									aria-label="Arrange mode"
+									aria-pressed={arrangeOn}
+									onpointerdown={(e) => e.stopPropagation()}
+									onclick={(e) => {
+										e.preventDefault();
+										e.stopPropagation();
+										toggleArrangeUi();
+									}}
+								>
+									<AlignHorizontalSpaceAround class="size-3.5" />
+								</Button>
+							{/snippet}
+						</Tooltip.Trigger>
+						<Tooltip.Content>Arrange mode (A) — hide TTS, focus Video + Original</Tooltip.Content>
+					</Tooltip.Root>
+				</div>
+
+				<div class="timeline-tool-cluster flex items-center gap-0.5 rounded-xl border border-border/50 bg-[var(--surface-toolbar)] p-0.5 shadow-[var(--elevation-panel)]">
 					<Button
 						variant="ghost"
 						size="icon-xs"
@@ -1009,14 +1461,14 @@
 					</Button>
 				</div>
 
-				<Badge variant="secondary" class="font-mono text-[10px] tracking-normal">
+				<Badge variant="secondary" class="rounded-lg font-mono text-[10px] tracking-normal">
 					{formatTimecode(displayMs, projectStore.current.fps)}
 					<span class="mx-1 opacity-40">/</span>
 					{formatTimecode(duration, projectStore.current.fps)}
 				</Badge>
 
 				<div
-					class="ml-1 flex items-center gap-1.5 rounded-md border border-border/60 bg-[var(--surface-toolbar)] px-1.5 py-0.5"
+					class="timeline-tool-cluster ml-1 flex items-center gap-1.5 rounded-xl border border-border/50 bg-[var(--surface-toolbar)] px-1.5 py-0.5 shadow-[var(--elevation-panel)]"
 				>
 					<Tooltip.Root>
 						<Tooltip.Trigger class="inline-flex">
@@ -1093,7 +1545,7 @@
 		</div>
 	</div>
 
-	<div class="relative min-h-0 flex-1 overflow-hidden">
+	<div class="timeline-body relative min-h-0 flex-1 overflow-hidden">
 		<div
 			bind:this={scrollEl}
 			class="timeline-scroller absolute inset-0 overflow-x-auto overflow-y-auto"
@@ -1117,19 +1569,7 @@
 				onpointerup={onContentPointerUp}
 				onpointercancel={onContentPointerUp}
 				onkeydown={(e) => {
-					const step = e.shiftKey ? 1000 : 100;
-					if (e.key === 'ArrowRight') {
-						e.preventDefault();
-						const ms = playback.playheadMs + step;
-						setVisualPlayheadMs(ms, { seekMedia: true });
-						projectStore.setPlayhead(ms);
-					}
-					if (e.key === 'ArrowLeft') {
-						e.preventDefault();
-						const ms = playback.playheadMs - step;
-						setVisualPlayheadMs(ms, { seekMedia: true });
-						projectStore.setPlayhead(ms);
-					}
+					onTimelineKeyDown(e);
 				}}
 			>
 				<!-- Time ruler -->
@@ -1163,17 +1603,51 @@
 				</div>
 
 				<!-- Tracks -->
-				{#each TIMELINE_TRACKS as track (track.id)}
+				{#each visibleTracks as track (track.id)}
 					<div
 						class="timeline-track-row grid"
+						class:timeline-track-row-hidden={!track.shown}
 						data-track-kind={track.kind}
 						style="grid-template-columns: {LABEL_WIDTH}px 1fr; height: {track.height}px;"
 					>
 						<div data-track-label class="timeline-track-header">
 							<span class="timeline-track-swatch" style="background: {track.color};"></span>
 							<div class="min-w-0 flex-1">
-								<p class="timeline-track-name">{track.name}</p>
-								{#if track.kind === 'original'}
+								<div class="flex items-center gap-0.5">
+									<p class="timeline-track-name min-w-0 flex-1 truncate">{track.name}</p>
+									<button
+										type="button"
+										class="timeline-track-icon-btn"
+										class:timeline-track-icon-btn-active={!timelineUi.visibility[track.kind]}
+										title={timelineUi.visibility[track.kind] ? 'Hide track' : 'Show track'}
+										aria-label={timelineUi.visibility[track.kind] ? 'Hide track' : 'Show track'}
+										onclick={(e) => {
+											e.stopPropagation();
+											timelineUi.toggleVisible(track.kind as TimelineTrackKind);
+										}}
+									>
+										{#if timelineUi.visibility[track.kind]}
+											<Eye class="size-3" />
+										{:else}
+											<EyeOff class="size-3" />
+										{/if}
+									</button>
+									<button
+										type="button"
+										class="timeline-track-icon-btn"
+										class:timeline-track-icon-btn-solo={timelineUi.solo[track.kind]}
+										title={timelineUi.solo[track.kind] ? 'Unsolo' : 'Solo'}
+										aria-label={timelineUi.solo[track.kind] ? 'Unsolo track' : 'Solo track'}
+										aria-pressed={timelineUi.solo[track.kind]}
+										onclick={(e) => {
+											e.stopPropagation();
+											timelineUi.toggleSolo(track.kind as TimelineTrackKind);
+										}}
+									>
+										S
+									</button>
+								</div>
+								{#if track.shown && track.kind === 'original'}
 									<div class="timeline-original-mixer">
 										<button
 											type="button"
@@ -1220,13 +1694,16 @@
 												: `${Math.round(projectStore.originalAudioGain * 100)}`}
 										</span>
 									</div>
-								{:else}
+								{:else if track.shown}
 									<p class="timeline-track-role">{track.role}</p>
+								{:else}
+									<p class="timeline-track-role opacity-60">Hidden</p>
 								{/if}
 							</div>
 						</div>
 
 						<div class="timeline-track-lane relative z-0 overflow-hidden" style="width: {widthPx}px;">
+							{#if track.shown}
 							<div
 								class="timeline-scale-layer absolute inset-y-0 left-0"
 								style="width: {layoutWidthPx}px; transform-origin: 0 0;{zoomScale === 1
@@ -1237,7 +1714,39 @@
 								<span class="timeline-lane-gridline" style="left: {tick.x}px;"></span>
 							{/each}
 
-							{#if track.kind === 'subtitles'}
+							{#if track.kind === 'video'}
+								{#if projectStore.videoUrl}
+									{@const mediaW = msToX(
+										Math.min(
+											duration,
+											projectStore.originalAudio.durationMs > 0
+												? projectStore.originalAudio.durationMs
+												: duration
+										),
+										layoutZoom
+									)}
+									<div
+										class="timeline-clip timeline-clip-video pointer-events-none absolute overflow-hidden rounded-[0.45rem] border"
+										style="left: 0; width: {Math.max(48, mediaW || layoutWidthPx)}px; top: 0.4rem; bottom: 0.4rem;"
+									>
+										<VideoFilmstrip
+											videoUrl={projectStore.videoUrl}
+											durationMs={duration}
+											widthPx={Math.max(48, mediaW || layoutWidthPx)}
+											heightPx={Math.max(36, track.height - 14)}
+										/>
+									</div>
+								{:else}
+									<div
+										class="timeline-original-empty pointer-events-none absolute inset-y-1.5 left-1 flex items-center rounded-[0.45rem] border border-dashed px-3"
+										style="width: {Math.max(48, layoutWidthPx - 8)}px;"
+									>
+										<span class="text-[10px] text-muted-foreground">
+											Import a video to show frame previews
+										</span>
+									</div>
+								{/if}
+							{:else if track.kind === 'subtitles'}
 								{#each projectStore.current.cues as cue (cue.id)}
 									{@const times = cueDisplayTimes(cue, 'subtitles')}
 									{@const left = msToX(times.startMs, layoutZoom)}
@@ -1263,7 +1772,7 @@
 									)}
 									{#if moving || trimming}
 										<div
-											class="timeline-clip-ghost timeline-clip-subs pointer-events-none absolute overflow-hidden rounded-md border px-1.5"
+											class="timeline-clip-ghost timeline-clip-subs pointer-events-none absolute overflow-hidden rounded-[0.45rem] border px-1.5"
 											style="left: {originLeft}px; width: {originWidth}px;"
 											aria-hidden="true"
 										>
@@ -1281,7 +1790,7 @@
 										data-cue-id={cue.id}
 										aria-pressed={selected}
 										class={[
-											'timeline-clip absolute overflow-hidden rounded-md border px-1.5 text-left',
+											'timeline-clip absolute overflow-hidden rounded-[0.45rem] border px-1.5 text-left',
 											'timeline-clip-subs',
 											selected ? 'timeline-clip-selected' : '',
 											playing ? 'timeline-clip-playing' : '',
@@ -1379,7 +1888,7 @@
 										dndStore.drag?.kind === 'tts-audio' && dndStore.drag.id === cue.id}
 									{#if moving || trimming}
 										<div
-											class="timeline-clip-ghost timeline-clip-tts pointer-events-none absolute overflow-hidden rounded-md border"
+											class="timeline-clip-ghost timeline-clip-tts pointer-events-none absolute overflow-hidden rounded-[0.45rem] border"
 											style="left: {originLeft}px; width: {originWidth}px;"
 											aria-hidden="true"
 										>
@@ -1394,7 +1903,7 @@
 										draggable="true"
 										aria-pressed={selected}
 										class={[
-											'timeline-clip absolute overflow-hidden rounded-md border',
+											'timeline-clip absolute overflow-hidden rounded-[0.45rem] border',
 											'timeline-clip-tts',
 											'timeline-clip-tts-enter',
 											selected ? 'timeline-clip-selected' : '',
@@ -1511,7 +2020,7 @@
 									)}
 									<div
 										data-clip
-										class="timeline-clip timeline-clip-original pointer-events-none absolute overflow-hidden rounded-md border"
+										class="timeline-clip timeline-clip-original pointer-events-none absolute overflow-hidden rounded-[0.45rem] border"
 										class:timeline-clip-original-dimmed={projectStore.originalAudioMuted ||
 											projectStore.originalAudioGain < 0.05}
 										style="left: 0; width: {Math.max(1, originalWidthPx)}px; opacity: {projectStore.originalAudioMuted
@@ -1524,8 +2033,8 @@
 									</div>
 								{:else}
 									<div
-										class="timeline-original-empty pointer-events-none absolute inset-y-1.5 left-0 flex items-center rounded-md border border-dashed px-3"
-										style="width: {layoutWidthPx}px;"
+										class="timeline-original-empty pointer-events-none absolute inset-y-1.5 left-1 flex items-center rounded-[0.45rem] border border-dashed px-3"
+										style="width: {Math.max(48, layoutWidthPx - 8)}px;"
 									>
 										<span class="text-[10px] text-muted-foreground">
 											{#if originalAudio.status === 'loading'}
@@ -1540,6 +2049,7 @@
 								{/if}
 							{/if}
 							</div>
+							{/if}
 						</div>
 					</div>
 				{/each}
@@ -1559,6 +2069,35 @@
 						<span class="timeline-snap-label">
 							{clipDrag.snapKind === 'playhead' ? 'Playhead' : 'Snap'}
 						</span>
+					</div>
+				{/if}
+
+				{#if marquee?.moved}
+					{@const leftMs = Math.min(marquee.originMs, marquee.currentMs)}
+					{@const rightMs = Math.max(marquee.originMs, marquee.currentMs)}
+					<div
+						class="timeline-marquee pointer-events-none absolute z-[28]"
+						style="left: {LABEL_WIDTH + msToX(leftMs, zoom)}px; width: {Math.max(
+							2,
+							msToX(rightMs - leftMs, zoom)
+						)}px; top: {RULER_HEIGHT}px; height: {tracksHeight}px;"
+						aria-hidden="true"
+					></div>
+				{/if}
+
+				{#if activeTool === 'blade' && bladeHoverMs != null}
+					{@const valid = bladeHoverValid()}
+					<div
+						class="timeline-blade-guide pointer-events-none absolute top-0 z-[31]"
+						class:timeline-blade-guide-valid={valid}
+						class:timeline-blade-guide-invalid={!valid}
+						style="transform: translate3d({LABEL_WIDTH +
+							Math.round(msToX(bladeHoverMs, zoom))}px, 0, 0); height: {RULER_HEIGHT +
+							tracksHeight}px;"
+						aria-hidden="true"
+					>
+						<span class="timeline-blade-guide-cap"></span>
+						<span class="timeline-blade-guide-label">{valid ? 'Cut' : '—'}</span>
 					</div>
 				{/if}
 			</div>
@@ -1584,6 +2123,54 @@
 </section>
 
 <style>
+	:global([data-slot='timeline-editor'].timeline-shell) {
+		margin: 0.4rem 0.45rem 0.45rem;
+		border: 1px solid color-mix(in oklab, var(--border) 78%, transparent);
+		border-radius: 0.9rem;
+		background: color-mix(in oklab, var(--card) 88%, var(--surface-timeline));
+		box-shadow:
+			0 1px 0 color-mix(in oklab, white 6%, transparent) inset,
+			0 8px 24px color-mix(in oklab, var(--foreground) 6%, transparent);
+		overflow: hidden;
+		isolation: isolate;
+	}
+
+	:global(:root:not(.dark) [data-slot='timeline-editor'].timeline-shell) {
+		box-shadow:
+			0 1px 0 color-mix(in oklab, white 70%, transparent) inset,
+			0 10px 28px color-mix(in oklab, var(--foreground) 7%, transparent);
+	}
+
+	.timeline-toolbar {
+		border-bottom: 1px solid color-mix(in oklab, var(--border) 70%, transparent);
+		border-radius: 0.9rem 0.9rem 0 0;
+		background:
+			linear-gradient(
+				180deg,
+				color-mix(in oklab, var(--card) 96%, white 4%),
+				color-mix(in oklab, var(--sidebar) 94%, var(--card))
+			);
+		box-shadow: inset 0 1px 0 color-mix(in oklab, white 55%, transparent);
+	}
+
+	:global(.dark) .timeline-toolbar {
+		background: linear-gradient(
+			180deg,
+			color-mix(in oklab, var(--card) 90%, white 3%),
+			color-mix(in oklab, var(--sidebar) 92%, var(--card))
+		);
+		box-shadow: inset 0 1px 0 oklch(1 0 0 / 4%);
+	}
+
+	.timeline-tool-cluster :global(button) {
+		border-radius: 0.55rem;
+	}
+
+	.timeline-body {
+		border-radius: 0 0 0.85rem 0.85rem;
+		background: var(--surface-timeline-deep);
+	}
+
 	.timeline-scale-layer {
 		transform-origin: 0 0;
 	}
@@ -1619,15 +2206,15 @@
 	.timeline-scroller {
 		/* Prevent browser scroll-anchoring from fighting programmatic follow. */
 		overflow-anchor: none;
-		/* Avoid clientWidth thrash when the scrollbar appears mid-follow. */
-		scrollbar-gutter: stable;
+		/* Do not reserve a permanent right gutter — lanes should fill the pane. */
+		scrollbar-gutter: auto;
+		border-radius: 0 0 0.85rem 0.85rem;
 	}
 
 	.timeline-ruler-corner,
 	.timeline-track-header {
-		border-right: 1px solid color-mix(in oklab, var(--border) 88%, transparent);
-		/* Fully opaque — translucent + backdrop-filter let lane content show “through/over”. */
-		background: var(--sidebar);
+		border-right: 1px solid color-mix(in oklab, var(--border) 80%, transparent);
+		background: color-mix(in oklab, var(--sidebar) 94%, var(--card));
 		isolation: isolate;
 	}
 
@@ -1635,7 +2222,7 @@
 		position: sticky;
 		left: 0;
 		z-index: 40;
-		border-bottom: 1px solid color-mix(in oklab, var(--border) 90%, var(--primary) 8%);
+		border-bottom: 1px solid color-mix(in oklab, var(--border) 82%, var(--primary) 8%);
 	}
 
 	.timeline-ruler-lane {
@@ -1643,10 +2230,11 @@
 		z-index: 0;
 		overflow: hidden;
 		contain: paint;
-		border-bottom: 1px solid color-mix(in oklab, var(--border) 90%, var(--primary) 8%);
+		cursor: ew-resize;
+		border-bottom: 1px solid color-mix(in oklab, var(--border) 82%, var(--primary) 8%);
 		background: linear-gradient(
 			180deg,
-			color-mix(in oklab, var(--surface-timeline) 70%, var(--card)),
+			color-mix(in oklab, var(--surface-timeline) 55%, var(--card)),
 			var(--surface-timeline-deep)
 		);
 	}
@@ -1696,7 +2284,7 @@
 		flex-shrink: 0;
 		width: 0.7rem;
 		height: 0.7rem;
-		border-radius: 0.28rem;
+		border-radius: 0.35rem;
 		box-shadow:
 			inset 0 1px 0 oklch(1 0 0 / 28%),
 			0 0 0 1px color-mix(in oklab, var(--foreground) 8%, transparent);
@@ -1764,6 +2352,51 @@
 		background: color-mix(in oklab, var(--destructive) 12%, transparent);
 	}
 
+	.timeline-track-icon-btn {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+		width: 1.15rem;
+		height: 1.15rem;
+		border-radius: 0.25rem;
+		border: 1px solid transparent;
+		background: transparent;
+		color: var(--muted-foreground);
+		font-size: 9px;
+		font-weight: 700;
+		line-height: 1;
+		cursor: pointer;
+	}
+
+	.timeline-track-icon-btn:hover {
+		color: var(--foreground);
+		background: color-mix(in oklab, var(--muted) 40%, transparent);
+	}
+
+	.timeline-track-icon-btn-active {
+		color: var(--destructive);
+	}
+
+	.timeline-track-icon-btn-solo {
+		color: oklch(0.75 0.14 85);
+		border-color: color-mix(in oklab, oklch(0.75 0.14 85) 45%, var(--border));
+		background: color-mix(in oklab, oklch(0.75 0.14 85) 14%, transparent);
+	}
+
+	.timeline-track-row-hidden .timeline-track-lane {
+		opacity: 0.35;
+		background: var(--surface-timeline-deep);
+	}
+
+	:global([data-slot='timeline-editor'].timeline-blade-cursor) {
+		cursor: crosshair;
+	}
+
+	:global([data-slot='timeline-editor'].timeline-blade-cursor) :global([data-clip]) {
+		cursor: crosshair;
+	}
+
 	.timeline-original-pct {
 		flex-shrink: 0;
 		min-width: 1.6rem;
@@ -1805,6 +2438,14 @@
 		background: linear-gradient(180deg, var(--surface-timeline), var(--surface-timeline-deep));
 	}
 
+	.timeline-track-row[data-track-kind='video'] .timeline-track-lane {
+		background: linear-gradient(
+			180deg,
+			color-mix(in oklab, var(--track-video) 6%, var(--surface-timeline)),
+			var(--surface-timeline-deep)
+		);
+	}
+
 	.timeline-track-row[data-track-kind='subtitles'] .timeline-track-lane {
 		background: linear-gradient(
 			180deg,
@@ -1835,6 +2476,66 @@
 		width: 1px;
 		background: color-mix(in oklab, var(--foreground) 5.5%, transparent);
 		pointer-events: none;
+	}
+
+	.timeline-marquee {
+		border: 1px solid color-mix(in oklab, var(--primary) 70%, white);
+		background: color-mix(in oklab, var(--primary) 18%, transparent);
+		border-radius: 2px;
+	}
+
+	.timeline-blade-guide {
+		width: 0;
+		border-left: 1px dashed color-mix(in oklab, var(--destructive) 55%, white);
+		margin-left: -0.5px;
+	}
+
+	.timeline-blade-guide-valid {
+		border-left-color: color-mix(in oklab, oklch(0.72 0.18 55) 85%, white);
+	}
+
+	.timeline-blade-guide-invalid {
+		border-left-color: color-mix(in oklab, var(--muted-foreground) 55%, transparent);
+		opacity: 0.55;
+	}
+
+	.timeline-blade-guide-cap {
+		position: absolute;
+		top: 0;
+		left: -4px;
+		width: 8px;
+		height: 8px;
+		border-radius: 1px;
+		background: color-mix(in oklab, oklch(0.72 0.18 55) 90%, white);
+		transform: rotate(45deg);
+		transform-origin: center;
+	}
+
+	.timeline-blade-guide-invalid .timeline-blade-guide-cap {
+		background: color-mix(in oklab, var(--muted-foreground) 70%, transparent);
+	}
+
+	.timeline-blade-guide-label {
+		position: absolute;
+		top: 10px;
+		left: 6px;
+		padding: 0 4px;
+		border-radius: 3px;
+		font-size: 9px;
+		font-weight: 700;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		color: oklch(0.22 0.04 55);
+		background: color-mix(in oklab, oklch(0.82 0.14 85) 92%, white);
+		white-space: nowrap;
+	}
+
+	.timeline-blade-guide-invalid .timeline-blade-guide-label {
+		display: none;
+	}
+
+	.timeline-ruler-lane {
+		cursor: ew-resize;
 	}
 
 	:global(.dark) .timeline-ruler-corner,
@@ -1976,6 +2677,16 @@
 		pointer-events: none;
 		border-color: color-mix(in oklab, var(--track-original) 28%, var(--border));
 		background: color-mix(in oklab, var(--track-original) 6%, transparent);
+		box-shadow: inset 0 1px 0 color-mix(in oklab, white 8%, transparent);
+	}
+
+	.timeline-clip-video {
+		border-color: color-mix(in oklab, var(--track-video) 38%, transparent);
+		background: color-mix(in oklab, var(--track-video) 10%, var(--surface-timeline-deep));
+		box-shadow:
+			0 1px 2px oklch(0 0 0 / 12%),
+			inset 0 1px 0 oklch(1 0 0 / 8%);
+		cursor: default;
 	}
 
 	.timeline-clip-original {
@@ -2016,6 +2727,7 @@
 		z-index: 2;
 		top: 0.55rem;
 		bottom: 0.55rem;
+		border-radius: 0.45rem;
 		cursor: grab;
 		touch-action: none;
 		user-select: none;
@@ -2038,14 +2750,14 @@
 
 	.timeline-content.timeline-has-selection .timeline-clip:not(.timeline-clip-selected):not(
 			.timeline-clip-dragging
-		):not(.timeline-clip-original) {
+		):not(.timeline-clip-original):not(.timeline-clip-video) {
 		opacity: 0.62;
 		filter: saturate(0.82);
 	}
 
 	.timeline-clip:hover:not(.timeline-clip-dragging):not(.timeline-clip-trimming):not(
 			.timeline-clip-original
-		) {
+		):not(.timeline-clip-video) {
 		filter: brightness(1.06) saturate(1.04);
 		transform: translateY(-1.5px);
 		box-shadow:
@@ -2057,7 +2769,7 @@
 	:global(:root:not(.dark))
 		.timeline-clip:hover:not(.timeline-clip-dragging):not(.timeline-clip-trimming):not(
 			.timeline-clip-original
-		) {
+		):not(.timeline-clip-video) {
 		box-shadow:
 			0 5px 14px oklch(0.4 0.04 265 / 14%),
 			0 0 0 1px color-mix(in oklab, var(--primary) 16%, var(--border)),
@@ -2067,7 +2779,7 @@
 	.timeline-content.timeline-has-selection
 		.timeline-clip:not(.timeline-clip-selected):not(.timeline-clip-dragging):not(
 			.timeline-clip-original
-		):hover {
+		):not(.timeline-clip-video):hover {
 		opacity: 0.86;
 		filter: brightness(1.06) saturate(0.95);
 	}

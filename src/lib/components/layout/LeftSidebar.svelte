@@ -231,7 +231,7 @@
 							disabled={tempoStore.isRemastering}
 							onclick={() => void tempoStore.resolveOverhangTrim()}
 						>
-							Auto-trim into picture
+							Auto-trim windows (keep natural speech)
 						</Button>
 						<Button
 							size="sm"

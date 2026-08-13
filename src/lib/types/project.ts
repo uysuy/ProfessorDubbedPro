@@ -153,7 +153,7 @@ export interface DubbingProject {
 	cues: SubtitleCue[];
 	/** Burn-in / preview subtitle appearance. */
 	subtitleStyle: SubtitleStyle;
-	/** Per-speaker clone refs + gender (from Detect Speakers). */
+	/** Per-speaker voice presets, gender, and optional locked clone sample. */
 	speakerBank: SpeakerVoiceProfile[];
 	updatedAt: string;
 }

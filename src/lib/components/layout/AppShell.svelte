@@ -102,7 +102,12 @@
 			if (!ok) return;
 		}
 		projectStore.createProject();
-		dndStore.flash('New project created');
+		const kept = projectStore.speakerBank.length;
+		dndStore.flash(
+			kept > 0
+				? `New project — kept ${kept} saved speaker${kept === 1 ? '' : 's'}`
+				: 'New project created'
+		);
 	}
 
 	async function onSaveProject() {
