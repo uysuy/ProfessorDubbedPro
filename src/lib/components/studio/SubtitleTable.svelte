@@ -81,17 +81,8 @@
 	const canSplitAtPlayhead = $derived.by(() => canSplitCue(primarySelectedId));
 	const canMergeSelection = $derived(selectedCount >= 2);
 
-	/** Bank ids + any free-text speakers still present on cues. */
-	const speakerOptions = $derived.by(() => {
-		const ids = new Set<string>();
-		for (const s of projectStore.speakerBank) ids.add(s.id);
-		for (const c of projectStore.current.cues) {
-			const sp = (c.speaker || '').trim();
-			if (sp) ids.add(sp);
-		}
-		if (ids.size === 0) ids.add('Speaker 1');
-		return [...ids];
-	});
+	/** Bank + vault + saved-voice templates for the Speaker column. */
+	const speakerOptions = $derived(projectStore.speakerTemplateOptions);
 
 	function canSplitCue(id: string | null | undefined) {
 		if (!id) return false;

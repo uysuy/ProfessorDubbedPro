@@ -13,6 +13,9 @@ import { isVoxcpmVoiceId, resolveVoxcpmPrompt } from '$lib/tts/voxcpm-voices';
 const PREVIEW_KM = 'សួស្តី ខ្ញុំជាសំឡេងសាកល្បង។';
 const PREVIEW_EN = 'Hello, this is a voice preview.';
 
+/** Same Khmer line used for Preview and Lock (design voices vary run-to-run). */
+export const VOXCPM_LOCK_SAMPLE_TEXT = PREVIEW_KM;
+
 type RustResult = {
 	filePath: string;
 	voice: string;
@@ -25,6 +28,18 @@ let source: AudioBufferSourceNode | null = null;
 let gain: GainNode | null = null;
 let activeVoiceId: string | null = null;
 let generation = 0;
+/** Last successful design-preview WAV per voice id — Lock reuses this exact file. */
+const lastPreviewFileByVoiceId = new Map<string, string>();
+
+export function getLastVoxcpmPreviewPath(voiceId: string): string | null {
+	const id = voiceId.trim();
+	return id ? (lastPreviewFileByVoiceId.get(id) ?? null) : null;
+}
+
+export function clearLastVoxcpmPreviewPath(voiceId?: string) {
+	if (voiceId?.trim()) lastPreviewFileByVoiceId.delete(voiceId.trim());
+	else lastPreviewFileByVoiceId.clear();
+}
 
 function getCtx(): AudioContext {
 	if (!ctx) {
@@ -164,11 +179,12 @@ export async function previewEdgeVoice(
 /**
  * Short VoxCPM2 design-voice sample (no speaker clone ref).
  * Requires the VoxCPM server/model to be started first.
+ * Returns the WAV path so Lock can save the exact sample you heard.
  */
 export async function previewVoxcpmVoice(
 	voiceId: string,
 	opts?: { onStart?: () => void; onEnd?: () => void }
-): Promise<void> {
+): Promise<string | null> {
 	const id = voiceId.trim();
 	if (!isVoxcpmVoiceId(id)) {
 		throw new Error('Not a VoxCPM2 voice id.');
@@ -176,7 +192,7 @@ export async function previewVoxcpmVoice(
 	if (activeVoiceId === id) {
 		stopVoicePreview();
 		opts?.onEnd?.();
-		return;
+		return getLastVoxcpmPreviewPath(id);
 	}
 
 	stopVoicePreview();
@@ -199,8 +215,12 @@ export async function previewVoxcpmVoice(
 			}
 		});
 
-		if (token !== generation) return;
+		if (token !== generation) return null;
+		if (result.filePath && result.byteLength) {
+			lastPreviewFileByVoiceId.set(id, result.filePath);
+		}
 		await playPreviewFile(result.filePath, result.byteLength, token, opts);
+		return result.filePath || getLastVoxcpmPreviewPath(id);
 	} catch (err) {
 		if (token === generation) {
 			activeVoiceId = null;

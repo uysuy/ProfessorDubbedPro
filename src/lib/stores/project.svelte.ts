@@ -15,11 +15,14 @@ import {
 } from '$lib/utils/project-io';
 import {
 	clearSpeakerLockInVault,
+	loadSpeakerVault,
 	mergeBankWithVault,
 	persistSpeakerBankToVault,
 	renameSpeakerInVault,
 	speakerBankFromVault
 } from '$lib/utils/speaker-vault';
+import { upsertSavedVoice, loadSavedVoices, deleteSavedVoice, getSavedVoice } from '$lib/utils/voice-library';
+import type { SavedVoice } from '$lib/utils/voice-library';
 import {
 	buildRecoveryDocument,
 	saveRecoveryToLocalStorage
@@ -161,6 +164,8 @@ let generateError = $state<string | null>(null);
 let speakersDetecting = $state(false);
 let speakersError = $state<string | null>(null);
 let speakersLockingId = $state<string | null>(null);
+/** Bump so UI re-reads the saved-voices library after Lock / delete. */
+let savedVoicesTick = $state(0);
 /** Runtime waveform peaks for TTS clips (not persisted). */
 let ttsWaveforms = $state<Record<string, number[]>>({});
 /** VideoPreview registers the mixer invalidate hook here. */
@@ -542,6 +547,36 @@ export const projectStore = {
 	},
 	get speakerBank() {
 		return project.speakerBank ?? [];
+	},
+	/** Loved voices saved to the app library (pick anytime). */
+	get savedVoices(): SavedVoice[] {
+		void savedVoicesTick;
+		return loadSavedVoices();
+	},
+	/**
+	 * Names available in the subtitle Speaker column: current bank + vault +
+	 * saved-voice templates (Hong_Kong_TVB_*, etc.).
+	 */
+	get speakerTemplateOptions(): string[] {
+		void savedVoicesTick;
+		const ids = new Set<string>();
+		for (const s of project.speakerBank ?? []) {
+			const id = s.id.trim();
+			if (id) ids.add(id);
+		}
+		for (const e of loadSpeakerVault()) {
+			if (e.id.trim()) ids.add(e.id.trim());
+		}
+		for (const v of loadSavedVoices()) {
+			const name = v.name.trim();
+			if (name) ids.add(name);
+		}
+		for (const c of project.cues) {
+			const sp = (c.speaker || '').trim();
+			if (sp) ids.add(sp);
+		}
+		if (ids.size === 0) ids.add('Speaker 1');
+		return [...ids].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 	},
 	/** Waveform peaks for a TTS clip (real Edge audio when available). */
 	ttsPeaksForCue(cueId: string, widthPx: number, barWidth = 2): number[] {
@@ -2133,6 +2168,9 @@ export const projectStore = {
 			'volume',
 			'speaker'
 		] as const;
+		if (typeof patch.speaker === 'string' && patch.speaker.trim()) {
+			this.ensureSpeakerFromTemplate(patch.speaker.trim());
+		}
 		project = touch({
 			...project,
 			cues: project.cues.map((cue) => {
@@ -3526,6 +3564,66 @@ export const projectStore = {
 	},
 
 	/**
+	 * Ensure a speaker name from the subtitle dropdown exists in the project bank.
+	 * Pulls lock/preset from Saved voices or the vault when available.
+	 */
+	ensureSpeakerFromTemplate(speakerName: string): boolean {
+		const id = speakerName.trim();
+		if (!id) return false;
+		const bank = [...(project.speakerBank ?? [])];
+		if (bank.some((s) => s.id === id)) return true;
+
+		const eng = getTtsEngineId();
+		const saved =
+			loadSavedVoices().find((v) => v.name.trim() === id) ??
+			loadSavedVoices().find((v) => v.id === id);
+		const vault = loadSpeakerVault().find((e) => e.id === id);
+
+		let profile: SpeakerVoiceProfile;
+		if (saved) {
+			profile = {
+				id,
+				gender: saved.gender,
+				voiceId: saved.voiceId,
+				locked: Boolean(saved.refWavPath),
+				refWavPath: saved.refWavPath || '',
+				cueCount: 0
+			};
+		} else if (vault) {
+			profile = {
+				id,
+				gender: vault.gender,
+				voiceId:
+					eng === 'voxcpm'
+						? matchVoxcpmVoiceToGender(vault.voiceId, vault.gender)
+						: vault.voiceId,
+				locked: Boolean(vault.locked && vault.refWavPath),
+				refWavPath: vault.locked ? vault.refWavPath : '',
+				cueCount: 0
+			};
+		} else {
+			profile = {
+				id,
+				gender: 'neutral',
+				voiceId: voiceIdForSpeakerGender('neutral', eng),
+				locked: false,
+				refWavPath: '',
+				cueCount: 0
+			};
+		}
+
+		bank.push(profile);
+		project = {
+			...project,
+			speakerBank: bank,
+			updatedAt: new Date().toISOString()
+		};
+		isDirty = true;
+		persistSpeakerBankToVault(bank);
+		return true;
+	},
+
+	/**
 	 * Manually create Speaker 1..N (no auto-detect). Preserves matching speakers'
 	 * gender / preset / lock when the count still includes them.
 	 */
@@ -3594,7 +3692,74 @@ export const projectStore = {
 		});
 		persistSpeakerBankToVault(bank);
 		saveProjectToStorage(project);
+		// Keep sidebar Voice Selection in sync with Speaker 1.
+		const lead = bank[0]?.voiceId;
+		if (lead) {
+			voiceId = migrateVoiceId(lead);
+			preferencesStore.setDefaultVoiceId(voiceId);
+		}
 		return bank.length;
+	},
+
+	/**
+	 * Push current speaker-bank voices onto matching cues (and remap unknown
+	 * speakers to Speaker 1). Used by Done so closing the dialog always applies.
+	 */
+	applySpeakerBankToCues(): number {
+		const bank = [...(project.speakerBank ?? [])];
+		if (!bank.length) return 0;
+		const validIds = new Set(bank.map((s) => s.id));
+		const defaultId = bank[0]!.id;
+		const voiceBySpeaker = new Map(bank.map((s) => [s.id, s.voiceId]));
+		let changed = 0;
+		const cueIdsClear: string[] = [];
+		const cues = project.cues.map((c) => {
+			const raw = (c.speaker || '').trim();
+			const spk = raw && validIds.has(raw) ? raw : defaultId;
+			const nextVoice = voiceBySpeaker.get(spk) ?? c.voiceId;
+			if (spk === (c.speaker || '').trim() && nextVoice === c.voiceId) return c;
+			changed += 1;
+			const next = { ...c, speaker: spk, voiceId: nextVoice };
+			if (c.assignedAudio && (spk !== raw || nextVoice !== c.voiceId)) {
+				next.assignedAudio = null;
+				if (next.status === 'generated' || next.status === 'error') {
+					next.status = 'ready';
+				}
+				cueIdsClear.push(c.id);
+			}
+			return next;
+		});
+		for (const s of bank) {
+			s.cueCount = cues.filter((c) => (c.speaker || '').trim() === s.id).length;
+		}
+		if (changed || bank.some((s, i) => s.cueCount !== (project.speakerBank?.[i]?.cueCount ?? -1))) {
+			project = touch({ ...project, speakerBank: bank, cues });
+			if (cueIdsClear.length) dropTtsWaveforms(cueIdsClear);
+			saveProjectToStorage(project);
+			persistSpeakerBankToVault(bank);
+		}
+		const lead = bank[0]?.voiceId;
+		if (lead) {
+			voiceId = migrateVoiceId(lead);
+			preferencesStore.setDefaultVoiceId(voiceId);
+		}
+		return changed;
+	},
+
+	/**
+	 * Commit speaker count + push bank voices onto cues (Engine dialog Done).
+	 */
+	commitSpeakers(count?: number): number {
+		const n =
+			typeof count === 'number' && Number.isFinite(count)
+				? Math.max(1, Math.min(8, Math.round(count)))
+				: Math.max(1, project.speakerBank?.length || 1);
+		const bankLen = project.speakerBank?.length ?? 0;
+		if (!bankLen || bankLen !== n) {
+			return this.setManualSpeakers(n);
+		}
+		this.applySpeakerBankToCues();
+		return bankLen;
 	},
 
 	/**
@@ -3792,10 +3957,14 @@ export const projectStore = {
 	},
 
 	/**
-	 * Synthesize a short Khmer sample from the speaker's VoxCPM preset and lock it
-	 * as the clone reference for all of that speaker's lines.
+	 * Lock a speaker to a Khmer clone sample.
+	 * Prefers the exact WAV from the last Preview for that preset (VoxCPM design
+	 * voices are non-deterministic — re-generating would sound different).
 	 */
-	async lockSpeakerVoice(speakerId: string): Promise<boolean> {
+	async lockSpeakerVoice(
+		speakerId: string,
+		opts?: { sourceWavPath?: string }
+	): Promise<boolean> {
 		const id = speakerId.trim();
 		const bank = (project.speakerBank ?? []).find((s) => s.id === id);
 		if (!bank) {
@@ -3815,25 +3984,35 @@ export const projectStore = {
 		speakersLockingId = id;
 		speakersError = null;
 		try {
-			// Gender always wins over a mismatched style (Soft F + Male → Soft M).
 			const usedVoiceId =
 				bank.gender === 'male' || bank.gender === 'female'
 					? matchVoxcpmVoiceToGender(bank.voiceId, bank.gender)
 					: resolveVoxcpmVoiceId(bank.voiceId, voiceId);
-			const engine = getTtsEngine();
-			const LOCK_TEXT = 'សួស្តី ខ្ញុំជាសំឡេងសាកល្បងសម្រាប់ចាក់សោ។';
-			const result = await engine.synthesize({
-				cueId: `lock-${Date.now()}-${id.replace(/[^\w.-]+/g, '_')}`,
-				text: LOCK_TEXT,
-				voiceId: usedVoiceId,
-				pitch: 0,
-				speed: 1,
-				volume: 100,
-				language: 'km'
-				// No referenceWavPath — design prompt for the chosen preset.
-			});
-			if (!result.filePath || !result.byteLength) {
-				throw new Error('Lock sample was empty — is VoxCPM2 started?');
+
+			const { getLastVoxcpmPreviewPath, VOXCPM_LOCK_SAMPLE_TEXT } = await import(
+				'$lib/tts/voice-preview'
+			);
+			let sourcePath = (opts?.sourceWavPath ?? '').trim();
+			if (!sourcePath) {
+				sourcePath = getLastVoxcpmPreviewPath(usedVoiceId)?.trim() || '';
+			}
+
+			// No matching preview → synthesize with the same line/params as Preview.
+			if (!sourcePath) {
+				const engine = getTtsEngine();
+				const result = await engine.synthesize({
+					cueId: `lock-${Date.now()}-${id.replace(/[^\w.-]+/g, '_')}`,
+					text: VOXCPM_LOCK_SAMPLE_TEXT,
+					voiceId: usedVoiceId,
+					pitch: 0,
+					speed: 1,
+					volume: 100,
+					language: 'km'
+				});
+				if (!result.filePath || !result.byteLength) {
+					throw new Error('Lock sample was empty — is VoxCPM2 started?');
+				}
+				sourcePath = result.filePath;
 			}
 
 			const { invoke } = await import('@tauri-apps/api/core');
@@ -3841,7 +4020,7 @@ export const projectStore = {
 				args: {
 					projectId: project.id,
 					speakerId: id,
-					sourcePath: result.filePath
+					sourcePath
 				}
 			});
 
@@ -3876,6 +4055,13 @@ export const projectStore = {
 			if (cueIds.length) dropTtsWaveforms(cueIds);
 			saveProjectToStorage(project);
 			persistSpeakerBankToVault(project.speakerBank ?? []);
+			upsertSavedVoice({
+				name: id,
+				gender: bank.gender,
+				voiceId: usedVoiceId,
+				refWavPath: saved.filePath
+			});
+			savedVoicesTick += 1;
 			return true;
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
@@ -3884,6 +4070,125 @@ export const projectStore = {
 		} finally {
 			speakersLockingId = null;
 		}
+	},
+
+	/**
+	 * Apply a loved voice from the library onto a speaker slot (one click).
+	 * Renames the slot to the saved voice name when free, so the table shows
+	 * “Hong_Kong_TVB_3” instead of staying on “Speaker 1”.
+	 * Returns the speaker id after apply (may be renamed), or null on failure.
+	 */
+	applySavedVoice(speakerId: string, savedVoiceId: string): string | null {
+		const id = speakerId.trim();
+		const saved = getSavedVoice(savedVoiceId);
+		if (!saved) {
+			speakersError = 'Saved voice not found.';
+			return null;
+		}
+		const bank = [...(project.speakerBank ?? [])];
+		const idx = bank.findIndex((s) => s.id === id);
+		if (idx < 0) {
+			speakersError = 'Speaker not found — set speakers first.';
+			return null;
+		}
+		const prev = bank[idx]!;
+		const wantedName = saved.name.trim() || prev.id;
+		const nameTaken =
+			wantedName !== prev.id && bank.some((s, i) => i !== idx && s.id === wantedName);
+		const nextId = nameTaken ? prev.id : wantedName;
+
+		const cueIds: string[] = [];
+		const cues = project.cues.map((c) => {
+			if ((c.speaker || '').trim() !== id) return c;
+			cueIds.push(c.id);
+			return {
+				...c,
+				speaker: nextId,
+				voiceId: saved.voiceId,
+				assignedAudio: null,
+				status:
+					c.status === 'generated' || c.status === 'error'
+						? ('ready' as const)
+						: c.status
+			};
+		});
+
+		bank[idx] = {
+			...prev,
+			id: nextId,
+			gender: saved.gender,
+			voiceId: saved.voiceId,
+			locked: true,
+			refWavPath: saved.refWavPath,
+			cueCount: cues.filter((c) => (c.speaker || '').trim() === nextId).length
+		};
+
+		project = touch({
+			...project,
+			speakerBank: bank,
+			cues
+		});
+		if (cueIds.length) dropTtsWaveforms(cueIds);
+		if (nextId !== id) renameSpeakerInVault(id, nextId);
+		saveProjectToStorage(project);
+		persistSpeakerBankToVault(project.speakerBank ?? []);
+		speakersError = null;
+		return nextId;
+	},
+
+	removeSavedVoice(savedVoiceId: string): boolean {
+		const ok = deleteSavedVoice(savedVoiceId);
+		if (ok) savedVoicesTick += 1;
+		return ok;
+	},
+
+	/** Restore locked speakers from the vault into this project (e.g. Engine open). */
+	restoreSpeakersFromVault(): number {
+		const vault = speakerBankFromVault();
+		if (!vault.length) return 0;
+		const eng = getTtsEngineId();
+		const bank = vault.map((s) => {
+			const voiceId =
+				eng === 'voxcpm'
+					? matchVoxcpmVoiceToGender(s.voiceId, s.gender)
+					: s.voiceId;
+			return {
+				...s,
+				voiceId,
+				cueCount: project.cues.filter((c) => (c.speaker || '').trim() === s.id).length
+			};
+		});
+		// Backfill loved-voice library from existing vault locks (one-time migrate feel).
+		for (const s of bank) {
+			if (s.locked && s.refWavPath) {
+				upsertSavedVoice({
+					name: s.id,
+					gender: s.gender,
+					voiceId: s.voiceId,
+					refWavPath: s.refWavPath
+				});
+			}
+		}
+		savedVoicesTick += 1;
+		const validIds = new Set(bank.map((s) => s.id));
+		const defaultId = bank[0]!.id;
+		const voiceBySpeaker = new Map(bank.map((s) => [s.id, s.voiceId]));
+		project = touch({
+			...project,
+			speakerBank: bank,
+			cues: project.cues.map((c) => {
+				const raw = (c.speaker || '').trim();
+				const spk = raw && validIds.has(raw) ? raw : defaultId;
+				return {
+					...c,
+					speaker: spk,
+					voiceId: voiceBySpeaker.get(spk) ?? c.voiceId
+				};
+			})
+		});
+		saveProjectToStorage(project);
+		persistSpeakerBankToVault(bank);
+		return bank.length;
 	},
 
 	clearSpeakerLock(speakerId: string): boolean {

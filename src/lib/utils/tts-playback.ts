@@ -5,7 +5,8 @@
  * After Align, cues store fitPlaybackRate so speech fits the subtitle window.
  * Playback applies that rate once per cue (no mid-clip restarts) so the burned
  * title and audio start/finish together — without syllable chopping from drift
- * re-seeks.
+ * re-seeks. When speech ends before the subtitle window, the cue is marked
+ * exhausted so sync() does not replay from the start before the next line.
  */
 
 import { cuePreviewEndMs, cueEffectivePlaybackRate, TTS_ALIGN_MAX_PLAYBACK } from '$lib/utils/tts-fit';
@@ -51,6 +52,12 @@ export class TtsPlaybackMixer {
 	private activeId: string | null = null;
 	private activeRate = 1;
 	private lastPlayheadMs = -1;
+	/**
+	 * Cue whose buffer finished naturally while the playhead was still in its
+	 * subtitle window. Without this, sync() would restart that clip from 0
+	 * (audible “replay then jump”) until the next cue starts.
+	 */
+	private exhaustedId: string | null = null;
 	private resolveUrl: ((filePath: string) => string | null) | null = null;
 
 	get playingCueId(): string | null {
@@ -109,6 +116,7 @@ export class TtsPlaybackMixer {
 	/** Drop a cached buffer after regenerating TTS for a cue. */
 	invalidate(cueId: string) {
 		this.buffers.delete(cueId);
+		if (this.exhaustedId === cueId) this.exhaustedId = null;
 		if (this.activeId === cueId) this.stopSource();
 	}
 
@@ -124,6 +132,7 @@ export class TtsPlaybackMixer {
 	private stopSource() {
 		if (this.source) {
 			try {
+				this.source.onended = null;
 				this.source.stop();
 			} catch {
 				/* already stopped */
@@ -150,6 +159,7 @@ export class TtsPlaybackMixer {
 	pauseAll() {
 		this.stopSource();
 		this.lastPlayheadMs = -1;
+		this.exhaustedId = null;
 	}
 
 	dispose() {
@@ -157,6 +167,7 @@ export class TtsPlaybackMixer {
 		this.buffers.clear();
 		this.loading.clear();
 		this.lastPlayheadMs = -1;
+		this.exhaustedId = null;
 		if (this.ctx) {
 			void this.ctx.close().catch(() => undefined);
 			this.ctx = null;
@@ -210,14 +221,16 @@ export class TtsPlaybackMixer {
 		this.gain = gain;
 		this.activeId = cue.id;
 		this.activeRate = safeRate;
+		if (this.exhaustedId === cue.id) this.exhaustedId = null;
 
 		source.onended = () => {
-			if (this.source === source) {
-				this.source = null;
-				this.gain = null;
-				this.activeId = null;
-				this.activeRate = 1;
-			}
+			if (this.source !== source) return;
+			// Natural end — remember so we do not re-attack from sample 0.
+			this.exhaustedId = cue.id;
+			this.source = null;
+			this.gain = null;
+			this.activeId = null;
+			this.activeRate = 1;
 		};
 	}
 
@@ -264,6 +277,17 @@ export class TtsPlaybackMixer {
 		const seekJump = prev >= 0 && (playheadMs - prev > 450 || playheadMs - prev < -120);
 		this.lastPlayheadMs = playheadMs;
 
+		if (seekJump) {
+			this.exhaustedId = null;
+		} else if (this.exhaustedId) {
+			const done = cues.find((c) => c.id === this.exhaustedId);
+			const stillInExhausted =
+				done &&
+				playheadMs >= done.startMs - 40 &&
+				playheadMs < cueWindowEndMs(done) + 80;
+			if (!stillInExhausted) this.exhaustedId = null;
+		}
+
 		// Play-through lock: keep one line going, but stop when playhead left the window
 		// (seek / next cue) and keep transport × fit rate live so picture ↔ TTS stay matched.
 		if (this.source && this.activeId && !seekJump) {
@@ -293,7 +317,14 @@ export class TtsPlaybackMixer {
 
 		const cue = this.pickCue(cues, playheadMs, preferredCueId);
 		if (!cue) {
-			if (!(this.source && this.activeId && !seekJump)) this.pauseAll();
+			// Do not pauseAll() here — that resets lastPlayheadMs and can make the
+			// next line look like a cold start after a short gap.
+			if (!(this.source && this.activeId && !seekJump)) this.stopSource();
+			return;
+		}
+
+		// Speech already finished for this cue — stay silent until the next line / seek.
+		if (this.exhaustedId === cue.id && !seekJump) {
 			return;
 		}
 
@@ -321,7 +352,7 @@ export class TtsPlaybackMixer {
 
 		const url = this.resolveCueUrl(cue);
 		if (!url) {
-			this.pauseAll();
+			this.stopSource();
 			return;
 		}
 
@@ -342,6 +373,13 @@ export class TtsPlaybackMixer {
 			seekJump && !nearStart
 				? Math.max(0, ((playheadMs - cue.startMs) / 1000) * fit)
 				: 0;
+
+		// Mid-window seek into an already-finished buffer → stay silent.
+		if (seekJump && !nearStart && offsetSec >= buffer.duration - 0.03) {
+			this.exhaustedId = cue.id;
+			this.stopSource();
+			return;
+		}
 
 		const remainWindowSec = Math.max(0.05, (cueWindowEndMs(cue) - playheadMs) / 1000);
 		this.startCue(cue, buffer, offsetSec, rate, remainWindowSec);

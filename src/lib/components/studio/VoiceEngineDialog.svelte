@@ -18,10 +18,10 @@
 		matchVoxcpmVoiceToGender,
 		voxcpmVoicesForGender
 	} from '$lib/tts/voxcpm-voices';
-	import { previewVoxcpmVoice, stopVoicePreview } from '$lib/tts/voice-preview';
+	import { previewVoxcpmVoice, stopVoicePreview, clearLastVoxcpmPreviewPath, getLastVoxcpmPreviewPath } from '$lib/tts/voice-preview';
 	import { voiceMatchesEngine } from '$lib/tts/voice-engine';
 	import { isTauriRuntime } from '$lib/utils/platform';
-	import { LoaderCircle, Lock, LockOpen, Play, SkipForward } from '@lucide/svelte';
+	import { LoaderCircle, Lock, LockOpen, Play, SkipForward, Trash2 } from '@lucide/svelte';
 	import type { SpeakerVoiceProfile } from '$lib/types/project';
 
 	const open = $derived(studioUi.voiceEngineOpen);
@@ -139,8 +139,19 @@
 		studioUi.voiceEngineOpen = v;
 		if (v) {
 			void refreshVoxStatus();
-			const bankLen = projectStore.speakerBank.length;
-			if (bankLen > 0) speakerCount = Math.max(1, Math.min(6, bankLen));
+			// Bring back loved speakers without forcing Set speakers again.
+			if (!projectStore.speakerBank.length) {
+				const n = projectStore.restoreSpeakersFromVault();
+				if (n > 0) {
+					speakerCount = Math.max(1, Math.min(6, n));
+					focusedSpeakerId = projectStore.speakerBank[0]?.id ?? null;
+					dndStore.flash(`Restored ${n} saved speaker${n === 1 ? '' : 's'}`);
+				}
+			} else {
+				const bankLen = projectStore.speakerBank.length;
+				speakerCount = Math.max(1, Math.min(6, bankLen));
+				focusedSpeakerId = projectStore.speakerBank[0]?.id ?? focusedSpeakerId;
+			}
 		} else {
 			stopLockAudio();
 			stopVoicePreview();
@@ -211,6 +222,24 @@
 		);
 	}
 
+	function onDone() {
+		const before = projectStore.speakerBank.length;
+		const n = projectStore.commitSpeakers(speakerCount);
+		focusedSpeakerId = projectStore.speakerBank[0]?.id ?? null;
+		const cueN = projectStore.current.cues.length;
+		if (n > 0) {
+			dndStore.flash(
+				cueN > 0
+					? `Applied ${n} speaker${n === 1 ? '' : 's'} to ${cueN} line${cueN === 1 ? '' : 's'} — assign Speaker in the table if needed, then Generate`
+					: `Applied ${n} speaker${n === 1 ? '' : 's'} — Extract / paste lines, then assign Speaker in the table`
+			);
+		} else if (!before) {
+			dndStore.flash('Set a speaker count first, then Done');
+			return;
+		}
+		onOpenChange(false);
+	}
+
 	function focusSpeaker(id: string) {
 		focusedSpeakerId = id;
 	}
@@ -264,7 +293,6 @@
 		previewingId = target.id;
 		try {
 			// Locked → hear the saved clone sample. Unlocked → hear the current preset.
-			// Press Preview again to replay the same voice for this speaker.
 			if (target.locked && target.refWavPath) {
 				const url = convertFileSrc(target.refWavPath);
 				const audio = new Audio(url);
@@ -293,11 +321,20 @@
 		}
 		stopLockAudio();
 		stopVoicePreview();
-		const ok = await projectStore.lockSpeakerVoice(sp.id);
+		const voiceId = resolvePreviewVoiceId(sp);
+		const previewPath = getLastVoxcpmPreviewPath(voiceId);
+		if (!previewPath && !(sp.locked && sp.refWavPath)) {
+			dndStore.flash('Preview this preset first, then Lock — so we save the exact voice you heard.');
+		}
+		const ok = await projectStore.lockSpeakerVoice(sp.id, {
+			sourceWavPath: previewPath || undefined
+		});
 		if (ok) {
 			const locked = projectStore.speakerBank.find((s) => s.id === sp.id);
 			dndStore.flash(
-				`Locked ${sp.id} → ${presetLabel(locked?.voiceId || sp.voiceId)}`
+				previewPath
+					? `Locked the voice you previewed → ${presetLabel(locked?.voiceId || sp.voiceId)}`
+					: `Saved “${sp.id}” → ${presetLabel(locked?.voiceId || sp.voiceId)} (preview first next time for an exact match)`
 			);
 		} else if (projectStore.speakersError) {
 			dndStore.flash(projectStore.speakersError);
@@ -308,7 +345,36 @@
 		stopLockAudio();
 		stopVoicePreview();
 		projectStore.clearSpeakerLock(sp.id);
-		dndStore.flash(`Cleared ${sp.id} — Preview again, then Lock when you like it`);
+		dndStore.flash(`Cleared ${sp.id} lock — Saved voices library kept for re-select`);
+	}
+
+	function onApplySaved(sp: SpeakerVoiceProfile, savedId: string | undefined) {
+		if (!savedId) return;
+		const savedName =
+			projectStore.savedVoices.find((v) => v.id === savedId)?.name ?? 'voice';
+		const nextId = projectStore.applySavedVoice(sp.id, savedId);
+		if (nextId) {
+			if (focusedSpeakerId === sp.id || focusedSpeakerId === nextId) {
+				focusedSpeakerId = nextId;
+			}
+			dndStore.flash(
+				nextId !== sp.id
+					? `Applied “${savedName}” — speaker renamed to ${nextId}`
+					: `Applied saved voice “${savedName}” → ${nextId}`
+			);
+		} else if (projectStore.speakersError) {
+			dndStore.flash(projectStore.speakersError);
+		}
+	}
+
+	function onDeleteSaved(savedId: string) {
+		const name = projectStore.savedVoices.find((v) => v.id === savedId)?.name ?? 'voice';
+		if (typeof window !== 'undefined') {
+			const ok = window.confirm(`Remove saved voice “${name}” from the library?`);
+			if (!ok) return;
+		}
+		projectStore.removeSavedVoice(savedId);
+		dndStore.flash(`Removed “${name}” from Saved voices`);
 	}
 </script>
 
@@ -317,8 +383,8 @@
 		<Dialog.Header>
 			<Dialog.Title>Engine & Speakers</Dialog.Title>
 			<Dialog.Description>
-				Locked speakers are saved across New project until you Clear. Preview the current speaker,
-				or Next speaker to move on — Preview again replays that voice.
+				Preview a preset, then Lock — we save the exact WAV you just heard (VoxCPM design voices
+				vary each run). Pick it later from Saved voices.
 			</Dialog.Description>
 		</Dialog.Header>
 
@@ -468,6 +534,13 @@
 								{@const locking = projectStore.speakersLockingId === sp.id}
 								{@const previewing = previewingId === sp.id}
 								{@const focused = focusedSpeakerId === sp.id}
+								{@const appliedSaved = sp.locked
+									? projectStore.savedVoices.find(
+											(v) =>
+												v.refWavPath === sp.refWavPath ||
+												(v.voiceId === sp.voiceId && v.name === sp.id)
+										)
+									: null}
 								<li
 									class="space-y-1.5 rounded border px-2 py-2 text-[10px] leading-snug {focused
 										? 'border-primary/50 bg-primary/8 ring-1 ring-primary/25'
@@ -523,6 +596,7 @@
 												value={sp.gender}
 												onValueChange={(v) => {
 													if (v === 'female' || v === 'male' || v === 'neutral') {
+														clearLastVoxcpmPreviewPath(resolvePreviewVoiceId(sp));
 														projectStore.updateSpeaker(sp.id, { gender: v });
 													}
 												}}
@@ -543,7 +617,10 @@
 												type="single"
 												value={sp.voiceId}
 												onValueChange={(v) => {
-													if (v) projectStore.updateSpeaker(sp.id, { voiceId: v });
+													if (v) {
+														clearLastVoxcpmPreviewPath(resolvePreviewVoiceId(sp));
+														projectStore.updateSpeaker(sp.id, { voiceId: v });
+													}
 												}}
 											>
 												<Select.Trigger class="h-7 w-full text-[10px]" aria-label="Voice preset">
@@ -556,6 +633,48 @@
 												</Select.Content>
 											</Select.Root>
 										</div>
+									</div>
+
+									<div class="space-y-0.5">
+										<span class="text-muted-foreground">Saved voices (pick anytime)</span>
+										<Select.Root
+											type="single"
+											value={appliedSaved?.id ?? ''}
+											onValueChange={(v) => {
+												if (!v || v === '__none__') return;
+												onApplySaved(sp, v);
+											}}
+										>
+											<Select.Trigger
+												class="h-7 w-full text-[10px]"
+												aria-label="Apply saved voice"
+												onclick={(e) => e.stopPropagation()}
+											>
+												{appliedSaved
+													? appliedSaved.name
+													: projectStore.savedVoices.length
+														? 'Select a saved voice…'
+														: 'No saved voices yet — Lock one'}
+											</Select.Trigger>
+											<Select.Content>
+												{#if projectStore.savedVoices.length}
+													{#each projectStore.savedVoices as sv (sv.id)}
+														<Select.Item value={sv.id} label={sv.name}>
+															<span class="flex w-full items-center justify-between gap-2">
+																<span class="truncate">{sv.name}</span>
+																<span class="shrink-0 text-[9px] text-muted-foreground">
+																	{genderLabel(sv.gender)} · {presetLabel(sv.voiceId)}
+																</span>
+															</span>
+														</Select.Item>
+													{/each}
+												{:else}
+													<Select.Item value="__none__" label="None" disabled
+														>Lock a voice to save it here</Select.Item
+													>
+												{/if}
+											</Select.Content>
+										</Select.Root>
 									</div>
 
 									<div class="flex flex-wrap items-center gap-1">
@@ -615,11 +734,47 @@
 								</li>
 							{/each}
 						</ul>
+						{#if projectStore.savedVoices.length}
+							<div class="space-y-1 rounded-md border border-border/50 bg-muted/15 px-2 py-1.5">
+								<p class="text-[10px] font-medium text-foreground/80">Library (survives New / close)</p>
+								<ul class="max-h-28 space-y-0.5 overflow-auto">
+									{#each projectStore.savedVoices as sv (sv.id)}
+										<li class="flex items-center gap-1 text-[10px]">
+											<span class="min-w-0 flex-1 truncate"
+												>{sv.name}
+												<span class="text-muted-foreground">
+													· {genderLabel(sv.gender)} · {presetLabel(sv.voiceId)}</span
+												></span
+											>
+											<Button
+												size="sm"
+												variant="ghost"
+												class="h-6 shrink-0 px-1 text-muted-foreground"
+												title="Remove from library"
+												onclick={() => onDeleteSaved(sv.id)}
+											>
+												<Trash2 class="size-3" />
+											</Button>
+										</li>
+									{/each}
+								</ul>
+							</div>
+						{/if}
 					{:else}
 						<p class="text-[10px] leading-snug text-muted-foreground">
-							Choose a count and press <span class="font-medium text-foreground">Set speakers</span>.
-							Then set Male/Female + preset, Preview until you like it, and Lock.
+							Choose a count and press <span class="font-medium text-foreground">Set speakers</span>
+							(or just <span class="font-medium text-foreground">Done</span> — it applies the count).
+							Then set Male/Female + preset, Preview until you like it, and Lock — that also saves
+							to your library for next time.
 						</p>
+						{#if projectStore.savedVoices.length}
+							<p class="text-[10px] text-muted-foreground">
+								You already have {projectStore.savedVoices.length} saved voice{projectStore
+									.savedVoices.length === 1
+									? ''
+									: 's'} — Set speakers, then pick from Saved voices.
+							</p>
+						{/if}
 					{/if}
 					{#if projectStore.speakersError}
 						<p class="text-[10px] text-destructive whitespace-pre-wrap">
@@ -631,7 +786,7 @@
 		</div>
 
 		<Dialog.Footer>
-			<Button class="h-8" onclick={() => onOpenChange(false)}>Done</Button>
+			<Button class="h-8" onclick={onDone}>Done</Button>
 		</Dialog.Footer>
 	</Dialog.Content>
 </Dialog.Root>

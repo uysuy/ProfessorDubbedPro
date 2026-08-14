@@ -120,6 +120,32 @@
 				value={projectStore.voiceId}
 				voices={voiceList}
 				onValueChange={(id) => {
+					const bank = projectStore.speakerBank;
+					if (bank.length) {
+						const selected = new Set(projectStore.selectedCueIds);
+						const cues =
+							selected.size > 0
+								? projectStore.current.cues.filter((c) => selected.has(c.id))
+								: projectStore.current.cues;
+						const speakerIds = new Set(
+							cues.map((c) => (c.speaker || '').trim()).filter(Boolean)
+						);
+						if (speakerIds.size) {
+							let updated = 0;
+							for (const spk of speakerIds) {
+								if (bank.some((s) => s.id === spk)) {
+									if (projectStore.updateSpeaker(spk, { voiceId: id })) updated += 1;
+								}
+							}
+							projectStore.setVoiceId(id, { applyToCues: false });
+							dndStore.flash(
+								updated > 0
+									? `Voice applied to ${updated} speaker${updated === 1 ? '' : 's'} (and their lines)`
+									: `Default voice updated — assign speakers in the table first`
+							);
+							return;
+						}
+					}
 					projectStore.setVoiceId(id);
 					const n = selectedCount || projectStore.current.cues.length;
 					dndStore.flash(
@@ -132,7 +158,12 @@
 				}}
 			/>
 			<p class="text-[10px] leading-snug text-muted-foreground">
-				Applies to selected (or all). Re-Generate to hear the new voice.
+				{#if projectStore.speakerBank.length}
+					With speakers set, this updates the speaker voice(s) for selected lines. Re-Generate to
+					hear it.
+				{:else}
+					Applies to selected (or all). Re-Generate to hear the new voice.
+				{/if}
 			</p>
 			<button
 				type="button"

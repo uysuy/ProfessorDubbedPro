@@ -362,6 +362,16 @@ fn sanitize_speaker_file_stem(speaker_id: &str) -> String {
 	}
 }
 
+fn voice_library_dir(app: &AppHandle) -> Result<PathBuf, String> {
+	let dir = app
+		.path()
+		.app_data_dir()
+		.map_err(|e| format!("Could not resolve app data dir: {e}"))?
+		.join("voice-library");
+	fs::create_dir_all(&dir).map_err(|e| format!("Could not create voice-library dir: {e}"))?;
+	Ok(dir)
+}
+
 fn save_speaker_lock_blocking(
 	app: &AppHandle,
 	args: SaveSpeakerLockArgs,
@@ -370,36 +380,41 @@ fn save_speaker_lock_blocking(
 	if !src.is_file() {
 		return Err(format!("Lock sample not found: {}", src.display()));
 	}
-	let dir = speakers_data_dir(app, &args.project_id)?;
+	// App-global library so locks survive New project / app restart.
+	let dir = voice_library_dir(app)?;
 	let stem = sanitize_speaker_file_stem(&args.speaker_id);
-	// Unique path each lock so preview/Generate cannot keep a stale cached WAV.
 	let stamp = SystemTime::now()
 		.duration_since(UNIX_EPOCH)
 		.map(|d| d.as_millis())
 		.unwrap_or(0);
-	let dest = dir.join(format!("lock-{stem}-{stamp}.wav"));
+	let dest = dir.join(format!("voice-{stem}-{stamp}.wav"));
 	fs::copy(&src, &dest).map_err(|e| format!("Could not save lock WAV: {e}"))?;
-	// Remove older lock samples for this speaker (keep the new one).
-	if let Ok(entries) = fs::read_dir(&dir) {
-		let prefix = format!("lock-{stem}-");
-		for entry in entries.flatten() {
-			let path = entry.path();
-			if path == dest {
-				continue;
-			}
-			let name = path
-				.file_name()
-				.and_then(|n| n.to_str())
-				.unwrap_or("");
-			if name.starts_with(&prefix) && name.ends_with(".wav") {
-				let _ = fs::remove_file(&path);
-			}
-			// Legacy fixed name from earlier builds.
-			if name == format!("lock-{stem}.wav") {
-				let _ = fs::remove_file(&path);
+
+	// Also keep a project-scoped copy for older tooling / recovery.
+	if let Ok(proj_dir) = speakers_data_dir(app, &args.project_id) {
+		let proj_dest = proj_dir.join(format!("lock-{stem}-{stamp}.wav"));
+		let _ = fs::copy(&dest, &proj_dest);
+		if let Ok(entries) = fs::read_dir(&proj_dir) {
+			let prefix = format!("lock-{stem}-");
+			for entry in entries.flatten() {
+				let path = entry.path();
+				if path == proj_dest {
+					continue;
+				}
+				let name = path
+					.file_name()
+					.and_then(|n| n.to_str())
+					.unwrap_or("");
+				if name.starts_with(&prefix) && name.ends_with(".wav") {
+					let _ = fs::remove_file(&path);
+				}
+				if name == format!("lock-{stem}.wav") {
+					let _ = fs::remove_file(&path);
+				}
 			}
 		}
 	}
+
 	Ok(SaveSpeakerLockResult {
 		file_path: dest.to_string_lossy().into_owned(),
 	})
