@@ -11,6 +11,7 @@ let tempoOpen = $state(false);
 let voiceEngineOpen = $state(false);
 let prosodyOpen = $state(false);
 let titleLiverOpen = $state(false);
+let linkImportOpen = $state(false);
 /** Title-safe / action-safe overlays on the program monitor. */
 let titleSafeGuides = $state(false);
 
@@ -79,6 +80,20 @@ export const studioUi = {
 	},
 	closeTitleLiver() {
 		titleLiverOpen = false;
+	},
+
+	get linkImportOpen() {
+		return linkImportOpen;
+	},
+	set linkImportOpen(v: boolean) {
+		linkImportOpen = v;
+	},
+	/** Separate dialog — downloads into cache, then opens in the existing studio timeline. */
+	openLinkImport() {
+		linkImportOpen = true;
+	},
+	closeLinkImport() {
+		linkImportOpen = false;
 	},
 
 	get titleSafeGuides() {

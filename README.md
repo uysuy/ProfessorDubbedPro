@@ -72,6 +72,7 @@ Browse templates by category, edit properties in the right sidebar, preview on t
 ## Features
 
 - **Extract Subs** — local ASR from the audio track (FunASR SenseVoice for Chinese · Whisper.cpp fallback)
+- **Import from Link** — paste a video / channel URL (yt-dlp); optional time range + softsubs / hardsub OCR; opens into the same studio timeline
 - **Translate ZH → KM** — Fast (Azure / Google) or High Quality (DeepSeek / Qwen / Gemini) with slang glossary
 - **Paste Khmer script** — one line per cue; extra lines create new cues (skips auto-translate)
 - **Generate TTS** — Edge Read Aloud Khmer voices (default); optional **VoxCPM2** local engine for more natural KM (`pnpm voxcpm:setup`)
@@ -92,6 +93,7 @@ Browse templates by category, edit properties in the right sidebar, preview on t
 
 ### Unreleased
 
+- **Import from Link** — separate dialog (File → Import from Link…): paste video/channel URL or search name → yt-dlp download into app cache → optional start/end trim → soft/auto subs or hardsub OCR → opens in the existing studio timeline (subtitles, arrangement, Title Liver unchanged)
 - **Title Liver** — live title / lower-third templates (essentials, news, football, cinema), timeline track, right-sidebar properties, keyboard nudge/duplicate, and burned-in export that matches the studio graphic (PNG overlay)
 
 ### v0.2.1 — 2026-08-04
@@ -190,6 +192,8 @@ Video  →  Extract Subs  →  Translate  →  Generate TTS  →  Edit  →  Exp
 | Chinese ASR | **FunASR / SenseVoice** *(recommended)* |
 | Fallback ASR | **whisper.cpp** |
 | Media | **FFmpeg** (auto-downloaded) |
+| URL import | **yt-dlp** (`pnpm ytdlp:download`) |
+| Hardsub OCR (optional) | **RapidOCR** (`pnpm ocr:setup`) |
 
 ---
 
@@ -220,9 +224,13 @@ pnpm install
 # 3. Sidecars (first run may take a few minutes)
 pnpm ffmpeg:download
 pnpm whisper:download
+pnpm ytdlp:download
 
 # 4. Recommended — Chinese ASR
 pnpm funasr:setup
+
+# Optional — burned-in hardsub OCR (Import from Link)
+# pnpm ocr:setup
 
 # 5. Launch desktop studio
 pnpm tauri:dev
