@@ -134,6 +134,100 @@ export interface SpeakerVoiceProfile {
 	videoRefWavPath?: string;
 }
 
+/** Title Liver template ids (lower thirds / cards — not dialogue subs). */
+export type TitleLiverTemplateId =
+	| 'soft-bar'
+	| 'news-strip'
+	| 'speaker-chip'
+	| 'glass-ribbon'
+	| 'dual-stack'
+	| 'ticker-edge'
+	| 'cinema-card'
+	| 'spotlight'
+	| 'luxe-serif'
+	| 'chapter-bump'
+	| 'cobalt-l3rd'
+	| 'between-red'
+	| 'borealis-l3rd'
+	| 'sunset-l3rd'
+	| 'sapphire-l3rd'
+	| 'stratosphere-l3rd'
+	| 'zenith-l3rd'
+	| 'aeronautic-l3rd'
+	| 'news-feed-l3rd'
+	| 'enterprise-l3rd'
+	| 'fb-player-roll'
+	| 'fb-score-bug'
+	| 'fb-lineup'
+	| 'fb-goal-banner'
+	| 'fb-sub-board'
+	/* Expanded library */
+	| 'pill-badge'
+	| 'minimal-rule'
+	| 'podcast-tag'
+	| 'location-pin'
+	| 'outline-stroke'
+	| 'split-duo'
+	| 'ribbon-fold'
+	| 'gradient-wash'
+	| 'moire-band'
+	| 'neon-frame'
+	| 'social-handle'
+	| 'kinetic-stack'
+	| 'glitch-pop'
+	| 'breaking-slash'
+	| 'anchor-desk'
+	| 'countdown-bug'
+	| 'bracket-title'
+	| 'quote-card'
+	| 'whisper-serif'
+	| 'end-slate'
+	| 'fb-corner-clock'
+	| 'fb-possession'
+	| 'fb-org-chart'
+	| 'live-alert'
+	| 'corner-bug';
+
+/** Gallery category (Filmora / CapCut–style browser). */
+export type TitleLiverCategoryId =
+	| 'all'
+	| 'essentials'
+	| 'broadcast'
+	| 'filmora'
+	| 'capcut'
+	| 'football'
+	| 'cinema';
+
+/** Timed Title Liver graphic on the picture (separate from SubtitleCue). */
+export interface TitleLiverClip {
+	id: string;
+	templateId: TitleLiverTemplateId;
+	startMs: number;
+	endMs: number;
+	/** Primary line (name / title). */
+	line1: string;
+	/** Secondary line (role / location). */
+	line2: string;
+	/** Optional third line (roster names, kicker, etc.). */
+	line3: string;
+	/** Accent color (hex). */
+	accent: string;
+	/** Anchor X in picture (0–1), same space as subtitle style. */
+	x: number;
+	/** Anchor Y in picture (0–1). */
+	y: number;
+	fontFamily: string;
+	fontFile?: string | null;
+	/** Design font size at 720p tall (preview scales like subtitles). */
+	fontSizePx: number;
+	/** Black outline thickness in design px. */
+	outlineWidth: number;
+	/** Whole-graphic scale (0.5–2). */
+	scale: number;
+	/** Max width as fraction of picture width (0.25–0.98). */
+	maxWidthPct: number;
+}
+
 export interface DubbingProject {
 	id: string;
 	name: string;
@@ -155,6 +249,8 @@ export interface DubbingProject {
 	subtitleStyle: SubtitleStyle;
 	/** Per-speaker voice presets, gender, and optional locked clone sample. */
 	speakerBank: SpeakerVoiceProfile[];
+	/** Title Liver graphics (lower thirds / cards) — not dialogue subtitles. */
+	titleLiverClips: TitleLiverClip[];
 	updatedAt: string;
 }
 

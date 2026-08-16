@@ -4,6 +4,7 @@
 	import { Separator } from '$lib/components/ui/separator/index.js';
 	import { Progress } from '$lib/components/ui/progress/index.js';
 	import VoiceSelect from '$lib/components/studio/VoiceSelect.svelte';
+	import TitleLiverProperties from '$lib/components/studio/TitleLiverProperties.svelte';
 	import { projectStore } from '$lib/stores/project.svelte';
 	import { dndStore } from '$lib/stores/dnd.svelte';
 	import { tempoStore } from '$lib/stores/tempo.svelte';
@@ -14,6 +15,7 @@
 	import { AudioLines, LoaderCircle, PanelRightClose, Settings2, Sparkles } from '@lucide/svelte';
 
 	const selectedCount = $derived(projectStore.selectedCueIds.length);
+	const titleLiverClip = $derived(projectStore.selectedTitleLiver);
 	const busy = $derived(projectStore.isGenerating);
 	const engineId = $derived(preferencesStore.ttsEngine);
 	const engineLabel = $derived(
@@ -77,9 +79,11 @@
 
 <aside class="voice-mix flex h-full min-h-0 flex-col bg-transparent text-sidebar-foreground">
 	<div class="panel-header">
-		<span>Voice & Mix</span>
+		<span>{titleLiverClip ? 'Live Title' : 'Voice & Mix'}</span>
 		<div class="flex items-center gap-1.5">
-			<span class="normal-case tracking-normal">{selectedCount} selected</span>
+			<span class="normal-case tracking-normal">
+				{titleLiverClip ? titleLiverClip.line1 || 'Untitled' : `${selectedCount} selected`}
+			</span>
 			<Button
 				variant="ghost"
 				size="icon-xs"
@@ -92,6 +96,9 @@
 	</div>
 
 	<div class="min-h-0 flex-1 space-y-2.5 overflow-auto p-2.5">
+		{#if titleLiverClip}
+			<TitleLiverProperties />
+		{:else}
 		<section
 			class="flex items-center justify-between gap-2 rounded-md border border-border/70 bg-card p-2 shadow-[var(--elevation-panel)]"
 		>
@@ -183,8 +190,10 @@
 				<Progress value={projectStore.generateProgress} max={100} class="h-1.5" />
 			</div>
 		{/if}
+		{/if}
 	</div>
 
+	{#if !titleLiverClip}
 	<div
 		class="generate-dock shrink-0 space-y-2 border-t border-border/80 bg-card/90 px-2.5 pt-2.5 pb-3 shadow-[0_-6px_18px_oklch(0.4_0.04_265/6%)]"
 	>
@@ -221,6 +230,7 @@
 			{generateStatus}
 		</p>
 	</div>
+	{/if}
 </aside>
 
 <style>

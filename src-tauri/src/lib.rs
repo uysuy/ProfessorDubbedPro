@@ -31,6 +31,7 @@ pub fn run() {
 			export::begin_staged_file,
 			export::append_staged_file,
 			export::cleanup_staged_file,
+			export::probe_export_video_size,
 			fonts::list_system_fonts,
 			media_tempo::remaster_video_tempo,
 			media_tempo::cancel_video_tempo,

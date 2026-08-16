@@ -61,6 +61,12 @@ Real app UI — works on GitHub.com and the GitHub mobile app (images scale to y
 
 ![ProfessorDubbedPro timeline editor](docs/studio-timeline.png)
 
+### Title Liver — live titles & lower thirds
+
+Browse templates by category, edit properties in the right sidebar, preview on the program monitor, and burn the same graphic into export.
+
+![ProfessorDubbedPro Title Liver](docs/title_Liver_Feature.png)
+
 ---
 
 ## Features
@@ -70,11 +76,12 @@ Real app UI — works on GitHub.com and the GitHub mobile app (images scale to y
 - **Paste Khmer script** — one line per cue; extra lines create new cues (skips auto-translate)
 - **Generate TTS** — Edge Read Aloud Khmer voices (default); optional **VoxCPM2** local engine for more natural KM (`pnpm voxcpm:setup`)
 - **Detect Speakers + Lock voice** — neural diarization (Speaker 1…N + gender), then lock each actor to a Khmer VoxCPM preset sample so Generate stays consistent
+- **Title Liver** — live titles / lower thirds (news, football, cinema packs); drag on preview; preview-matched burn-in on export
 - **Tighten silent gaps** — packs TTS back-to-back (~0.1s breath); drops long Chinese ASR dead air
 - **Tempo / Fit video to dub** — pitch-safe stretch or shorten so picture length matches Khmer TTS
 - **Original Audio mixer** — mute / volume fader on the timeline (preview + export mix)
 - **Studio** — timeline, preview, subtitle table, project save
-- **Export** — `.srt`, soft-sub video, or burn-in with system/Khmer fonts (preview-matched wrap + position) and TTS + original mix
+- **Export** — `.srt`, soft-sub video, or burn-in with system/Khmer fonts (preview-matched wrap + position), Title Liver overlays, and TTS + original mix
 
 > **v0.2.1** — Preview-matched Khmer burn-in wrap, subtitle styling, Fit video to dub both ways, optional VoxCPM2 TTS.  
 > See [Changelog](#changelog).
@@ -82,6 +89,10 @@ Real app UI — works on GitHub.com and the GitHub mobile app (images scale to y
 ---
 
 ## Changelog
+
+### Unreleased
+
+- **Title Liver** — live title / lower-third templates (essentials, news, football, cinema), timeline track, right-sidebar properties, keyboard nudge/duplicate, and burned-in export that matches the studio graphic (PNG overlay)
 
 ### v0.2.1 — 2026-08-04
 

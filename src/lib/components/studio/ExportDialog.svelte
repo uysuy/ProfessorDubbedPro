@@ -31,9 +31,15 @@
 		projectStore.current.cues.filter((c) => Boolean(c.assignedAudio?.filePath?.trim())).length
 	);
 	const originalGain = $derived(projectStore.originalAudioEffectiveGain);
+	const titleLiverCount = $derived((projectStore.current.titleLiverClips ?? []).length);
 	const hasVideo = $derived(Boolean(projectStore.videoUrl));
 	const needsVideo = $derived(mode === 'videoSoftSubs' || mode === 'videoBurnedIn');
-	const canExport = $derived(exportableCount > 0 && !busy && (mode === 'srt' || hasVideo));
+	const canExport = $derived(
+		!busy &&
+			(mode === 'srt'
+				? exportableCount > 0
+				: hasVideo && (exportableCount > 0 || (mode === 'videoBurnedIn' && titleLiverCount > 0)))
+	);
 
 	/** Export mirrors Align state — same rate / play-through as preview (no re-tempo). */
 	function collectDubClips() {
@@ -86,6 +92,7 @@
 				originalAudioGain: projectStore.originalAudioEffectiveGain,
 				dubClips: collectDubClips(),
 				subtitleStyle: projectStore.current.subtitleStyle,
+				titleLiverClips: projectStore.current.titleLiverClips ?? [],
 				onStatus: (msg) => {
 					status = msg;
 				}
@@ -95,7 +102,7 @@
 				result.mode === 'srt'
 					? 'Subtitles exported'
 					: result.mode === 'videoBurnedIn'
-						? 'Video exported with burned-in subtitles'
+						? 'Video exported with burned-in titles & subtitles'
 						: 'Video exported with soft subtitles';
 			dndStore.flash(label);
 		} catch (err) {

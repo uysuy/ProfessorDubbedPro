@@ -128,6 +128,18 @@ pub struct ExportProjectArgs {
 	/// Preview-matched burn-in look (font / size / position).
 	#[serde(default)]
 	pub subtitle_style: Option<ExportSubtitleStyle>,
+	/// Title Liver / live title clips to burn in (video burned-in mode).
+	#[serde(default)]
+	pub title_liver_clips: Option<Vec<ExportTitleLiverClip>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportTitleLiverClip {
+	/// Full-frame transparent PNG (preview-matched graphic), absolute path.
+	pub png_path: String,
+	pub start_ms: u64,
+	pub end_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -964,10 +976,58 @@ fn write_burn_in_ass(
 	let mut style = style.clone();
 	style.font_family = family;
 	let (w, h) = probe_video_size(ffmpeg, video_path);
+	// Title Liver is burned via PNG overlay (preview-matched), not ASS text.
 	let ass = srt_to_preview_ass(&srt, &style, w, h);
 	let ass_path = srt_dir.join("burnin.ass");
 	write_utf8_file(&ass_path, &ass)?;
 	Ok((fonts_dir, ass_path))
+}
+
+/// Copy Title Liver PNGs into `work` as short names for FFmpeg `movie=` filters.
+fn stage_title_liver_pngs(
+	work: &Path,
+	clips: &[ExportTitleLiverClip],
+) -> Result<Vec<(String, f64, f64)>, String> {
+	let mut out = Vec::new();
+	for (i, clip) in clips.iter().enumerate() {
+		if clip.end_ms <= clip.start_ms {
+			continue;
+		}
+		let src = PathBuf::from(&clip.png_path);
+		if !src.is_file() {
+			return Err(format!("Title Liver PNG missing: {}", clip.png_path));
+		}
+		let name = format!("tl{i}.png");
+		let dest = work.join(&name);
+		fs::copy(&src, &dest).map_err(|e| format!("Could not stage Title Liver PNG: {e}"))?;
+		out.push((
+			name,
+			clip.start_ms as f64 / 1000.0,
+			clip.end_ms as f64 / 1000.0,
+		));
+	}
+	Ok(out)
+}
+
+/// Append full-frame PNG overlays after `from_label` (no brackets). Returns final label.
+fn title_liver_overlay_filters(
+	from_label: &str,
+	staged: &[(String, f64, f64)],
+) -> (Vec<String>, String) {
+	let mut filters = Vec::new();
+	let mut cur = from_label.to_string();
+	for (i, (name, start_s, end_s)) in staged.iter().enumerate() {
+		let tl = format!("tl{i}");
+		let next = format!("vtl{i}");
+		filters.push(format!(
+			"movie={name}:loop=0,format=rgba,setpts=PTS-STARTPTS[{tl}]"
+		));
+		filters.push(format!(
+			"[{cur}][{tl}]overlay=0:0:format=auto:eof_action=pass:enable='between(t,{start_s:.3},{end_s:.3})'[{next}]"
+		));
+		cur = next;
+	}
+	(filters, cur)
 }
 
 /// Burn SRT into the picture (always visible — matches studio preview).
@@ -977,6 +1037,7 @@ fn burn_in_subtitles(
 	srt_path: &Path,
 	output_path: &Path,
 	style: &ExportSubtitleStyle,
+	title_liver: &[ExportTitleLiverClip],
 ) -> Result<(), String> {
 	let ffmpeg = find_ffmpeg(app)?;
 	ensure_parent_dir(output_path)?;
@@ -989,33 +1050,75 @@ fn burn_in_subtitles(
 
 	let (fonts_dir, ass_path) =
 		write_burn_in_ass(app, &ffmpeg, video_path, srt_path, &srt_dir, style)?;
-	let vf = burn_in_ass_filter(&ass_path, &fonts_dir);
+	let staged_tl = stage_title_liver_pngs(&srt_dir, title_liver)?;
 
-	let status = Command::new(&ffmpeg)
-		.current_dir(&srt_dir)
-		.args([
-			"-hide_banner",
-			"-y",
-			"-i",
-			&ffmpeg_path_arg(video_path),
-			"-vf",
-			&vf,
-			"-c:v",
-			"libx264",
-			"-preset",
-			"medium",
-			"-crf",
-			"16",
-			"-pix_fmt",
-			"yuv420p",
-			"-c:a",
-			"copy",
-			"-movflags",
-			"+faststart",
-			&ffmpeg_path_arg(output_path),
-		])
-		.output()
-		.map_err(|e| format!("Failed to start FFmpeg: {e}"))?;
+	let status = if staged_tl.is_empty() {
+		let vf = burn_in_ass_filter(&ass_path, &fonts_dir);
+		Command::new(&ffmpeg)
+			.current_dir(&srt_dir)
+			.args([
+				"-hide_banner",
+				"-y",
+				"-i",
+				&ffmpeg_path_arg(video_path),
+				"-vf",
+				&vf,
+				"-c:v",
+				"libx264",
+				"-preset",
+				"medium",
+				"-crf",
+				"16",
+				"-pix_fmt",
+				"yuv420p",
+				"-c:a",
+				"copy",
+				"-movflags",
+				"+faststart",
+				&ffmpeg_path_arg(output_path),
+			])
+			.output()
+			.map_err(|e| format!("Failed to start FFmpeg: {e}"))?
+	} else {
+		let sub = burn_in_ass_filter(&ass_path, &fonts_dir);
+		let mut filters = vec![format!("[0:v]{sub}[vsub]")];
+		let (more, final_label) = title_liver_overlay_filters("vsub", &staged_tl);
+		filters.extend(more);
+		if final_label != "vout" {
+			filters.push(format!("[{final_label}]null[vout]"));
+		}
+		let fc = filters.join(";");
+		let script = write_filter_complex_script(&srt_dir, &fc)?;
+		Command::new(&ffmpeg)
+			.current_dir(&srt_dir)
+			.args([
+				"-hide_banner",
+				"-y",
+				"-i",
+				&ffmpeg_path_arg(video_path),
+				"-filter_complex_script",
+				&script,
+				"-map",
+				"[vout]",
+				"-map",
+				"0:a?",
+				"-c:v",
+				"libx264",
+				"-preset",
+				"medium",
+				"-crf",
+				"16",
+				"-pix_fmt",
+				"yuv420p",
+				"-c:a",
+				"copy",
+				"-movflags",
+				"+faststart",
+				&ffmpeg_path_arg(output_path),
+			])
+			.output()
+			.map_err(|e| format!("Failed to start FFmpeg: {e}"))?
+	};
 
 	if status.status.success() {
 		return Ok(());
@@ -1160,6 +1263,7 @@ fn export_video_with_audio_mix(
 	original_gain: f64,
 	clips: &[ExportDubClip],
 	style: &ExportSubtitleStyle,
+	title_liver: &[ExportTitleLiverClip],
 ) -> Result<(), String> {
 	export_video_with_audio_mix_inner(
 		app,
@@ -1170,6 +1274,7 @@ fn export_video_with_audio_mix(
 		original_gain,
 		clips,
 		style,
+		title_liver,
 		true,
 	)
 }
@@ -1184,6 +1289,7 @@ fn export_video_with_audio_mix_legacy(
 	original_gain: f64,
 	clips: &[ExportDubClip],
 	style: &ExportSubtitleStyle,
+	title_liver: &[ExportTitleLiverClip],
 ) -> Result<(), String> {
 	export_video_with_audio_mix_inner(
 		app,
@@ -1194,6 +1300,7 @@ fn export_video_with_audio_mix_legacy(
 		original_gain,
 		clips,
 		style,
+		title_liver,
 		false,
 	)
 }
@@ -1207,6 +1314,7 @@ fn export_video_with_audio_mix_inner(
 	original_gain: f64,
 	clips: &[ExportDubClip],
 	style: &ExportSubtitleStyle,
+	title_liver: &[ExportTitleLiverClip],
 	adelay_all: bool,
 ) -> Result<(), String> {
 	let ffmpeg = find_ffmpeg(app)?;
@@ -1271,16 +1379,24 @@ fn export_video_with_audio_mix_inner(
 
 	let (fonts_dir, ass_path) =
 		write_burn_in_ass(app, &ffmpeg, video_path, srt_path, &srt_dir, style)?;
+	let staged_tl = stage_title_liver_pngs(&work, title_liver)?;
 
 	match mode {
 		ExportMode::VideoBurnedIn => {
 			let sub = burn_in_ass_filter(&ass_path, &fonts_dir);
-			let vchain = if pad_sec > 0.05 {
-				format!("[0:v]{sub},tpad=stop_mode=clone:stop_duration={pad_sec:.3}[vout]")
-			} else {
-				format!("[0:v]{sub}[vout]")
-			};
-			filters.insert(0, vchain);
+			let mut vfilters = vec![format!("[0:v]{sub}[vsub]")];
+			let (more, vlabel) = title_liver_overlay_filters("vsub", &staged_tl);
+			vfilters.extend(more);
+			if pad_sec > 0.05 {
+				vfilters.push(format!(
+					"[{vlabel}]tpad=stop_mode=clone:stop_duration={pad_sec:.3}[vout]"
+				));
+			} else if vlabel != "vout" {
+				vfilters.push(format!("[{vlabel}]null[vout]"));
+			}
+			for (i, f) in vfilters.into_iter().enumerate() {
+				filters.insert(i, f);
+			}
 			let fc = filters.join(";");
 			let script = write_filter_complex_script(&work, &fc)?;
 			cmd.args([
@@ -1371,6 +1487,7 @@ fn export_video_with_audio_mix_inner(
 			original_gain,
 			clips,
 			style,
+			title_liver,
 		);
 	}
 	Err(err)
@@ -1385,6 +1502,7 @@ fn export_video_gain_only(
 	output_path: &Path,
 	original_gain: f64,
 	style: &ExportSubtitleStyle,
+	title_liver: &[ExportTitleLiverClip],
 ) -> Result<(), String> {
 	let ffmpeg = find_ffmpeg(app)?;
 	ensure_parent_dir(output_path)?;
@@ -1409,28 +1527,67 @@ fn export_video_gain_only(
 		ExportMode::VideoBurnedIn => {
 			let (fonts_dir, ass_path) =
 				write_burn_in_ass(app, &ffmpeg, video_path, srt_path, &srt_dir, style)?;
-			let vf = burn_in_ass_filter(&ass_path, &fonts_dir);
-			cmd.args([
-				"-vf",
-				&vf,
-				"-af",
-				&format!("volume={gain:.4}"),
-				"-c:v",
-				"libx264",
-				"-preset",
-				"medium",
-				"-crf",
-				"16",
-				"-pix_fmt",
-				"yuv420p",
-				"-c:a",
-				"aac",
-				"-b:a",
-				"192k",
-				"-movflags",
-				"+faststart",
-				&ffmpeg_path_arg(output_path),
-			]);
+			let staged_tl = stage_title_liver_pngs(&srt_dir, title_liver)?;
+			if staged_tl.is_empty() {
+				let vf = burn_in_ass_filter(&ass_path, &fonts_dir);
+				cmd.args([
+					"-vf",
+					&vf,
+					"-af",
+					&format!("volume={gain:.4}"),
+					"-c:v",
+					"libx264",
+					"-preset",
+					"medium",
+					"-crf",
+					"16",
+					"-pix_fmt",
+					"yuv420p",
+					"-c:a",
+					"aac",
+					"-b:a",
+					"192k",
+					"-movflags",
+					"+faststart",
+					&ffmpeg_path_arg(output_path),
+				]);
+			} else {
+				let sub = burn_in_ass_filter(&ass_path, &fonts_dir);
+				let mut filters = vec![
+					format!("[0:v]{sub}[vsub]"),
+					format!("[0:a]volume={gain:.4}[aout]"),
+				];
+				let (more, final_label) = title_liver_overlay_filters("vsub", &staged_tl);
+				filters.extend(more);
+				if final_label != "vout" {
+					filters.push(format!("[{final_label}]null[vout]"));
+				}
+				let fc = filters.join(";");
+				let script = write_filter_complex_script(&srt_dir, &fc)?;
+				cmd.args([
+					"-filter_complex_script",
+					&script,
+					"-map",
+					"[vout]",
+					"-map",
+					"[aout]",
+					"-c:v",
+					"libx264",
+					"-preset",
+					"medium",
+					"-crf",
+					"16",
+					"-pix_fmt",
+					"yuv420p",
+					"-c:a",
+					"aac",
+					"-b:a",
+					"192k",
+					"-movflags",
+					"+faststart",
+					&ffmpeg_path_arg(output_path),
+				]);
+			}
 		}
 		ExportMode::VideoSoftSubs => {
 			cmd.args(["-i", &ffmpeg_path_arg(srt_path)]);
@@ -1494,6 +1651,12 @@ fn safe_file_name(file_name: &str) -> &str {
 		.unwrap_or("staged.bin")
 }
 
+#[tauri::command]
+pub fn probe_export_video_size(app: AppHandle, video_path: String) -> Result<(u32, u32), String> {
+	let ffmpeg = find_ffmpeg(&app)?;
+	Ok(probe_video_size(&ffmpeg, Path::new(&video_path)))
+}
+
 /// Create an empty staging file; frontend appends chunks (avoids huge IPC payloads).
 #[tauri::command]
 pub fn begin_staged_file(app: AppHandle, file_name: String) -> Result<String, String> {
@@ -1546,8 +1709,14 @@ pub fn cleanup_staged_file(path: String) -> Result<(), String> {
 /// Export subtitles and/or mux soft subtitles into an MP4 via bundled/system FFmpeg.
 #[tauri::command]
 pub fn export_project(app: AppHandle, args: ExportProjectArgs) -> Result<ExportProjectResult, String> {
-	if args.srt_content.trim().is_empty() {
-		return Err("No subtitle cues to export. Add translation text first.".into());
+	if args.srt_content.trim().is_empty()
+		&& args
+			.title_liver_clips
+			.as_ref()
+			.map(|c| c.is_empty())
+			.unwrap_or(true)
+	{
+		return Err("No subtitle cues or live titles to export.".into());
 	}
 
 	let output = PathBuf::from(&args.output_path);
@@ -1557,6 +1726,9 @@ pub fn export_project(app: AppHandle, args: ExportProjectArgs) -> Result<ExportP
 
 	match args.mode {
 		ExportMode::Srt => {
+			if args.srt_content.trim().is_empty() {
+				return Err("No subtitle cues to export. Add translation text first.".into());
+			}
 			write_utf8_file(&output, &args.srt_content)?;
 			Ok(ExportProjectResult {
 				output_path: args.output_path,
@@ -1567,6 +1739,7 @@ pub fn export_project(app: AppHandle, args: ExportProjectArgs) -> Result<ExportP
 			let video = require_video_path(&args.video_path)?;
 			let gain = clamp_gain(args.original_audio_gain.unwrap_or(1.0));
 			let clips: Vec<ExportDubClip> = args.dub_clips.unwrap_or_default();
+			let title_liver: Vec<ExportTitleLiverClip> = args.title_liver_clips.unwrap_or_default();
 
 			// ASCII-only temp name avoids FFmpeg filter path issues with Unicode folders.
 			let tmp_dir = export_temp_dir(&app)?;
@@ -1577,16 +1750,31 @@ pub fn export_project(app: AppHandle, args: ExportProjectArgs) -> Result<ExportP
 					.map(|d| d.as_millis())
 					.unwrap_or(0)
 			));
-			write_utf8_file(&srt_tmp, &args.srt_content)?;
+			let srt_body = if args.srt_content.trim().is_empty() {
+				"1\n00:00:00,000 --> 00:00:00,040\n \n\n".to_string()
+			} else {
+				args.srt_content.clone()
+			};
+			write_utf8_file(&srt_tmp, &srt_body)?;
 
 			let style = args.subtitle_style.clone().unwrap_or_default();
 
 			let result = if needs_audio_remix(gain, &clips) {
 				if clips.is_empty() {
-					export_video_gain_only(&app, &args.mode, &video, &srt_tmp, &output, gain, &style)
+					export_video_gain_only(
+						&app, &args.mode, &video, &srt_tmp, &output, gain, &style, &title_liver,
+					)
 				} else {
 					export_video_with_audio_mix(
-						&app, &args.mode, &video, &srt_tmp, &output, gain, &clips, &style,
+						&app,
+						&args.mode,
+						&video,
+						&srt_tmp,
+						&output,
+						gain,
+						&clips,
+						&style,
+						&title_liver,
 					)
 				}
 				.map(|_| match args.mode {
@@ -1604,10 +1792,10 @@ pub fn export_project(app: AppHandle, args: ExportProjectArgs) -> Result<ExportP
 						}
 						mux.map(|_| "videoSoftSubs")
 					}
-					ExportMode::VideoBurnedIn => {
-						burn_in_subtitles(&app, &video, &srt_tmp, &output, &style)
-							.map(|_| "videoBurnedIn")
-					}
+					ExportMode::VideoBurnedIn => burn_in_subtitles(
+						&app, &video, &srt_tmp, &output, &style, &title_liver,
+					)
+					.map(|_| "videoBurnedIn"),
 					ExportMode::Srt => unreachable!(),
 				}
 			};

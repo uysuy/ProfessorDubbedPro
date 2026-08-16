@@ -10,6 +10,7 @@ export type TimelineTool = 'select' | 'blade';
 type TrackFlags = Record<TimelineTrackKind, boolean>;
 
 const ALL_VISIBLE: TrackFlags = {
+	titleLiver: true,
 	video: true,
 	subtitles: true,
 	tts: true,
@@ -17,6 +18,7 @@ const ALL_VISIBLE: TrackFlags = {
 };
 
 const NO_SOLO: TrackFlags = {
+	titleLiver: false,
 	video: false,
 	subtitles: false,
 	tts: false,
@@ -28,9 +30,12 @@ let snapEnabled = $state(true);
 let tool = $state<TimelineTool>('select');
 let visibility = $state<TrackFlags>({ ...ALL_VISIBLE });
 let solo = $state<TrackFlags>({ ...NO_SOLO });
+let locked = $state<TrackFlags>({ ...NO_SOLO });
 
 function anySolo(): boolean {
-	return solo.video || solo.subtitles || solo.tts || solo.original;
+	return (
+		solo.titleLiver || solo.video || solo.subtitles || solo.tts || solo.original
+	);
 }
 
 export const timelineUi = {
@@ -65,11 +70,18 @@ export const timelineUi = {
 	get solo() {
 		return solo;
 	},
+	get locked() {
+		return locked;
+	},
 
 	isTrackShown(kind: TimelineTrackKind): boolean {
 		if (!visibility[kind]) return false;
 		if (anySolo() && !solo[kind]) return false;
 		return true;
+	},
+
+	isTrackLocked(kind: TimelineTrackKind): boolean {
+		return Boolean(locked[kind]);
 	},
 
 	toggleVisible(kind: TimelineTrackKind) {
@@ -80,6 +92,10 @@ export const timelineUi = {
 		}
 	},
 
+	toggleLocked(kind: TimelineTrackKind) {
+		locked = { ...locked, [kind]: !locked[kind] };
+	},
+
 	toggleSolo(kind: TimelineTrackKind) {
 		const next = !solo[kind];
 		solo = { ...solo, [kind]: next };
@@ -88,11 +104,23 @@ export const timelineUi = {
 		}
 	},
 
-	/** Resolve-like arrange: hide TTS, keep Video + Subs + Original, snap on, select tool. */
+	/** Resolve-like arrange: hide TTS, keep Title Liver + Video + Subs + Original. */
 	enterArrangeMode() {
 		arrangeMode = true;
-		visibility = { video: true, subtitles: true, tts: false, original: true };
-		solo = { video: true, subtitles: true, tts: false, original: true };
+		visibility = {
+			titleLiver: true,
+			video: true,
+			subtitles: true,
+			tts: false,
+			original: true
+		};
+		solo = {
+			titleLiver: true,
+			video: true,
+			subtitles: true,
+			tts: false,
+			original: true
+		};
 		snapEnabled = true;
 		tool = 'select';
 		return true;

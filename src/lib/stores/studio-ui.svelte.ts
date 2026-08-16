@@ -10,6 +10,9 @@ let subtitleTab = $state<SubtitleDialogTab>('paste');
 let tempoOpen = $state(false);
 let voiceEngineOpen = $state(false);
 let prosodyOpen = $state(false);
+let titleLiverOpen = $state(false);
+/** Title-safe / action-safe overlays on the program monitor. */
+let titleSafeGuides = $state(false);
 
 let scriptDraft = $state('');
 let scriptFeedback = $state<string | null>(null);
@@ -62,6 +65,30 @@ export const studioUi = {
 	},
 	openProsody() {
 		prosodyOpen = true;
+	},
+
+	get titleLiverOpen() {
+		return titleLiverOpen;
+	},
+	set titleLiverOpen(v: boolean) {
+		titleLiverOpen = v;
+	},
+	/** Non-modal panel — stays open while editing timeline / preview. */
+	openTitleLiver() {
+		titleLiverOpen = true;
+	},
+	closeTitleLiver() {
+		titleLiverOpen = false;
+	},
+
+	get titleSafeGuides() {
+		return titleSafeGuides;
+	},
+	set titleSafeGuides(v: boolean) {
+		titleSafeGuides = v;
+	},
+	toggleTitleSafeGuides() {
+		titleSafeGuides = !titleSafeGuides;
 	},
 
 	get scriptDraft() {

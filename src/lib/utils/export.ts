@@ -10,6 +10,7 @@ import {
 } from '$lib/utils/khmer-wrap';
 import { isTauriRuntime } from '$lib/utils/platform';
 import { cuesToSrt } from '$lib/utils/srt';
+import { renderTitleLiverOverlays } from '$lib/utils/title-liver-export';
 
 export type ExportMode = 'srt' | 'videoSoftSubs' | 'videoBurnedIn';
 
@@ -72,6 +73,8 @@ export type RunExportOptions = {
 	dubClips?: ExportDubClip[];
 	/** Preview-matched burn-in style (font / size / position). */
 	subtitleStyle?: SubtitleStyle | null;
+	/** Title Liver clips burned into video (burned-in mode). */
+	titleLiverClips?: import('$lib/types/project').TitleLiverClip[] | null;
 	onStatus?: (message: string) => void;
 };
 
@@ -109,7 +112,11 @@ export async function runProjectExport(opts: RunExportOptions): Promise<ExportPr
 		srtContent = cuesToSrt(opts.cues);
 	}
 	if (!srtContent.trim()) {
-		throw new Error('No subtitle cues to export. Add translation text first.');
+		const hasTitles = (opts.titleLiverClips ?? []).length > 0;
+		if (!(opts.mode === 'videoBurnedIn' && hasTitles)) {
+			throw new Error('No subtitle cues to export. Add translation text first.');
+		}
+		srtContent = '1\n00:00:00,000 --> 00:00:00,040\n \n\n';
 	}
 
 	const safeBase =
@@ -149,6 +156,7 @@ export async function runProjectExport(opts: RunExportOptions): Promise<ExportPr
 	}
 
 	let stagedPath: string | null = null;
+	let stagedTitlePngs: string[] = [];
 	let videoPath = opts.videoPath?.trim() || null;
 
 	try {
@@ -186,6 +194,16 @@ export async function runProjectExport(opts: RunExportOptions): Promise<ExportPr
 			opts.onStatus?.('Writing SRT…');
 		}
 
+		let titleLiverOverlays: Array<{ pngPath: string; startMs: number; endMs: number }> = [];
+		if (video && opts.mode === 'videoBurnedIn' && videoPath) {
+			const tlClips = opts.titleLiverClips ?? [];
+			if (tlClips.length) {
+				titleLiverOverlays = await renderTitleLiverOverlays(tlClips, videoPath, opts.onStatus);
+				stagedTitlePngs = titleLiverOverlays.map((o) => o.pngPath);
+			}
+			opts.onStatus?.('Burning subtitles & live titles into video…');
+		}
+
 		const result = await invoke<ExportProjectResult>('export_project', {
 			args: {
 				mode: opts.mode,
@@ -217,7 +235,8 @@ export async function runProjectExport(opts: RunExportOptions): Promise<ExportPr
 					look: style.look ?? 'outline',
 					maxWidthPct: style.maxWidthPct ?? 0.96,
 					outlineWidth: style.outlineWidth ?? 1
-				}
+				},
+				titleLiverClips: titleLiverOverlays
 			}
 		});
 
@@ -226,6 +245,9 @@ export async function runProjectExport(opts: RunExportOptions): Promise<ExportPr
 	} finally {
 		if (stagedPath) {
 			await invoke('cleanup_staged_file', { path: stagedPath }).catch(() => undefined);
+		}
+		for (const p of stagedTitlePngs) {
+			await invoke('cleanup_staged_file', { path: p }).catch(() => undefined);
 		}
 	}
 }

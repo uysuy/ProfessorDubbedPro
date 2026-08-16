@@ -5,9 +5,12 @@ import type {
 	MediaKind,
 	SpeakerVoiceProfile,
 	SubtitleCue,
-	SubtitleStyle
+	SubtitleStyle,
+	TitleLiverClip,
+	TitleLiverTemplateId
 } from '$lib/types/project';
 import { DEFAULT_SUBTITLE_STYLE } from '$lib/types/project';
+import { createTitleLiverClip } from '$lib/utils/title-liver';
 import { DEFAULT_EDGE_VOICE_ID } from '$lib/tts/edge-voices';
 import { voiceIdForEngineGender } from '$lib/tts/voice-engine';
 import type { TtsEngineId } from '$lib/tts/types';
@@ -93,6 +96,7 @@ export function createEmptyProject(
 		cues: [],
 		subtitleStyle: { ...DEFAULT_SUBTITLE_STYLE },
 		speakerBank: [],
+		titleLiverClips: [],
 		updatedAt: new Date().toISOString()
 	};
 }
@@ -255,6 +259,98 @@ export function voiceIdForSpeakerGender(
 	return voiceIdForEngineGender(eng, gender) || DEFAULT_EDGE_VOICE_ID;
 }
 
+function normalizeTitleLiverClips(raw: unknown): TitleLiverClip[] {
+	if (!Array.isArray(raw)) return [];
+	const out: TitleLiverClip[] = [];
+	const valid: TitleLiverTemplateId[] = [
+		'soft-bar',
+		'news-strip',
+		'speaker-chip',
+		'glass-ribbon',
+		'dual-stack',
+		'ticker-edge',
+		'cinema-card',
+		'spotlight',
+		'luxe-serif',
+		'chapter-bump',
+		'cobalt-l3rd',
+		'between-red',
+		'borealis-l3rd',
+		'sunset-l3rd',
+		'sapphire-l3rd',
+		'stratosphere-l3rd',
+		'zenith-l3rd',
+		'aeronautic-l3rd',
+		'news-feed-l3rd',
+		'enterprise-l3rd',
+		'fb-player-roll',
+		'fb-score-bug',
+		'fb-lineup',
+		'fb-goal-banner',
+		'fb-sub-board',
+		'pill-badge',
+		'minimal-rule',
+		'podcast-tag',
+		'location-pin',
+		'outline-stroke',
+		'split-duo',
+		'ribbon-fold',
+		'gradient-wash',
+		'moire-band',
+		'neon-frame',
+		'social-handle',
+		'kinetic-stack',
+		'glitch-pop',
+		'breaking-slash',
+		'anchor-desk',
+		'countdown-bug',
+		'bracket-title',
+		'quote-card',
+		'whisper-serif',
+		'end-slate',
+		'fb-corner-clock',
+		'fb-possession',
+		'fb-org-chart',
+		'live-alert',
+		'corner-bug'
+	];
+	for (const item of raw) {
+		if (!item || typeof item !== 'object') continue;
+		const o = item as Record<string, unknown>;
+		const id = typeof o.id === 'string' ? o.id.trim() : '';
+		if (!id) continue;
+		const templateRaw = typeof o.templateId === 'string' ? o.templateId : 'soft-bar';
+		const templateId = (valid.includes(templateRaw as TitleLiverTemplateId)
+			? templateRaw
+			: 'soft-bar') as TitleLiverTemplateId;
+		const startMs = Number.isFinite(Number(o.startMs)) ? Math.max(0, Math.round(Number(o.startMs))) : 0;
+		const endMs = Number.isFinite(Number(o.endMs))
+			? Math.max(startMs + 400, Math.round(Number(o.endMs)))
+			: startMs + 4000;
+		out.push(
+			createTitleLiverClip({
+				id,
+				templateId,
+				startMs,
+				endMs,
+				line1: typeof o.line1 === 'string' ? o.line1 : 'Speaker name',
+				line2: typeof o.line2 === 'string' ? o.line2 : 'Role or title',
+				line3: typeof o.line3 === 'string' ? o.line3 : '',
+				accent: typeof o.accent === 'string' && o.accent.trim() ? o.accent.trim() : '#7c3aed',
+				x: Number.isFinite(Number(o.x)) ? Number(o.x) : undefined,
+				y: Number.isFinite(Number(o.y)) ? Number(o.y) : undefined,
+				fontFamily: typeof o.fontFamily === 'string' ? o.fontFamily : undefined,
+				fontFile: typeof o.fontFile === 'string' ? o.fontFile : o.fontFile === null ? null : undefined,
+				fontSizePx: Number.isFinite(Number(o.fontSizePx)) ? Number(o.fontSizePx) : undefined,
+				outlineWidth: Number.isFinite(Number(o.outlineWidth)) ? Number(o.outlineWidth) : undefined,
+				scale: Number.isFinite(Number(o.scale)) ? Number(o.scale) : undefined,
+				maxWidthPct: Number.isFinite(Number(o.maxWidthPct)) ? Number(o.maxWidthPct) : undefined
+			})
+		);
+	}
+	return out;
+}
+
 function normalizeSpeakerBank(raw: unknown): SpeakerVoiceProfile[] {
 	if (!Array.isArray(raw)) return [];
 	const out: SpeakerVoiceProfile[] = [];
@@ -345,6 +441,7 @@ export function parseProject(raw: unknown): DubbingProject | null {
 		cues,
 		subtitleStyle: normalizeSubtitleStyle(raw.subtitleStyle),
 		speakerBank: normalizeSpeakerBank(raw.speakerBank),
+		titleLiverClips: normalizeTitleLiverClips(raw.titleLiverClips),
 		updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : new Date().toISOString()
 	};
 }
@@ -360,6 +457,7 @@ export function serializeProject(project: DubbingProject): DubbingProject {
 		cues: project.cues.map((c) => ({ ...c })),
 		subtitleStyle: { ...project.subtitleStyle },
 		speakerBank: (project.speakerBank ?? []).map((s) => ({ ...s })),
+		titleLiverClips: (project.titleLiverClips ?? []).map((c) => ({ ...c })),
 		updatedAt: new Date().toISOString()
 	};
 	return JSON.parse(JSON.stringify(plain)) as DubbingProject;

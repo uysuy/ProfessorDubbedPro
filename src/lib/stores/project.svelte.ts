@@ -1,4 +1,4 @@
-import type { DubbingProject, SpeakerVoiceProfile, SubtitleCue, SubtitleStyle, VoiceProfile } from '$lib/types/project';
+import type { DubbingProject, SpeakerVoiceProfile, SubtitleCue, SubtitleStyle, TitleLiverClip, TitleLiverTemplateId, VoiceProfile } from '$lib/types/project';
 import { DEFAULT_SUBTITLE_STYLE } from '$lib/types/project';
 import { classifyMediaFile } from '$lib/utils/media';
 import { extractWaveformFromFile, extractWaveformFromUrl } from '$lib/utils/audio-waveform';
@@ -23,6 +23,7 @@ import {
 } from '$lib/utils/speaker-vault';
 import { upsertSavedVoice, loadSavedVoices, deleteSavedVoice, getSavedVoice } from '$lib/utils/voice-library';
 import type { SavedVoice } from '$lib/utils/voice-library';
+import { createTitleLiverClip, TITLE_LIVER_PRESETS } from '$lib/utils/title-liver';
 import {
 	buildRecoveryDocument,
 	saveRecoveryToLocalStorage
@@ -145,6 +146,8 @@ export const playback = $state({
 
 let selectedCueIds = $state<string[]>([]);
 let selectionAnchorId = $state<string | null>(null);
+/** Selected Title Liver clip (timeline + panel stay in sync). */
+let selectedTitleLiverId = $state<string | null>(null);
 let leftCollapsed = $state(false);
 let rightCollapsed = $state(false);
 let activeVideoTool = $state('tempo');
@@ -419,6 +422,7 @@ function resetPlayback() {
 	playback.playheadMs = 0;
 	selectedCueIds = [];
 	selectionAnchorId = null;
+	selectedTitleLiverId = null;
 }
 
 function clampPreviewHeight(px: number) {
@@ -492,6 +496,17 @@ export const projectStore = {
 	},
 	get selectedCueIds() {
 		return selectedCueIds;
+	},
+	get selectedTitleLiverId() {
+		return selectedTitleLiverId;
+	},
+	get titleLiverClips(): TitleLiverClip[] {
+		return project.titleLiverClips ?? [];
+	},
+	get selectedTitleLiver(): TitleLiverClip | null {
+		const id = selectedTitleLiverId;
+		if (!id) return null;
+		return (project.titleLiverClips ?? []).find((c) => c.id === id) ?? null;
 	},
 	get leftCollapsed() {
 		return leftCollapsed;
@@ -4227,6 +4242,202 @@ export const projectStore = {
 		persistSpeakerBankToVault(project.speakerBank ?? []);
 		return true;
 	},
+
+	selectTitleLiver(id: string | null) {
+		selectedTitleLiverId = id;
+		if (id) rightCollapsed = false;
+	},
+
+	/**
+	 * Add a Title Liver clip at the playhead (or given start). Selects it.
+	 */
+	addTitleLiverClip(opts?: {
+		templateId?: TitleLiverTemplateId;
+		startMs?: number;
+		durationMs?: number;
+		line1?: string;
+		line2?: string;
+	}): TitleLiverClip {
+		const start =
+			typeof opts?.startMs === 'number'
+				? Math.max(0, Math.round(opts.startMs))
+				: Math.max(0, Math.round(playback.playheadMs));
+		const dur = Math.max(800, Math.round(opts?.durationMs ?? 4000));
+		const end = Math.min(
+			Math.max(start + dur, start + 800),
+			Math.max(project.durationMs || start + dur, start + dur)
+		);
+		const clip = createTitleLiverClip({
+			templateId: opts?.templateId ?? 'soft-bar',
+			startMs: start,
+			endMs: end,
+			line1: opts?.line1,
+			line2: opts?.line2
+		});
+		project = touch({
+			...project,
+			titleLiverClips: [...(project.titleLiverClips ?? []), clip]
+		});
+		selectedTitleLiverId = clip.id;
+		rightCollapsed = false;
+		return clip;
+	},
+
+	updateTitleLiverClip(
+		id: string,
+		patch: Partial<Omit<TitleLiverClip, 'id'>>
+	): boolean {
+		const clips = [...(project.titleLiverClips ?? [])];
+		const idx = clips.findIndex((c) => c.id === id);
+		if (idx < 0) return false;
+		const prev = clips[idx]!;
+		let startMs =
+			typeof patch.startMs === 'number' ? Math.max(0, Math.round(patch.startMs)) : prev.startMs;
+		let endMs =
+			typeof patch.endMs === 'number' ? Math.max(0, Math.round(patch.endMs)) : prev.endMs;
+		if (endMs < startMs + 400) endMs = startMs + 400;
+		clips[idx] = {
+			...prev,
+			...patch,
+			startMs,
+			endMs,
+			line1: typeof patch.line1 === 'string' ? patch.line1 : prev.line1,
+			line2: typeof patch.line2 === 'string' ? patch.line2 : prev.line2,
+			line3: typeof patch.line3 === 'string' ? patch.line3 : (prev.line3 ?? ''),
+			accent:
+				typeof patch.accent === 'string' && patch.accent.trim()
+					? patch.accent.trim()
+					: prev.accent,
+			templateId: patch.templateId ?? prev.templateId,
+			x:
+				typeof patch.x === 'number' && Number.isFinite(patch.x)
+					? Math.max(0.02, Math.min(0.98, patch.x))
+					: (prev.x ?? 0.5),
+			y:
+				typeof patch.y === 'number' && Number.isFinite(patch.y)
+					? Math.max(0.02, Math.min(0.98, patch.y))
+					: (prev.y ?? 0.82),
+			fontFamily:
+				typeof patch.fontFamily === 'string' && patch.fontFamily.trim()
+					? patch.fontFamily.trim()
+					: (prev.fontFamily || 'Noto Sans Khmer'),
+			fontFile:
+				patch.fontFile !== undefined ? patch.fontFile : (prev.fontFile ?? null),
+			fontSizePx:
+				typeof patch.fontSizePx === 'number' && Number.isFinite(patch.fontSizePx)
+					? Math.max(10, Math.min(96, Math.round(patch.fontSizePx)))
+					: (prev.fontSizePx ?? 22),
+			outlineWidth:
+				typeof patch.outlineWidth === 'number' && Number.isFinite(patch.outlineWidth)
+					? Math.max(0, Math.min(5, patch.outlineWidth))
+					: (prev.outlineWidth ?? 1.25),
+			scale:
+				typeof patch.scale === 'number' && Number.isFinite(patch.scale)
+					? Math.max(0.5, Math.min(2, patch.scale))
+					: (prev.scale ?? 1),
+			maxWidthPct:
+				typeof patch.maxWidthPct === 'number' && Number.isFinite(patch.maxWidthPct)
+					? Math.max(0.25, Math.min(0.98, patch.maxWidthPct))
+					: (prev.maxWidthPct ?? 0.92)
+		};
+		project = touch({ ...project, titleLiverClips: clips });
+		return true;
+	},
+
+	duplicateTitleLiverClip(id?: string | null): TitleLiverClip | null {
+		const srcId = id ?? selectedTitleLiverId;
+		if (!srcId) return null;
+		const src = (project.titleLiverClips ?? []).find((c) => c.id === srcId);
+		if (!src) return null;
+		const dur = Math.max(400, src.endMs - src.startMs);
+		const start = Math.max(0, src.endMs + 120);
+		const { id: _omit, ...rest } = src;
+		const clip = createTitleLiverClip({
+			...rest,
+			startMs: start,
+			endMs: start + dur
+		});
+		project = touch({
+			...project,
+			titleLiverClips: [...(project.titleLiverClips ?? []), clip]
+		});
+		selectedTitleLiverId = clip.id;
+		rightCollapsed = false;
+		return clip;
+	},
+
+	nudgeTitleLiver(id: string | null | undefined, dx: number, dy: number): boolean {
+		const srcId = id ?? selectedTitleLiverId;
+		if (!srcId) return false;
+		const src = (project.titleLiverClips ?? []).find((c) => c.id === srcId);
+		if (!src) return false;
+		return this.updateTitleLiverClip(srcId, {
+			x: (src.x ?? 0.5) + dx,
+			y: (src.y ?? 0.82) + dy
+		});
+	},
+
+	applyTitleLiverPreset(presetId: string, atMs?: number): number {
+		const preset = TITLE_LIVER_PRESETS.find((p) => p.id === presetId);
+		if (!preset) return 0;
+		const base =
+			typeof atMs === 'number' && Number.isFinite(atMs)
+				? Math.max(0, Math.round(atMs))
+				: Math.max(0, Math.round(playback.playheadMs));
+		const added: TitleLiverClip[] = [];
+		for (const spec of preset.clips) {
+			added.push(
+				createTitleLiverClip({
+					templateId: spec.templateId,
+					startMs: base + spec.offsetMs,
+					endMs: base + spec.offsetMs + spec.durationMs,
+					line1: spec.line1,
+					line2: spec.line2,
+					line3: spec.line3
+				})
+			);
+		}
+		if (!added.length) return 0;
+		project = touch({
+			...project,
+			titleLiverClips: [...(project.titleLiverClips ?? []), ...added]
+		});
+		selectedTitleLiverId = added[0]!.id;
+		rightCollapsed = false;
+		return added.length;
+	},
+
+	removeTitleLiverClip(id: string): boolean {
+		const clips = project.titleLiverClips ?? [];
+		if (!clips.some((c) => c.id === id)) return false;
+		project = touch({
+			...project,
+			titleLiverClips: clips.filter((c) => c.id !== id)
+		});
+		if (selectedTitleLiverId === id) selectedTitleLiverId = null;
+		return true;
+	},
+
+	moveTitleLiverTiming(id: string, startMs: number): boolean {
+		const clip = (project.titleLiverClips ?? []).find((c) => c.id === id);
+		if (!clip) return false;
+		const dur = Math.max(400, clip.endMs - clip.startMs);
+		const start = Math.max(0, Math.round(startMs));
+		return this.updateTitleLiverClip(id, { startMs: start, endMs: start + dur });
+	},
+
+	trimTitleLiverEdge(id: string, edge: 'start' | 'end', ms: number): boolean {
+		const clip = (project.titleLiverClips ?? []).find((c) => c.id === id);
+		if (!clip) return false;
+		const minDur = 400;
+		if (edge === 'start') {
+			const start = Math.max(0, Math.min(clip.endMs - minDur, Math.round(ms)));
+			return this.updateTitleLiverClip(id, { startMs: start });
+		}
+		const end = Math.max(clip.startMs + minDur, Math.round(ms));
+		return this.updateTitleLiverClip(id, { endMs: end });
+	},
+
 	get dubOverhangMs() {
 		const media =
 			originalAudio.durationMs > 1000

@@ -6,7 +6,7 @@
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu/index.js';
 	import WindowControls from '$lib/components/layout/WindowControls.svelte';
 	import ThemeToggle from '$lib/components/layout/ThemeToggle.svelte';
-	import { projectStore } from '$lib/stores/project.svelte';
+	import { projectStore, playback } from '$lib/stores/project.svelte';
 	import { autosaveStore } from '$lib/stores/autosave.svelte';
 	import { studioUi } from '$lib/stores/studio-ui.svelte';
 	import { languageLabel, normalizeDubLanguage } from '$lib/stores/preferences.svelte';
@@ -190,6 +190,27 @@
 				<DropdownMenu.Item onclick={() => onExport?.()}>Export…</DropdownMenu.Item>
 				<DropdownMenu.Separator />
 				<DropdownMenu.Item onclick={() => onSettings?.()}>Settings…</DropdownMenu.Item>
+			</DropdownMenu.Content>
+		</DropdownMenu.Root>
+
+		<DropdownMenu.Root>
+			<DropdownMenu.Trigger
+				class="inline-flex h-7 items-center gap-0.5 rounded-md px-2 text-[12px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+			>
+				Title Liver <ChevronDown class="size-3 opacity-60" />
+			</DropdownMenu.Trigger>
+			<DropdownMenu.Content align="start" class="min-w-48">
+				<DropdownMenu.Item
+					onclick={() => {
+						studioUi.openTitleLiver();
+						projectStore.addTitleLiverClip({ startMs: playback.playheadMs });
+						dndStore.flash('Title Liver added at playhead');
+					}}
+					>Add at playhead…</DropdownMenu.Item
+				>
+				<DropdownMenu.Item onclick={() => studioUi.openTitleLiver()}
+					>Open Title Liver…</DropdownMenu.Item
+				>
 			</DropdownMenu.Content>
 		</DropdownMenu.Root>
 

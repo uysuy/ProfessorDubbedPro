@@ -18,7 +18,8 @@
 	import TempoDialog from '$lib/components/studio/TempoDialog.svelte';
 	import VoiceEngineDialog from '$lib/components/studio/VoiceEngineDialog.svelte';
 	import ProsodyDialog from '$lib/components/studio/ProsodyDialog.svelte';
-	import { matchStudioShortcut, type StudioShortcutId } from '$lib/utils/shortcuts';
+	import TitleLiverPanel from '$lib/components/studio/TitleLiverPanel.svelte';
+	import { isTypingTarget, matchStudioShortcut, type StudioShortcutId } from '$lib/utils/shortcuts';
 	import { isTauriRuntime } from '$lib/utils/platform';
 
 	type PaneApi = {
@@ -203,9 +204,15 @@
 				return;
 			}
 			case 'delete': {
+				const tlId = projectStore.selectedTitleLiverId;
+				if (tlId && !projectStore.selectedCueIds.length) {
+					projectStore.removeTitleLiverClip(tlId);
+					dndStore.flash('Deleted live title');
+					return;
+				}
 				const ids = projectStore.selectedCueIds;
 				if (!ids.length) {
-					dndStore.flash('Select a subtitle first');
+					dndStore.flash('Select a subtitle or live title first');
 					return;
 				}
 				const withTts = ids.filter((id) => {
@@ -224,6 +231,11 @@
 				return;
 			}
 			case 'duplicate': {
+				if (projectStore.selectedTitleLiverId && !projectStore.selectedCueIds.length) {
+					const c = projectStore.duplicateTitleLiverClip();
+					dndStore.flash(c ? 'Duplicated live title' : 'Nothing to duplicate');
+					return;
+				}
 				const newId = projectStore.duplicateSelectedCue();
 				dndStore.flash(newId ? 'Duplicated subtitle' : 'Select a subtitle first');
 				return;
@@ -249,6 +261,51 @@
 	function onStudioKeydown(e: KeyboardEvent) {
 		// Ignore when a modal dialog owns focus (export, etc.).
 		if (document.querySelector('[data-slot="dialog-content"]')) return;
+
+		// Esc closes Title Liver template browser (keeps timeline selection).
+		if (
+			!e.altKey &&
+			!e.ctrlKey &&
+			!e.metaKey &&
+			(e.key === 'Escape' || e.code === 'Escape') &&
+			studioUi.titleLiverOpen
+		) {
+			e.preventDefault();
+			studioUi.closeTitleLiver();
+			return;
+		}
+
+		// Arrow nudge for selected live title (when not typing).
+		if (
+			projectStore.selectedTitleLiverId &&
+			!projectStore.selectedCueIds.length &&
+			!isTypingTarget(e.target) &&
+			!e.altKey &&
+			!e.ctrlKey &&
+			!e.metaKey
+		) {
+			const step = e.shiftKey ? 0.02 : 0.008;
+			if (e.key === 'ArrowLeft' || e.code === 'ArrowLeft') {
+				e.preventDefault();
+				projectStore.nudgeTitleLiver(null, -step, 0);
+				return;
+			}
+			if (e.key === 'ArrowRight' || e.code === 'ArrowRight') {
+				e.preventDefault();
+				projectStore.nudgeTitleLiver(null, step, 0);
+				return;
+			}
+			if (e.key === 'ArrowUp' || e.code === 'ArrowUp') {
+				e.preventDefault();
+				projectStore.nudgeTitleLiver(null, 0, -step);
+				return;
+			}
+			if (e.key === 'ArrowDown' || e.code === 'ArrowDown') {
+				e.preventDefault();
+				projectStore.nudgeTitleLiver(null, 0, step);
+				return;
+			}
+		}
 
 		const action = matchStudioShortcut(e);
 		if (!action) return;
@@ -446,4 +503,5 @@
 <TempoDialog />
 <VoiceEngineDialog />
 <ProsodyDialog />
+<TitleLiverPanel />
 <DragGhost />

@@ -1,6 +1,4 @@
 <script lang="ts">
-	import { Button } from '$lib/components/ui/button/index.js';
-	import { Badge } from '$lib/components/ui/badge/index.js';
 	import { Slider } from '$lib/components/ui/slider/index.js';
 	import * as Tooltip from '$lib/components/ui/tooltip/index.js';
 	import Waveform from '$lib/components/studio/Waveform.svelte';
@@ -33,6 +31,7 @@
 	import { resamplePeaks } from '$lib/utils/audio-waveform';
 	import { cuePreviewEndMs } from '$lib/utils/tts-fit';
 	import { timelineUi } from '$lib/stores/timeline-ui.svelte';
+	import { studioUi } from '$lib/stores/studio-ui.svelte';
 	import {
 		Eye,
 		EyeOff,
@@ -42,12 +41,12 @@
 		Scan,
 		Scissors,
 		MousePointer2,
-		AlignHorizontalSpaceAround,
+		Link2,
 		CircleHelp,
-		Volume2,
-		VolumeX,
 		ZoomIn,
-		ZoomOut
+		ZoomOut,
+		Lock,
+		Unlock
 	} from '@lucide/svelte';
 	import { dndStore, MIME_TTS_AUDIO } from '$lib/stores/dnd.svelte';
 	import { onDestroy } from 'svelte';
@@ -124,6 +123,20 @@
 	let clipTrimMoveRaf = 0;
 	let pendingTrimClientX: number | null = null;
 
+	/** Title Liver clip drag (move) or edge trim. */
+	let titleLiverDrag = $state<{
+		id: string;
+		mode: 'move' | 'trim-start' | 'trim-end';
+		originClientX: number;
+		originStartMs: number;
+		originEndMs: number;
+		durationMs: number;
+		startMs: number;
+		endMs: number;
+		moved: boolean;
+		pointerId: number;
+	} | null>(null);
+
 	const MIN_TRIM_DURATION_MS = 200;
 
 	const duration = $derived(projectStore.current.durationMs);
@@ -185,7 +198,7 @@
 		const on = timelineUi.toggleArrangeMode();
 		bladeHoverMs = null;
 		focusTimeline();
-		dndStore.flash(on ? 'Arrange — TTS hidden, Video + Subs + Original' : 'Arrange off');
+		dndStore.flash(on ? 'Arrange — TTS hidden, Title Liver + Video + Subs + Original' : 'Arrange off');
 	}
 
 	function updateBladeHover(clientX: number, target: EventTarget | null) {
@@ -924,6 +937,97 @@
 		}
 	}
 
+	function onTitleLiverPointerDown(
+		e: PointerEvent & { currentTarget: HTMLElement },
+		id: string,
+		startMs: number,
+		endMs: number,
+		mode: 'move' | 'trim-start' | 'trim-end' = 'move'
+	) {
+		if (isZoomLive) endZoomGesture();
+		e.preventDefault();
+		e.stopPropagation();
+		projectStore.selectTitleLiver(id);
+		const ph = playback.playheadMs;
+		if (ph < startMs || ph >= endMs) {
+			setVisualPlayheadMs(startMs, { seekMedia: true });
+			projectStore.setPlayhead(startMs);
+		}
+		titleLiverDrag = {
+			id,
+			mode,
+			originClientX: e.clientX,
+			originStartMs: startMs,
+			originEndMs: endMs,
+			durationMs: Math.max(400, endMs - startMs),
+			startMs,
+			endMs,
+			moved: false,
+			pointerId: e.pointerId
+		};
+		e.currentTarget.setPointerCapture(e.pointerId);
+	}
+
+	function onTitleLiverPointerMove(e: PointerEvent & { currentTarget: HTMLElement }) {
+		if (!titleLiverDrag || e.pointerId !== titleLiverDrag.pointerId) return;
+		const dx = e.clientX - titleLiverDrag.originClientX;
+		if (!titleLiverDrag.moved && Math.abs(dx) < 2) return;
+		const deltaMs = deltaXToMs(dx, zoom);
+		const minDur = 400;
+		if (titleLiverDrag.mode === 'move') {
+			const nextStart = Math.max(0, Math.round(titleLiverDrag.originStartMs + deltaMs));
+			titleLiverDrag = {
+				...titleLiverDrag,
+				startMs: nextStart,
+				endMs: nextStart + titleLiverDrag.durationMs,
+				moved: true
+			};
+			return;
+		}
+		if (titleLiverDrag.mode === 'trim-start') {
+			const nextStart = Math.max(
+				0,
+				Math.min(titleLiverDrag.originEndMs - minDur, Math.round(titleLiverDrag.originStartMs + deltaMs))
+			);
+			titleLiverDrag = {
+				...titleLiverDrag,
+				startMs: nextStart,
+				endMs: titleLiverDrag.originEndMs,
+				moved: true
+			};
+			return;
+		}
+		const nextEnd = Math.max(
+			titleLiverDrag.originStartMs + minDur,
+			Math.round(titleLiverDrag.originEndMs + deltaMs)
+		);
+		titleLiverDrag = {
+			...titleLiverDrag,
+			startMs: titleLiverDrag.originStartMs,
+			endMs: nextEnd,
+			moved: true
+		};
+	}
+
+	function onTitleLiverPointerUp(e: PointerEvent & { currentTarget: HTMLElement }) {
+		if (!titleLiverDrag || e.pointerId !== titleLiverDrag.pointerId) return;
+		const drag = titleLiverDrag;
+		titleLiverDrag = null;
+		try {
+			e.currentTarget.releasePointerCapture(e.pointerId);
+		} catch {
+			/* ignore */
+		}
+		if (!drag.moved) return;
+		if (drag.mode === 'move') {
+			projectStore.moveTitleLiverTiming(drag.id, drag.startMs);
+		} else if (drag.mode === 'trim-start') {
+			projectStore.trimTitleLiverEdge(drag.id, 'start', drag.startMs);
+		} else {
+			projectStore.trimTitleLiverEdge(drag.id, 'end', drag.endMs);
+		}
+	}
+
 	function clientXToTimelineMs(clientX: number): number {
 		if (!scrollEl) return playback.playheadMs;
 		const rect = scrollEl.getBoundingClientRect();
@@ -1320,229 +1424,202 @@
 		bladeHoverMs = null;
 	}}
 >
-	<div class="timeline-toolbar panel-header gap-3">
-		<span>Timeline Editor</span>
-		{#if arrangeOn}
-			<Badge variant="secondary" class="text-[10px] tracking-normal">Arrange</Badge>
-		{/if}
-
-		<div class="flex min-w-0 flex-1 items-center justify-end gap-1.5 normal-case tracking-normal">
-			<Tooltip.Provider>
+	<div class="timeline-toolbar">
+		<Tooltip.Provider>
+			<!-- Resolve-style: edit tools left -->
+			<div class="timeline-tools" role="toolbar" aria-label="Timeline tools">
 				<Tooltip.Root>
-					<Tooltip.Trigger class="inline-flex shrink-0">
+					<Tooltip.Trigger class="inline-flex">
 						{#snippet child({ props })}
-							<Button
+							<button
 								{...props}
 								type="button"
-								variant="ghost"
-								size="icon-xs"
-								aria-label="Timeline shortcuts"
-								class="text-muted-foreground"
+								class="timeline-tool-btn"
+								class:timeline-tool-btn-active={activeTool === 'select'}
+								aria-label="Selection tool"
+								aria-pressed={activeTool === 'select'}
+								onpointerdown={(e) => e.stopPropagation()}
+								onclick={(e) => {
+									e.preventDefault();
+									e.stopPropagation();
+									chooseTool('select');
+								}}
 							>
-								<CircleHelp class="size-3.5" />
-							</Button>
+								<MousePointer2 class="size-3.5" stroke-width={1.75} />
+							</button>
 						{/snippet}
 					</Tooltip.Trigger>
-					<Tooltip.Content class="max-w-64 text-left text-[11px] leading-relaxed normal-case tracking-normal">
+					<Tooltip.Content>Selection mode (V)</Tooltip.Content>
+				</Tooltip.Root>
+
+				<Tooltip.Root>
+					<Tooltip.Trigger class="inline-flex">
+						{#snippet child({ props })}
+							<button
+								{...props}
+								type="button"
+								class="timeline-tool-btn"
+								class:timeline-tool-btn-active={activeTool === 'blade'}
+								aria-label="Blade tool"
+								aria-pressed={activeTool === 'blade'}
+								onpointerdown={(e) => e.stopPropagation()}
+								onclick={(e) => {
+									e.preventDefault();
+									e.stopPropagation();
+									chooseTool('blade');
+								}}
+							>
+								<Scissors class="size-3.5" stroke-width={1.75} />
+							</button>
+						{/snippet}
+					</Tooltip.Trigger>
+					<Tooltip.Content>Blade / split (B)</Tooltip.Content>
+				</Tooltip.Root>
+
+				<span class="timeline-tool-sep" aria-hidden="true"></span>
+
+				<Tooltip.Root>
+					<Tooltip.Trigger class="inline-flex">
+						{#snippet child({ props })}
+							<button
+								{...props}
+								type="button"
+								class="timeline-tool-btn"
+								class:timeline-tool-btn-armed={snapOn}
+								aria-label="Toggle snapping"
+								aria-pressed={snapOn}
+								onpointerdown={(e) => e.stopPropagation()}
+								onclick={(e) => {
+									e.preventDefault();
+									e.stopPropagation();
+									toggleSnapUi();
+								}}
+							>
+								<Magnet class="size-3.5" stroke-width={1.75} />
+							</button>
+						{/snippet}
+					</Tooltip.Trigger>
+					<Tooltip.Content>Snapping {snapOn ? 'on' : 'off'} (N)</Tooltip.Content>
+				</Tooltip.Root>
+
+				<Tooltip.Root>
+					<Tooltip.Trigger class="inline-flex">
+						{#snippet child({ props })}
+							<button
+								{...props}
+								type="button"
+								class="timeline-tool-btn"
+								class:timeline-tool-btn-active={arrangeOn}
+								aria-label="Linked / arrange view"
+								aria-pressed={arrangeOn}
+								onpointerdown={(e) => e.stopPropagation()}
+								onclick={(e) => {
+									e.preventDefault();
+									e.stopPropagation();
+									toggleArrangeUi();
+								}}
+							>
+								<Link2 class="size-3.5" stroke-width={1.75} />
+							</button>
+						{/snippet}
+					</Tooltip.Trigger>
+					<Tooltip.Content>Arrange view (A) — focus Video + Original</Tooltip.Content>
+				</Tooltip.Root>
+
+				<span class="timeline-tool-sep" aria-hidden="true"></span>
+
+				<Tooltip.Root>
+					<Tooltip.Trigger class="inline-flex">
+						{#snippet child({ props })}
+							<button
+								{...props}
+								type="button"
+								class="timeline-tool-btn"
+								aria-label={playback.isPlaying ? 'Pause' : 'Play'}
+								onclick={() => projectStore.togglePlayback()}
+							>
+								{#if playback.isPlaying}
+									<Pause class="size-3.5 fill-current" stroke-width={1.75} />
+								{:else}
+									<Play class="size-3.5 fill-current" stroke-width={1.75} />
+								{/if}
+							</button>
+						{/snippet}
+					</Tooltip.Trigger>
+					<Tooltip.Content>{playback.isPlaying ? 'Pause' : 'Play'} (Space)</Tooltip.Content>
+				</Tooltip.Root>
+
+				<Tooltip.Root>
+					<Tooltip.Trigger class="inline-flex">
+						{#snippet child({ props })}
+							<button
+								{...props}
+								type="button"
+								class="timeline-tool-btn"
+								aria-label="Timeline shortcuts"
+							>
+								<CircleHelp class="size-3.5" stroke-width={1.75} />
+							</button>
+						{/snippet}
+					</Tooltip.Trigger>
+					<Tooltip.Content class="max-w-64 text-left text-[11px] leading-relaxed">
 						<div class="font-semibold">Shortcuts</div>
-						<div>A arrange · V select · B blade · N snap</div>
+						<div>V select · B blade · N snap · A arrange</div>
 						<div>Drag ruler / video / original = scrub</div>
-						<div>Drag Subs/TTS lane = marquee</div>
 						<div>C split at playhead · [ ] nudge</div>
 					</Tooltip.Content>
 				</Tooltip.Root>
-				<div class="timeline-tool-cluster flex shrink-0 items-center gap-0.5 rounded-xl border border-border/50 bg-[var(--surface-toolbar)] p-0.5 shadow-[var(--elevation-panel)]">
-					<Tooltip.Root>
-						<Tooltip.Trigger class="inline-flex">
-							{#snippet child({ props })}
-								<Button
-									{...props}
-									type="button"
-									variant={activeTool === 'select' ? 'secondary' : 'ghost'}
-									size="icon-xs"
-									aria-label="Select tool"
-									aria-pressed={activeTool === 'select'}
-									onpointerdown={(e) => e.stopPropagation()}
-									onclick={(e) => {
-										e.preventDefault();
-										e.stopPropagation();
-										chooseTool('select');
-									}}
-								>
-									<MousePointer2 class="size-3.5" />
-								</Button>
-							{/snippet}
-						</Tooltip.Trigger>
-						<Tooltip.Content>Select (V)</Tooltip.Content>
-					</Tooltip.Root>
-					<Tooltip.Root>
-						<Tooltip.Trigger class="inline-flex">
-							{#snippet child({ props })}
-								<Button
-									{...props}
-									type="button"
-									variant={activeTool === 'blade' ? 'secondary' : 'ghost'}
-									size="icon-xs"
-									aria-label="Blade tool"
-									aria-pressed={activeTool === 'blade'}
-									onpointerdown={(e) => e.stopPropagation()}
-									onclick={(e) => {
-										e.preventDefault();
-										e.stopPropagation();
-										chooseTool('blade');
-									}}
-								>
-									<Scissors class="size-3.5" />
-								</Button>
-							{/snippet}
-						</Tooltip.Trigger>
-						<Tooltip.Content>Blade / split (B)</Tooltip.Content>
-					</Tooltip.Root>
-					<Tooltip.Root>
-						<Tooltip.Trigger class="inline-flex">
-							{#snippet child({ props })}
-								<Button
-									{...props}
-									type="button"
-									variant={snapOn ? 'secondary' : 'ghost'}
-									size="icon-xs"
-									aria-label="Toggle snap"
-									aria-pressed={snapOn}
-									onpointerdown={(e) => e.stopPropagation()}
-									onclick={(e) => {
-										e.preventDefault();
-										e.stopPropagation();
-										toggleSnapUi();
-									}}
-								>
-									<Magnet class="size-3.5" />
-								</Button>
-							{/snippet}
-						</Tooltip.Trigger>
-						<Tooltip.Content>Snap {snapOn ? 'on' : 'off'} (N)</Tooltip.Content>
-					</Tooltip.Root>
-					<Tooltip.Root>
-						<Tooltip.Trigger class="inline-flex">
-							{#snippet child({ props })}
-								<Button
-									{...props}
-									type="button"
-									variant={arrangeOn ? 'secondary' : 'ghost'}
-									size="icon-xs"
-									aria-label="Arrange mode"
-									aria-pressed={arrangeOn}
-									onpointerdown={(e) => e.stopPropagation()}
-									onclick={(e) => {
-										e.preventDefault();
-										e.stopPropagation();
-										toggleArrangeUi();
-									}}
-								>
-									<AlignHorizontalSpaceAround class="size-3.5" />
-								</Button>
-							{/snippet}
-						</Tooltip.Trigger>
-						<Tooltip.Content>Arrange mode (A) — hide TTS, focus Video + Original</Tooltip.Content>
-					</Tooltip.Root>
-				</div>
+			</div>
 
-				<div class="timeline-tool-cluster flex items-center gap-0.5 rounded-xl border border-border/50 bg-[var(--surface-toolbar)] p-0.5 shadow-[var(--elevation-panel)]">
-					<Button
-						variant="ghost"
-						size="icon-xs"
-						aria-label={playback.isPlaying ? 'Pause' : 'Play'}
-						onclick={() => projectStore.togglePlayback()}
-					>
-						{#if playback.isPlaying}
-							<Pause class="size-3.5 fill-current" />
-						{:else}
-							<Play class="size-3.5 fill-current" />
-						{/if}
-					</Button>
-				</div>
+			<!-- Center timecode -->
+			<div class="timeline-tc" aria-live="polite">
+				<span class="timeline-tc-now">{formatTimecode(displayMs, projectStore.current.fps)}</span>
+				<span class="timeline-tc-sep">/</span>
+				<span class="timeline-tc-dur">{formatTimecode(duration, projectStore.current.fps)}</span>
+			</div>
 
-				<Badge variant="secondary" class="rounded-lg font-mono text-[10px] tracking-normal">
-					{formatTimecode(displayMs, projectStore.current.fps)}
-					<span class="mx-1 opacity-40">/</span>
-					{formatTimecode(duration, projectStore.current.fps)}
-				</Badge>
-
-				<div
-					class="timeline-tool-cluster ml-1 flex items-center gap-1.5 rounded-xl border border-border/50 bg-[var(--surface-toolbar)] px-1.5 py-0.5 shadow-[var(--elevation-panel)]"
+			<!-- Resolve-style: zoom right -->
+			<div class="timeline-zoom" role="group" aria-label="Timeline zoom">
+				<button
+					type="button"
+					class="timeline-tool-btn"
+					aria-label="Zoom out"
+					disabled={zoom <= effectiveMinZoom + 0.001}
+					onclick={() => zoomBy(-0.25)}
 				>
-					<Tooltip.Root>
-						<Tooltip.Trigger class="inline-flex">
-							{#snippet child({ props })}
-								<Button
-									{...props}
-									variant="ghost"
-									size="icon-xs"
-									aria-label="Zoom out"
-									disabled={zoom <= effectiveMinZoom + 0.001}
-									onclick={() => zoomBy(-0.25)}
-								>
-									<ZoomOut class="size-3.5" />
-								</Button>
-							{/snippet}
-						</Tooltip.Trigger>
-						<Tooltip.Content sideOffset={6}>Zoom out</Tooltip.Content>
-					</Tooltip.Root>
-
-					<Slider
-						type="single"
-						class="timeline-zoom-slider w-24"
-						value={zoom}
-						min={effectiveMinZoom}
-						max={MAX_ZOOM}
-						step={0.01}
-						onValueChange={onZoomSlider}
-						onValueCommit={onZoomSliderCommit}
-						aria-label="Timeline zoom"
-					/>
-
-					<Tooltip.Root>
-						<Tooltip.Trigger class="inline-flex">
-							{#snippet child({ props })}
-								<Button
-									{...props}
-									variant="ghost"
-									size="icon-xs"
-									aria-label="Zoom in"
-									disabled={zoom >= MAX_ZOOM}
-									onclick={() => zoomBy(0.25)}
-								>
-									<ZoomIn class="size-3.5" />
-								</Button>
-							{/snippet}
-						</Tooltip.Trigger>
-						<Tooltip.Content sideOffset={6}>Zoom in</Tooltip.Content>
-					</Tooltip.Root>
-
-					<Tooltip.Root>
-						<Tooltip.Trigger class="inline-flex">
-							{#snippet child({ props })}
-								<Button
-									{...props}
-									variant="ghost"
-									size="icon-xs"
-									aria-label="Fit timeline to view"
-									onclick={fitTimelineToView}
-								>
-									<Scan class="size-3.5" />
-								</Button>
-							{/snippet}
-						</Tooltip.Trigger>
-						<Tooltip.Content sideOffset={6}>Fit to view</Tooltip.Content>
-					</Tooltip.Root>
-
-					<span
-						class="w-14 text-right font-mono text-[10px] text-muted-foreground"
-						title="Timeline zoom (not playback speed)"
-						>Zoom {zoom < 1 ? zoom.toFixed(2) : zoom.toFixed(1)}×</span
-					>
-				</div>
-			</Tooltip.Provider>
-		</div>
+					<ZoomOut class="size-3.5" stroke-width={1.75} />
+				</button>
+				<Slider
+					type="single"
+					class="timeline-zoom-slider w-28"
+					value={zoom}
+					min={effectiveMinZoom}
+					max={MAX_ZOOM}
+					step={0.01}
+					onValueChange={onZoomSlider}
+					onValueCommit={onZoomSliderCommit}
+					aria-label="Timeline zoom"
+				/>
+				<button
+					type="button"
+					class="timeline-tool-btn"
+					aria-label="Zoom in"
+					disabled={zoom >= MAX_ZOOM}
+					onclick={() => zoomBy(0.25)}
+				>
+					<ZoomIn class="size-3.5" stroke-width={1.75} />
+				</button>
+				<button
+					type="button"
+					class="timeline-tool-btn"
+					aria-label="Fit timeline to view"
+					onclick={fitTimelineToView}
+					title="Full extent"
+				>
+					<Scan class="size-3.5" stroke-width={1.75} />
+				</button>
+			</div>
+		</Tooltip.Provider>
 	</div>
 
 	<div class="timeline-body relative min-h-0 flex-1 overflow-hidden">
@@ -1610,99 +1687,121 @@
 						data-track-kind={track.kind}
 						style="grid-template-columns: {LABEL_WIDTH}px 1fr; height: {track.height}px;"
 					>
-						<div data-track-label class="timeline-track-header">
+						<div
+							data-track-label
+							class="timeline-track-header"
+							class:timeline-track-header-locked={timelineUi.locked[track.kind]}
+						>
 							<span class="timeline-track-swatch" style="background: {track.color};"></span>
-							<div class="min-w-0 flex-1">
-								<div class="flex items-center gap-0.5">
-									<p class="timeline-track-name min-w-0 flex-1 truncate">{track.name}</p>
+							<div class="timeline-track-id">
+								<p class="timeline-track-name">{track.name}</p>
+								<p class="timeline-track-role">{track.role}</p>
+							</div>
+							<div class="timeline-track-controls">
+								<button
+									type="button"
+									class="timeline-track-icon-btn"
+									class:timeline-track-icon-btn-active={timelineUi.locked[track.kind]}
+									title={timelineUi.locked[track.kind] ? 'Unlock track' : 'Lock track'}
+									aria-label={timelineUi.locked[track.kind] ? 'Unlock track' : 'Lock track'}
+									aria-pressed={timelineUi.locked[track.kind]}
+									onclick={(e) => {
+										e.stopPropagation();
+										timelineUi.toggleLocked(track.kind as TimelineTrackKind);
+									}}
+								>
+									{#if timelineUi.locked[track.kind]}
+										<Lock class="size-3" stroke-width={1.75} />
+									{:else}
+										<Unlock class="size-3" stroke-width={1.75} />
+									{/if}
+								</button>
+								<button
+									type="button"
+									class="timeline-track-icon-btn"
+									class:timeline-track-icon-btn-active={!timelineUi.visibility[track.kind]}
+									title={timelineUi.visibility[track.kind] ? 'Disable track' : 'Enable track'}
+									aria-label={timelineUi.visibility[track.kind] ? 'Hide track' : 'Show track'}
+									onclick={(e) => {
+										e.stopPropagation();
+										timelineUi.toggleVisible(track.kind as TimelineTrackKind);
+									}}
+								>
+									{#if timelineUi.visibility[track.kind]}
+										<Eye class="size-3" stroke-width={1.75} />
+									{:else}
+										<EyeOff class="size-3" stroke-width={1.75} />
+									{/if}
+								</button>
+								<button
+									type="button"
+									class="timeline-track-icon-btn"
+									class:timeline-track-icon-btn-solo={timelineUi.solo[track.kind]}
+									title={timelineUi.solo[track.kind] ? 'Unsolo' : 'Solo'}
+									aria-label={timelineUi.solo[track.kind] ? 'Unsolo track' : 'Solo track'}
+									aria-pressed={timelineUi.solo[track.kind]}
+									onclick={(e) => {
+										e.stopPropagation();
+										timelineUi.toggleSolo(track.kind as TimelineTrackKind);
+									}}
+								>
+									S
+								</button>
+								{#if track.kind === 'original'}
 									<button
 										type="button"
 										class="timeline-track-icon-btn"
-										class:timeline-track-icon-btn-active={!timelineUi.visibility[track.kind]}
-										title={timelineUi.visibility[track.kind] ? 'Hide track' : 'Show track'}
-										aria-label={timelineUi.visibility[track.kind] ? 'Hide track' : 'Show track'}
+										class:timeline-track-icon-btn-active={projectStore.originalAudioMuted ||
+											projectStore.originalAudioGain < 0.005}
+										title={projectStore.originalAudioMuted ? 'Unmute' : 'Mute'}
+										aria-label={projectStore.originalAudioMuted
+											? 'Unmute original audio'
+											: 'Mute original audio'}
+										aria-pressed={projectStore.originalAudioMuted}
 										onclick={(e) => {
 											e.stopPropagation();
-											timelineUi.toggleVisible(track.kind as TimelineTrackKind);
+											projectStore.toggleOriginalAudioMute();
 										}}
 									>
-										{#if timelineUi.visibility[track.kind]}
-											<Eye class="size-3" />
-										{:else}
-											<EyeOff class="size-3" />
-										{/if}
+										M
 									</button>
-									<button
-										type="button"
-										class="timeline-track-icon-btn"
-										class:timeline-track-icon-btn-solo={timelineUi.solo[track.kind]}
-										title={timelineUi.solo[track.kind] ? 'Unsolo' : 'Solo'}
-										aria-label={timelineUi.solo[track.kind] ? 'Unsolo track' : 'Solo track'}
-										aria-pressed={timelineUi.solo[track.kind]}
-										onclick={(e) => {
-											e.stopPropagation();
-											timelineUi.toggleSolo(track.kind as TimelineTrackKind);
-										}}
-									>
-										S
-									</button>
-								</div>
-								{#if track.shown && track.kind === 'original'}
-									<div class="timeline-original-mixer">
-										<button
-											type="button"
-											class="timeline-mute-btn"
-											class:timeline-mute-btn-active={projectStore.originalAudioMuted ||
-												projectStore.originalAudioGain < 0.005}
-											aria-label={projectStore.originalAudioMuted
-												? 'Unmute original audio'
-												: 'Mute original audio'}
-											aria-pressed={projectStore.originalAudioMuted}
-											title={projectStore.originalAudioMuted ? 'Unmute' : 'Mute'}
-											onclick={(e) => {
-												e.stopPropagation();
-												projectStore.toggleOriginalAudioMute();
-											}}
-										>
-											{#if projectStore.originalAudioMuted || projectStore.originalAudioGain < 0.005}
-												<VolumeX class="size-3" />
-											{:else}
-												<Volume2 class="size-3" />
-											{/if}
-										</button>
-										<Slider
-											type="single"
-											class="timeline-original-fader min-w-0 flex-1"
-											value={Math.round(projectStore.originalAudioGain * 100)}
-											min={0}
-											max={100}
-											step={1}
-											disabled={projectStore.originalAudioMuted}
-											onValueChange={(v) => {
-												const n = typeof v === 'number' ? v : Number(v);
-												if (!Number.isFinite(n)) return;
-												projectStore.setOriginalAudioGain(n / 100);
-												if (projectStore.originalAudioMuted && n > 0) {
-													projectStore.setOriginalAudioMuted(false);
-												}
-											}}
-											aria-label="Original audio volume"
-										/>
-										<span class="timeline-original-pct font-mono">
-											{projectStore.originalAudioMuted
-												? 'M'
-												: `${Math.round(projectStore.originalAudioGain * 100)}`}
-										</span>
-									</div>
-								{:else if track.shown}
-									<p class="timeline-track-role">{track.role}</p>
-								{:else}
-									<p class="timeline-track-role opacity-60">Hidden</p>
 								{/if}
 							</div>
+							{#if track.shown && track.kind === 'original'}
+								<div class="timeline-original-mixer">
+									<Slider
+										type="single"
+										class="timeline-original-fader min-w-0 flex-1"
+										value={Math.round(projectStore.originalAudioGain * 100)}
+										min={0}
+										max={100}
+										step={1}
+										disabled={projectStore.originalAudioMuted ||
+											timelineUi.locked.original}
+										onValueChange={(v) => {
+											const n = typeof v === 'number' ? v : Number(v);
+											if (!Number.isFinite(n)) return;
+											projectStore.setOriginalAudioGain(n / 100);
+											if (projectStore.originalAudioMuted && n > 0) {
+												projectStore.setOriginalAudioMuted(false);
+											}
+										}}
+										aria-label="Original audio volume"
+									/>
+									<span class="timeline-original-pct font-mono">
+										{projectStore.originalAudioMuted
+											? 'M'
+											: `${Math.round(projectStore.originalAudioGain * 100)}`}
+									</span>
+								</div>
+							{/if}
 						</div>
 
-						<div class="timeline-track-lane relative z-0 overflow-hidden" style="width: {widthPx}px;">
+						<div
+							class="timeline-track-lane relative z-0 overflow-hidden"
+							class:timeline-track-lane-locked={timelineUi.locked[track.kind]}
+							style="width: {widthPx}px;"
+						>
 							{#if track.shown}
 							<div
 								class="timeline-scale-layer absolute inset-y-0 left-0"
@@ -1726,7 +1825,7 @@
 										layoutZoom
 									)}
 									<div
-										class="timeline-clip timeline-clip-video pointer-events-none absolute overflow-hidden rounded-[0.45rem] border"
+										class="timeline-clip timeline-clip-video pointer-events-none absolute overflow-hidden rounded-none border"
 										style="left: 0; width: {Math.max(48, mediaW || layoutWidthPx)}px; top: 0.4rem; bottom: 0.4rem;"
 									>
 										<VideoFilmstrip
@@ -1738,7 +1837,7 @@
 									</div>
 								{:else}
 									<div
-										class="timeline-original-empty pointer-events-none absolute inset-y-1.5 left-1 flex items-center rounded-[0.45rem] border border-dashed px-3"
+										class="timeline-original-empty pointer-events-none absolute inset-y-1.5 left-1 flex items-center rounded-none border border-dashed px-3"
 										style="width: {Math.max(48, layoutWidthPx - 8)}px;"
 									>
 										<span class="text-[10px] text-muted-foreground">
@@ -1746,11 +1845,114 @@
 										</span>
 									</div>
 								{/if}
+							{:else if track.kind === 'titleLiver'}
+								{#each projectStore.titleLiverClips as tl (tl.id)}
+									{@const dragLive =
+										titleLiverDrag?.id === tl.id ? titleLiverDrag : null}
+									{@const startMs = dragLive?.startMs ?? tl.startMs}
+									{@const endMs = dragLive?.endMs ?? tl.endMs}
+									{@const left = msToX(startMs, layoutZoom)}
+									{@const width = Math.max(1, msToX(Math.max(0, endMs - startMs), layoutZoom))}
+									{@const selected = projectStore.selectedTitleLiverId === tl.id}
+									{@const trimming =
+										dragLive?.moved &&
+										(dragLive.mode === 'trim-start' || dragLive.mode === 'trim-end')}
+									{@const micro = width < 14}
+									<button
+										type="button"
+										data-clip
+										data-title-liver-id={tl.id}
+										aria-pressed={selected}
+										class={[
+											'timeline-clip absolute overflow-hidden rounded-none border text-left',
+											micro ? 'px-0' : 'px-1.5',
+											'timeline-clip-title-liver',
+											micro ? 'timeline-clip-micro' : '',
+											selected ? 'timeline-clip-selected' : '',
+											dragLive?.moved && dragLive.mode === 'move' ? 'timeline-clip-dragging' : '',
+											trimming ? 'timeline-clip-trimming' : ''
+										]
+											.filter(Boolean)
+											.join(' ')}
+										style="left: {left}px; width: {width}px; --tl-accent: {tl.accent};"
+										title="{tl.line1} · {tl.line2} — drag to move, edges to trim"
+										onpointerdown={(e) => {
+											if ((e.target as HTMLElement).closest('[data-trim-handle]')) return;
+											onTitleLiverPointerDown(e, tl.id, tl.startMs, tl.endMs, 'move');
+										}}
+										onpointermove={onTitleLiverPointerMove}
+										onpointerup={onTitleLiverPointerUp}
+										onpointercancel={onTitleLiverPointerUp}
+										onclick={(e) => e.stopPropagation()}
+										ondblclick={(e) => {
+											e.stopPropagation();
+											projectStore.selectTitleLiver(tl.id);
+											studioUi.openTitleLiver();
+										}}
+									>
+										<span class="timeline-clip-label pointer-events-none block truncate text-[10px] leading-4">
+											{micro ? '' : tl.line1 || 'Title Liver'}
+										</span>
+										{#if trimming}
+											<span class="timeline-trim-badge pointer-events-none">
+												{formatTimecode(startMs, projectStore.current.fps)} →
+												{formatTimecode(endMs, projectStore.current.fps)}
+											</span>
+										{/if}
+										<span
+											data-trim-handle="start"
+											class="timeline-trim-handle timeline-trim-handle-start"
+											class:timeline-trim-handle-active={trimming &&
+												dragLive?.mode === 'trim-start'}
+											onpointerdown={(e) => {
+												e.stopPropagation();
+												onTitleLiverPointerDown(
+													e as PointerEvent & { currentTarget: HTMLElement },
+													tl.id,
+													tl.startMs,
+													tl.endMs,
+													'trim-start'
+												);
+											}}
+											onpointermove={onTitleLiverPointerMove}
+											onpointerup={onTitleLiverPointerUp}
+											onpointercancel={onTitleLiverPointerUp}
+										></span>
+										<span
+											data-trim-handle="end"
+											class="timeline-trim-handle timeline-trim-handle-end"
+											class:timeline-trim-handle-active={trimming && dragLive?.mode === 'trim-end'}
+											onpointerdown={(e) => {
+												e.stopPropagation();
+												onTitleLiverPointerDown(
+													e as PointerEvent & { currentTarget: HTMLElement },
+													tl.id,
+													tl.startMs,
+													tl.endMs,
+													'trim-end'
+												);
+											}}
+											onpointermove={onTitleLiverPointerMove}
+											onpointerup={onTitleLiverPointerUp}
+											onpointercancel={onTitleLiverPointerUp}
+										></span>
+									</button>
+								{/each}
+								{#if !projectStore.titleLiverClips.length}
+									<div
+										class="pointer-events-none absolute inset-y-1.5 left-1 flex items-center rounded-none border border-dashed px-3"
+										style="width: {Math.max(48, layoutWidthPx - 8)}px;"
+									>
+										<span class="text-[10px] text-muted-foreground">
+											Title Liver → Add at playhead
+										</span>
+									</div>
+								{/if}
 							{:else if track.kind === 'subtitles'}
 								{#each projectStore.current.cues as cue (cue.id)}
 									{@const times = cueDisplayTimes(cue, 'subtitles')}
 									{@const left = msToX(times.startMs, layoutZoom)}
-									{@const width = Math.max(28, msToX(times.endMs - times.startMs, layoutZoom))}
+									{@const width = Math.max(1, msToX(Math.max(0, times.endMs - times.startMs), layoutZoom))}
 									{@const playing = projectStore.isCuePlaying(cue.id)}
 									{@const selected = projectStore.selectedCueIds.includes(cue.id)}
 									{@const moving = isClipPreview(cue.id, 'subtitles')}
@@ -1762,7 +1964,7 @@
 										layoutZoom
 									)}
 									{@const originWidth = Math.max(
-										28,
+										1,
 										msToX(
 											trimming && clipTrim
 												? clipTrim.originEndMs - clipTrim.originStartMs
@@ -1772,7 +1974,7 @@
 									)}
 									{#if moving || trimming}
 										<div
-											class="timeline-clip-ghost timeline-clip-subs pointer-events-none absolute overflow-hidden rounded-[0.45rem] border px-1.5"
+											class="timeline-clip-ghost timeline-clip-subs pointer-events-none absolute overflow-hidden rounded-none border px-1.5"
 											style="left: {originLeft}px; width: {originWidth}px;"
 											aria-hidden="true"
 										>
@@ -1790,7 +1992,7 @@
 										data-cue-id={cue.id}
 										aria-pressed={selected}
 										class={[
-											'timeline-clip absolute overflow-hidden rounded-[0.45rem] border px-1.5 text-left',
+											'timeline-clip absolute overflow-hidden rounded-none border px-1.5 text-left',
 											'timeline-clip-subs',
 											selected ? 'timeline-clip-selected' : '',
 											playing ? 'timeline-clip-playing' : '',
@@ -1873,11 +2075,11 @@
 								{#each projectStore.current.cues.filter((c) => projectStore.cueHasTtsAudio(c)) as cue (cue.id)}
 									{@const times = cueDisplayTimes(cue, 'tts')}
 									{@const left = msToX(times.startMs, layoutZoom)}
-									{@const width = Math.max(24, msToX(times.endMs - times.startMs, layoutZoom))}
+									{@const width = Math.max(1, msToX(Math.max(0, times.endMs - times.startMs), layoutZoom))}
 									{@const originLeft = msToX(cue.startMs, layoutZoom)}
 									{@const originWidth = Math.max(
-										24,
-										msToX(cue.endMs - cue.startMs, layoutZoom)
+										1,
+										msToX(Math.max(0, cue.endMs - cue.startMs), layoutZoom)
 									)}
 									{@const peaks = projectStore.ttsPeaksForCue(cue.id, Math.max(40, width), 2)}
 									{@const playing = projectStore.isCuePlaying(cue.id)}
@@ -1888,7 +2090,7 @@
 										dndStore.drag?.kind === 'tts-audio' && dndStore.drag.id === cue.id}
 									{#if moving || trimming}
 										<div
-											class="timeline-clip-ghost timeline-clip-tts pointer-events-none absolute overflow-hidden rounded-[0.45rem] border"
+											class="timeline-clip-ghost timeline-clip-tts pointer-events-none absolute overflow-hidden rounded-none border"
 											style="left: {originLeft}px; width: {originWidth}px;"
 											aria-hidden="true"
 										>
@@ -1903,7 +2105,7 @@
 										draggable="true"
 										aria-pressed={selected}
 										class={[
-											'timeline-clip absolute overflow-hidden rounded-[0.45rem] border',
+											'timeline-clip absolute overflow-hidden rounded-none border',
 											'timeline-clip-tts',
 											'timeline-clip-tts-enter',
 											selected ? 'timeline-clip-selected' : '',
@@ -2020,7 +2222,7 @@
 									)}
 									<div
 										data-clip
-										class="timeline-clip timeline-clip-original pointer-events-none absolute overflow-hidden rounded-[0.45rem] border"
+										class="timeline-clip timeline-clip-original pointer-events-none absolute overflow-hidden rounded-none border"
 										class:timeline-clip-original-dimmed={projectStore.originalAudioMuted ||
 											projectStore.originalAudioGain < 0.05}
 										style="left: 0; width: {Math.max(1, originalWidthPx)}px; opacity: {projectStore.originalAudioMuted
@@ -2033,7 +2235,7 @@
 									</div>
 								{:else}
 									<div
-										class="timeline-original-empty pointer-events-none absolute inset-y-1.5 left-1 flex items-center rounded-[0.45rem] border border-dashed px-3"
+										class="timeline-original-empty pointer-events-none absolute inset-y-1.5 left-1 flex items-center rounded-none border border-dashed px-3"
 										style="width: {Math.max(48, layoutWidthPx - 8)}px;"
 									>
 										<span class="text-[10px] text-muted-foreground">
@@ -2123,51 +2325,111 @@
 </section>
 
 <style>
+	/* —— Timeline chrome (Resolve tool arrangement, theme colors) —— */
 	:global([data-slot='timeline-editor'].timeline-shell) {
-		margin: 0.4rem 0.45rem 0.45rem;
-		border: 1px solid color-mix(in oklab, var(--border) 78%, transparent);
-		border-radius: 0.9rem;
-		background: color-mix(in oklab, var(--card) 88%, var(--surface-timeline));
-		box-shadow:
-			0 1px 0 color-mix(in oklab, white 6%, transparent) inset,
-			0 8px 24px color-mix(in oklab, var(--foreground) 6%, transparent);
+		margin: 0.3rem 0.35rem 0.4rem;
+		border: 1px solid color-mix(in oklab, var(--border) 85%, transparent);
+		border-radius: 6px;
+		background: color-mix(in oklab, var(--card) 92%, var(--surface-timeline));
+		box-shadow: var(--elevation-panel);
 		overflow: hidden;
 		isolation: isolate;
 	}
 
-	:global(:root:not(.dark) [data-slot='timeline-editor'].timeline-shell) {
-		box-shadow:
-			0 1px 0 color-mix(in oklab, white 70%, transparent) inset,
-			0 10px 28px color-mix(in oklab, var(--foreground) 7%, transparent);
-	}
-
 	.timeline-toolbar {
-		border-bottom: 1px solid color-mix(in oklab, var(--border) 70%, transparent);
-		border-radius: 0.9rem 0.9rem 0 0;
-		background:
-			linear-gradient(
-				180deg,
-				color-mix(in oklab, var(--card) 96%, white 4%),
-				color-mix(in oklab, var(--sidebar) 94%, var(--card))
-			);
-		box-shadow: inset 0 1px 0 color-mix(in oklab, white 55%, transparent);
+		display: grid;
+		grid-template-columns: 1fr auto 1fr;
+		align-items: center;
+		gap: 0.5rem;
+		min-height: 2rem;
+		padding: 0.2rem 0.45rem;
+		border-bottom: 1px solid color-mix(in oklab, var(--border) 80%, transparent);
+		background: color-mix(in oklab, var(--sidebar) 88%, var(--card));
 	}
 
-	:global(.dark) .timeline-toolbar {
-		background: linear-gradient(
-			180deg,
-			color-mix(in oklab, var(--card) 90%, white 3%),
-			color-mix(in oklab, var(--sidebar) 92%, var(--card))
-		);
-		box-shadow: inset 0 1px 0 oklch(1 0 0 / 4%);
+	.timeline-tools {
+		display: flex;
+		align-items: center;
+		gap: 1px;
+		justify-self: start;
 	}
 
-	.timeline-tool-cluster :global(button) {
-		border-radius: 0.55rem;
+	.timeline-zoom {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+		justify-self: end;
+	}
+
+	.timeline-tool-sep {
+		width: 1px;
+		height: 1rem;
+		margin-inline: 0.3rem;
+		background: color-mix(in oklab, var(--border) 90%, transparent);
+	}
+
+	.timeline-tool-btn {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 1.55rem;
+		height: 1.55rem;
+		border: 0;
+		border-radius: 3px;
+		background: transparent;
+		color: var(--muted-foreground);
+		cursor: pointer;
+	}
+
+	.timeline-tool-btn:hover:not(:disabled) {
+		color: var(--foreground);
+		background: var(--interact-hover);
+	}
+
+	.timeline-tool-btn:disabled {
+		opacity: 0.35;
+		cursor: default;
+	}
+
+	.timeline-tool-btn-active {
+		color: var(--foreground);
+		background: var(--interact-selected);
+		box-shadow: inset 0 0 0 1px var(--interact-ring);
+	}
+
+	/* Resolve: snapping armed = red accent */
+	.timeline-tool-btn-armed {
+		color: var(--playhead, #e10600);
+		background: color-mix(in oklab, var(--playhead, #e10600) 12%, transparent);
+		box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--playhead, #e10600) 40%, transparent);
+	}
+
+	.timeline-tc {
+		display: inline-flex;
+		align-items: baseline;
+		gap: 0.25rem;
+		justify-self: center;
+		font-family: var(--font-mono);
+		font-size: 11px;
+		font-variant-numeric: tabular-nums;
+		font-weight: 600;
+		letter-spacing: 0.02em;
+		color: var(--foreground);
+		user-select: none;
+	}
+
+	.timeline-tc-sep {
+		opacity: 0.35;
+		font-weight: 500;
+	}
+
+	.timeline-tc-dur {
+		color: var(--muted-foreground);
+		font-weight: 500;
 	}
 
 	.timeline-body {
-		border-radius: 0 0 0.85rem 0.85rem;
+		border-radius: 0;
 		background: var(--surface-timeline-deep);
 	}
 
@@ -2175,17 +2437,14 @@
 		transform-origin: 0 0;
 	}
 
-	/* Only promote a GPU layer while live-zooming — permanent will-change/translateZ
-	   made waveforms composite above sticky track headers when panning. */
 	.timeline-content.timeline-zoom-animating .timeline-scale-layer {
 		will-change: transform;
 	}
 
-	/* Zoom is driven live — never tween clip left/width (that felt stuck/laggy). */
 	.timeline-content {
-		/* Width is set imperatively during zoom — never ease it. */
 		transition: none;
 		overflow-anchor: none;
+		background: var(--timeline-lane-alt);
 	}
 
 	.timeline-content.timeline-zoom-animating :global([data-clip]),
@@ -2202,19 +2461,17 @@
 			transform 100ms var(--motion-ease) !important;
 	}
 
-	/* —— Ruler & track chrome —— */
 	.timeline-scroller {
-		/* Prevent browser scroll-anchoring from fighting programmatic follow. */
 		overflow-anchor: none;
-		/* Do not reserve a permanent right gutter — lanes should fill the pane. */
 		scrollbar-gutter: auto;
-		border-radius: 0 0 0.85rem 0.85rem;
+		border-radius: 0;
+		background: var(--surface-timeline-deep);
 	}
 
 	.timeline-ruler-corner,
 	.timeline-track-header {
-		border-right: 1px solid color-mix(in oklab, var(--border) 80%, transparent);
-		background: color-mix(in oklab, var(--sidebar) 94%, var(--card));
+		border-right: 1px solid color-mix(in oklab, var(--border) 85%, transparent);
+		background: var(--timeline-header);
 		isolation: isolate;
 	}
 
@@ -2222,7 +2479,7 @@
 		position: sticky;
 		left: 0;
 		z-index: 40;
-		border-bottom: 1px solid color-mix(in oklab, var(--border) 82%, var(--primary) 8%);
+		border-bottom: 1px solid color-mix(in oklab, var(--border) 85%, transparent);
 	}
 
 	.timeline-ruler-lane {
@@ -2231,63 +2488,81 @@
 		overflow: hidden;
 		contain: paint;
 		cursor: ew-resize;
-		border-bottom: 1px solid color-mix(in oklab, var(--border) 82%, var(--primary) 8%);
-		background: linear-gradient(
-			180deg,
-			color-mix(in oklab, var(--surface-timeline) 55%, var(--card)),
-			var(--surface-timeline-deep)
-		);
+		border-bottom: 1px solid color-mix(in oklab, var(--border) 85%, transparent);
+		background: var(--timeline-ruler);
 	}
 
 	.timeline-tick-major {
-		height: 100%;
-		background: color-mix(in oklab, var(--border) 85%, var(--foreground) 10%);
+		height: 55%;
+		bottom: 0;
+		background: color-mix(in oklab, var(--foreground) 28%, transparent);
 	}
 
 	.timeline-tick-minor {
-		height: 0.45rem;
-		background: color-mix(in oklab, var(--border) 70%, transparent);
+		height: 28%;
+		bottom: 0;
+		background: color-mix(in oklab, var(--foreground) 14%, transparent);
 	}
 
 	.timeline-tick-label {
 		position: absolute;
-		top: 0.3rem;
+		top: 0.15rem;
 		translate: -50% 0;
 		font-family: var(--font-mono);
-		font-size: 10px;
+		font-size: 9px;
 		font-variant-numeric: tabular-nums;
-		letter-spacing: 0.02em;
-		color: color-mix(in oklab, var(--muted-foreground) 92%, var(--foreground));
+		letter-spacing: 0.01em;
+		color: var(--muted-foreground);
+		font-weight: 500;
 	}
 
 	.timeline-track-row {
-		border-bottom: 1px solid color-mix(in oklab, var(--border) 78%, transparent);
-		box-shadow: inset 0 1px 0 color-mix(in oklab, var(--foreground) 3.5%, transparent);
-	}
-
-	.timeline-track-row:last-child {
-		border-bottom-color: transparent;
+		border-bottom: 1px solid color-mix(in oklab, var(--border) 80%, transparent);
+		box-shadow: none;
 	}
 
 	.timeline-track-header {
 		position: sticky;
 		left: 0;
 		z-index: 40;
-		display: flex;
+		display: grid;
+		grid-template-columns: auto minmax(0, 1fr) auto;
+		grid-template-rows: auto auto;
 		align-items: center;
-		gap: 0.65rem;
-		padding-inline: 0.85rem;
-		box-shadow: 1px 0 0 color-mix(in oklab, var(--border) 55%, transparent);
+		column-gap: 0.35rem;
+		row-gap: 0.15rem;
+		padding: 0.3rem 0.4rem;
+		box-shadow: none;
 	}
 
 	.timeline-track-swatch {
-		flex-shrink: 0;
-		width: 0.7rem;
-		height: 0.7rem;
-		border-radius: 0.35rem;
-		box-shadow:
-			inset 0 1px 0 oklch(1 0 0 / 28%),
-			0 0 0 1px color-mix(in oklab, var(--foreground) 8%, transparent);
+		grid-row: 1;
+		width: 0.4rem;
+		height: 0.4rem;
+		border-radius: 1px;
+		box-shadow: none;
+	}
+
+	.timeline-track-id {
+		grid-row: 1;
+		min-width: 0;
+	}
+
+	.timeline-track-controls {
+		grid-row: 1;
+		display: flex;
+		align-items: center;
+		gap: 1px;
+	}
+
+	.timeline-original-mixer {
+		grid-column: 1 / -1;
+		grid-row: 2;
+		display: flex;
+		align-items: center;
+		gap: 0.28rem;
+		margin-top: 0;
+		min-width: 0;
 	}
 
 	.timeline-track-name {
@@ -2295,61 +2570,25 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
-		font-size: 0.75rem;
-		font-weight: 650;
-		letter-spacing: 0.01em;
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.04em;
 		color: var(--foreground);
-		line-height: 1.2;
+		line-height: 1.1;
+		font-family: var(--font-mono);
 	}
 
 	.timeline-track-role {
-		margin: 0.12rem 0 0;
+		margin: 0.05rem 0 0;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
-		font-size: 9px;
-		font-weight: 600;
-		letter-spacing: 0.12em;
-		text-transform: uppercase;
+		font-size: 8px;
+		font-weight: 500;
+		letter-spacing: 0.02em;
+		text-transform: none;
 		color: var(--muted-foreground);
-		line-height: 1.2;
-	}
-
-	.timeline-original-mixer {
-		display: flex;
-		align-items: center;
-		gap: 0.28rem;
-		margin-top: 0.28rem;
-		min-width: 0;
-	}
-
-	.timeline-mute-btn {
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		flex-shrink: 0;
-		width: 1.35rem;
-		height: 1.35rem;
-		border-radius: 0.3rem;
-		border: 1px solid color-mix(in oklab, var(--border) 80%, transparent);
-		background: color-mix(in oklab, var(--muted) 35%, transparent);
-		color: var(--muted-foreground);
-		cursor: pointer;
-		transition:
-			color 120ms var(--motion-ease),
-			background 120ms var(--motion-ease),
-			border-color 120ms var(--motion-ease);
-	}
-
-	.timeline-mute-btn:hover {
-		color: var(--foreground);
-		border-color: color-mix(in oklab, var(--border) 60%, var(--foreground) 20%);
-	}
-
-	.timeline-mute-btn-active {
-		color: var(--destructive);
-		border-color: color-mix(in oklab, var(--destructive) 45%, var(--border));
-		background: color-mix(in oklab, var(--destructive) 12%, transparent);
+		line-height: 1.1;
 	}
 
 	.timeline-track-icon-btn {
@@ -2357,13 +2596,13 @@
 		align-items: center;
 		justify-content: center;
 		flex-shrink: 0;
-		width: 1.15rem;
-		height: 1.15rem;
-		border-radius: 0.25rem;
+		width: 1.1rem;
+		height: 1.1rem;
+		border-radius: 2px;
 		border: 1px solid transparent;
 		background: transparent;
 		color: var(--muted-foreground);
-		font-size: 9px;
+		font-size: 8px;
 		font-weight: 700;
 		line-height: 1;
 		cursor: pointer;
@@ -2371,7 +2610,7 @@
 
 	.timeline-track-icon-btn:hover {
 		color: var(--foreground);
-		background: color-mix(in oklab, var(--muted) 40%, transparent);
+		background: var(--interact-hover);
 	}
 
 	.timeline-track-icon-btn-active {
@@ -2384,9 +2623,82 @@
 		background: color-mix(in oklab, oklch(0.75 0.14 85) 14%, transparent);
 	}
 
+	.timeline-track-header-locked {
+		opacity: 0.85;
+	}
+
+	.timeline-track-lane-locked :global([data-clip]) {
+		pointer-events: none;
+		opacity: 0.7;
+	}
+
 	.timeline-track-row-hidden .timeline-track-lane {
-		opacity: 0.35;
+		opacity: 0.3;
 		background: var(--surface-timeline-deep);
+	}
+
+	.timeline-original-pct {
+		flex-shrink: 0;
+		min-width: 1.4rem;
+		text-align: right;
+		font-size: 9px;
+		font-weight: 600;
+		color: var(--muted-foreground);
+		line-height: 1;
+	}
+
+	:global(.timeline-original-fader) {
+		height: 1rem;
+	}
+
+	:global(.timeline-original-fader [data-slot='slider-track']) {
+		height: 0.18rem;
+		border-radius: 0;
+	}
+
+	:global(.timeline-original-fader [data-slot='slider-thumb']) {
+		width: 0.55rem;
+		height: 0.55rem;
+		border-radius: 1px;
+	}
+
+	.timeline-clip-original-dimmed {
+		filter: grayscale(0.35) brightness(0.85);
+	}
+
+	.timeline-track-row[data-track-kind='original'] .timeline-track-header {
+		align-items: center;
+		padding-block: 0.3rem;
+	}
+
+	.timeline-track-lane {
+		position: relative;
+		z-index: 0;
+		overflow: hidden;
+		contain: paint;
+		background: var(--timeline-lane);
+	}
+
+	.timeline-track-row[data-track-kind='video'] .timeline-track-lane,
+	.timeline-track-row[data-track-kind='titleLiver'] .timeline-track-lane,
+	.timeline-track-row[data-track-kind='subtitles'] .timeline-track-lane,
+	.timeline-track-row[data-track-kind='tts'] .timeline-track-lane,
+	.timeline-track-row[data-track-kind='original'] .timeline-track-lane {
+		background: var(--timeline-lane);
+	}
+
+	.timeline-lane-gridline {
+		position: absolute;
+		inset-block: 0;
+		width: 1px;
+		background: color-mix(in oklab, var(--foreground) 5%, transparent);
+		pointer-events: none;
+	}
+
+	.timeline-marquee {
+		border: 1px solid var(--playhead, #e10600);
+		background: color-mix(in oklab, var(--playhead, #e10600) 12%, transparent);
+		border-radius: 0;
 	}
 
 	:global([data-slot='timeline-editor'].timeline-blade-cursor) {
@@ -2397,105 +2709,18 @@
 		cursor: crosshair;
 	}
 
-	.timeline-original-pct {
-		flex-shrink: 0;
-		min-width: 1.6rem;
-		text-align: right;
-		font-size: 9px;
-		font-weight: 600;
-		color: var(--muted-foreground);
-		line-height: 1;
-	}
-
-	:global(.timeline-original-fader) {
-		height: 1.1rem;
-	}
-
-	:global(.timeline-original-fader [data-slot='slider-track']) {
-		height: 0.22rem;
-	}
-
-	:global(.timeline-original-fader [data-slot='slider-thumb']) {
-		width: 0.65rem;
-		height: 0.65rem;
-	}
-
-	.timeline-clip-original-dimmed {
-		filter: grayscale(0.35);
-	}
-
-	.timeline-track-row[data-track-kind='original'] .timeline-track-header {
-		align-items: flex-start;
-		padding-block: 0.55rem;
-	}
-
-	.timeline-track-lane {
-		position: relative;
-		z-index: 0;
-		/* Clip zoom-scaled waveforms so they cannot paint over the sticky header. */
-		overflow: hidden;
-		contain: paint;
-		background: linear-gradient(180deg, var(--surface-timeline), var(--surface-timeline-deep));
-	}
-
-	.timeline-track-row[data-track-kind='video'] .timeline-track-lane {
-		background: linear-gradient(
-			180deg,
-			color-mix(in oklab, var(--track-video) 6%, var(--surface-timeline)),
-			var(--surface-timeline-deep)
-		);
-	}
-
-	.timeline-track-row[data-track-kind='subtitles'] .timeline-track-lane {
-		background: linear-gradient(
-			180deg,
-			color-mix(in oklab, var(--track-subs) 5%, var(--surface-timeline)),
-			var(--surface-timeline-deep)
-		);
-	}
-
-	.timeline-track-row[data-track-kind='tts'] .timeline-track-lane {
-		background: linear-gradient(
-			180deg,
-			color-mix(in oklab, var(--track-tts) 5.5%, var(--surface-timeline)),
-			var(--surface-timeline-deep)
-		);
-	}
-
-	.timeline-track-row[data-track-kind='original'] .timeline-track-lane {
-		background: linear-gradient(
-			180deg,
-			color-mix(in oklab, var(--track-original) 5%, var(--surface-timeline)),
-			var(--surface-timeline-deep)
-		);
-	}
-
-	.timeline-lane-gridline {
-		position: absolute;
-		inset-block: 0;
-		width: 1px;
-		background: color-mix(in oklab, var(--foreground) 5.5%, transparent);
-		pointer-events: none;
-	}
-
-	.timeline-marquee {
-		border: 1px solid color-mix(in oklab, var(--primary) 70%, white);
-		background: color-mix(in oklab, var(--primary) 18%, transparent);
-		border-radius: 2px;
-	}
-
 	.timeline-blade-guide {
 		width: 0;
-		border-left: 1px dashed color-mix(in oklab, var(--destructive) 55%, white);
+		border-left: 1px dashed oklch(0.75 0.14 85);
 		margin-left: -0.5px;
 	}
 
 	.timeline-blade-guide-valid {
-		border-left-color: color-mix(in oklab, oklch(0.72 0.18 55) 85%, white);
+		border-left-color: oklch(0.75 0.14 85);
 	}
 
 	.timeline-blade-guide-invalid {
-		border-left-color: color-mix(in oklab, var(--muted-foreground) 55%, transparent);
+		border-left-color: var(--muted-foreground);
 		opacity: 0.55;
 	}
 
@@ -2505,14 +2730,14 @@
 		left: -4px;
 		width: 8px;
 		height: 8px;
-		border-radius: 1px;
-		background: color-mix(in oklab, oklch(0.72 0.18 55) 90%, white);
+		border-radius: 0;
+		background: oklch(0.75 0.14 85);
 		transform: rotate(45deg);
 		transform-origin: center;
 	}
 
 	.timeline-blade-guide-invalid .timeline-blade-guide-cap {
-		background: color-mix(in oklab, var(--muted-foreground) 70%, transparent);
+		background: var(--muted-foreground);
 	}
 
 	.timeline-blade-guide-label {
@@ -2576,19 +2801,19 @@
 		transition: none !important;
 	}
 
-	/* Down-pointing caret sitting on the ruler, above the slim stem. */
+	/* Resolve-style head: flat red house / inverted chevron on the ruler. */
 	.timeline-playhead-head {
 		position: absolute;
 		top: 0;
 		left: 50%;
 		z-index: 2;
-		width: 0;
-		height: 0;
+		width: 11px;
+		height: 10px;
 		transform: translateX(-50%);
-		border-left: 7px solid transparent;
-		border-right: 7px solid transparent;
-		border-top: 10px solid #ef4444;
-		filter: drop-shadow(0 1px 4px oklch(0.55 0.22 25 / 65%));
+		background: var(--playhead, #e10600);
+		clip-path: polygon(0 0, 100% 0, 100% 55%, 50% 100%, 0 55%);
+		filter: none;
+		border: 0;
 	}
 
 	.timeline-playhead-stem {
@@ -2597,110 +2822,102 @@
 		bottom: 0;
 		left: 50%;
 		z-index: 1;
-		width: 2px;
+		width: 1px;
 		transform: translateX(-50%);
-		border-radius: 1px;
-		background: #ef4444;
-		box-shadow:
-			0 0 0 1px color-mix(in oklab, #ef4444 40%, transparent),
-			0 0 10px oklch(0.63 0.24 25 / 65%),
-			0 0 20px oklch(0.63 0.22 25 / 35%);
+		border-radius: 0;
+		background: var(--playhead, #e10600);
+		box-shadow: none;
 	}
 
 	:global(:root:not(.dark)) .timeline-playhead-head {
-		border-top-color: var(--playhead, #dc2626);
+		background: var(--playhead, #e10600);
 	}
 
 	:global(:root:not(.dark)) .timeline-playhead-stem {
-		background: var(--playhead, #dc2626);
-		box-shadow:
-			0 0 0 1px color-mix(in oklab, #991b1b 28%, transparent),
-			0 0 12px oklch(0.55 0.22 25 / 45%),
-			0 0 22px oklch(0.55 0.2 25 / 26%);
+		background: var(--playhead, #e10600);
+		box-shadow: none;
 	}
 
 	.timeline-playhead-label {
 		position: absolute;
-		top: 12px;
-		left: 10px;
+		top: 11px;
+		left: 8px;
 		z-index: 3;
-		padding: 2px 7px;
-		border-radius: 4px;
-		border: 1px solid color-mix(in oklab, #ef4444 45%, var(--border));
-		background: color-mix(in oklab, var(--card) 82%, #ef4444 14%);
-		color: var(--foreground);
+		padding: 1px 5px;
+		border-radius: 1px;
+		border: 1px solid #111;
+		background: #1a1a1a;
+		color: #f0f0f0;
 		font-family: var(--font-mono);
-		font-size: 10px;
-		font-weight: 650;
+		font-size: 9px;
+		font-weight: 600;
 		font-variant-numeric: tabular-nums;
 		letter-spacing: 0.02em;
-		line-height: 1.4;
+		line-height: 1.35;
 		white-space: nowrap;
-		box-shadow: var(--elevation-float);
-		backdrop-filter: blur(6px);
+		box-shadow: none;
+		backdrop-filter: none;
 		pointer-events: none;
 	}
 
 	:global(.dark) .timeline-playhead-label {
-		padding: 2px 7px;
+		padding: 1px 5px;
 		font-weight: 600;
-		background: oklch(0.22 0.06 25 / 94%);
-		color: oklch(0.96 0.02 25);
-		border-color: oklch(0.65 0.2 25 / 48%);
-		box-shadow:
-			0 2px 8px oklch(0 0 0 / 35%),
-			0 0 12px oklch(0.63 0.22 25 / 28%);
+		background: #1a1a1a;
+		color: #f0f0f0;
+		border-color: #111;
+		box-shadow: none;
 	}
 
 	.timeline-playhead-label-left {
 		left: auto;
-		right: 11px;
+		right: 8px;
 	}
 
 	.timeline-original-label {
 		pointer-events: none;
 		position: absolute;
-		top: 0.3rem;
-		left: 0.5rem;
-		border-radius: 0.25rem;
-		background: var(--surface-overlay);
-		padding: 0.05rem 0.35rem;
+		top: 0.2rem;
+		left: 0.35rem;
+		border-radius: 1px;
+		background: rgb(0 0 0 / 45%);
+		padding: 0.05rem 0.3rem;
 		font-family: var(--font-mono);
-		font-size: 9px;
+		font-size: 8px;
 		font-weight: 600;
 		letter-spacing: 0.04em;
 		text-transform: uppercase;
-		color: color-mix(in oklab, var(--foreground) 82%, transparent);
+		color: #ddd;
 	}
 
 	.timeline-original-empty {
 		pointer-events: none;
-		border-color: color-mix(in oklab, var(--track-original) 28%, var(--border));
-		background: color-mix(in oklab, var(--track-original) 6%, transparent);
-		box-shadow: inset 0 1px 0 color-mix(in oklab, white 8%, transparent);
+		border-color: #444;
+		border-style: dashed;
+		background: transparent;
+		box-shadow: none;
+		border-radius: 1px;
 	}
 
 	.timeline-clip-video {
-		border-color: color-mix(in oklab, var(--track-video) 38%, transparent);
-		background: color-mix(in oklab, var(--track-video) 10%, var(--surface-timeline-deep));
-		box-shadow:
-			0 1px 2px oklch(0 0 0 / 12%),
-			inset 0 1px 0 oklch(1 0 0 / 8%);
+		border-color: #2a5078;
+		background: var(--clip-video-bg, #3a6ea5);
+		box-shadow: none;
 		cursor: default;
+		border-radius: 1px;
 	}
 
 	.timeline-clip-original {
-		border-color: color-mix(in oklab, var(--track-original) 42%, transparent);
-		background: var(--clip-original-bg);
+		border-color: #1f6a3c;
+		background: var(--clip-original-bg, #2f8a52);
 		cursor: default;
-		box-shadow:
-			0 1px 2px oklch(0 0 0 / 10%),
-			inset 0 1px 0 oklch(1 0 0 / 8%);
+		box-shadow: none;
+		border-radius: 1px;
 	}
 
 	:global(.dark) .timeline-clip-original {
-		border-color: color-mix(in oklab, var(--track-original) 38%, transparent);
-		background: color-mix(in oklab, var(--track-original) 18%, transparent);
+		border-color: #1f6a3c;
+		background: var(--clip-original-bg, #2f8a52);
 	}
 
 	@media (prefers-reduced-motion: reduce) {
@@ -2719,143 +2936,110 @@
 	}
 
 	:global(.tts-clip-dragging) {
-		opacity: 0.4 !important;
-		transform: scale(0.96);
+		opacity: 0.45 !important;
+		transform: none;
 	}
 
 	.timeline-clip {
 		z-index: 2;
-		top: 0.55rem;
-		bottom: 0.55rem;
-		border-radius: 0.45rem;
+		top: 0.28rem;
+		bottom: 0.28rem;
+		border-radius: 1px;
 		cursor: grab;
 		touch-action: none;
 		user-select: none;
-		outline: 2px solid transparent;
+		outline: 1px solid transparent;
 		outline-offset: 0;
-		box-shadow:
-			0 1px 2px oklch(0 0 0 / 10%),
-			inset 0 1px 0 oklch(1 0 0 / 8%);
-		/* Intentionally no left/width transitions — zoom must track 1:1 with the control. */
+		box-shadow: none;
 		transition:
-			box-shadow var(--motion-base) var(--motion-ease),
-			border-color var(--motion-base) var(--motion-ease),
-			background-color var(--motion-base) var(--motion-ease),
-			transform var(--motion-fast) var(--motion-spring),
-			opacity var(--motion-base) var(--motion-ease),
-			filter var(--motion-base) var(--motion-ease),
-			outline-color var(--motion-base) var(--motion-ease),
-			outline-offset var(--motion-fast) var(--motion-ease);
+			outline-color 80ms ease,
+			filter 80ms ease,
+			opacity 80ms ease;
 	}
 
 	.timeline-content.timeline-has-selection .timeline-clip:not(.timeline-clip-selected):not(
 			.timeline-clip-dragging
 		):not(.timeline-clip-original):not(.timeline-clip-video) {
-		opacity: 0.62;
-		filter: saturate(0.82);
+		opacity: 0.72;
+		filter: saturate(0.9);
 	}
 
 	.timeline-clip:hover:not(.timeline-clip-dragging):not(.timeline-clip-trimming):not(
 			.timeline-clip-original
 		):not(.timeline-clip-video) {
-		filter: brightness(1.06) saturate(1.04);
-		transform: translateY(-1.5px);
-		box-shadow:
-			0 4px 12px oklch(0 0 0 / 14%),
-			0 0 0 1px color-mix(in oklab, var(--foreground) 10%, transparent),
-			inset 0 1px 0 oklch(1 0 0 / 14%);
+		filter: brightness(1.08);
+		transform: none;
+		box-shadow: none;
 	}
 
 	:global(:root:not(.dark))
 		.timeline-clip:hover:not(.timeline-clip-dragging):not(.timeline-clip-trimming):not(
 			.timeline-clip-original
 		):not(.timeline-clip-video) {
-		box-shadow:
-			0 5px 14px oklch(0.4 0.04 265 / 14%),
-			0 0 0 1px color-mix(in oklab, var(--primary) 16%, var(--border)),
-			inset 0 1px 0 oklch(1 0 0 / 45%);
+		box-shadow: none;
 	}
 
 	.timeline-content.timeline-has-selection
 		.timeline-clip:not(.timeline-clip-selected):not(.timeline-clip-dragging):not(
 			.timeline-clip-original
 		):not(.timeline-clip-video):hover {
-		opacity: 0.86;
-		filter: brightness(1.06) saturate(0.95);
+		opacity: 0.9;
+		filter: brightness(1.08);
 	}
 
 	.timeline-clip:active:not(.timeline-clip-dragging) {
 		cursor: grabbing;
-		transform: translateY(0) scale(0.985);
-		filter: brightness(0.98);
+		transform: none;
+		filter: brightness(0.96);
 	}
 
 	.timeline-content.timeline-clip-moving .timeline-clip:not(.timeline-clip-dragging) {
-		/* Keep non-dragged clips stable; allow settle transition after release */
-		transition:
-			box-shadow var(--motion-base) var(--motion-ease),
-			border-color var(--motion-base) var(--motion-ease),
-			background-color var(--motion-base) var(--motion-ease),
-			opacity var(--motion-base) var(--motion-ease),
-			filter var(--motion-base) var(--motion-ease);
+		transition: opacity 80ms ease, filter 80ms ease;
 	}
 
 	.timeline-clip-ghost {
 		z-index: 3;
-		top: 0.55rem;
-		bottom: 0.55rem;
-		opacity: 0.38;
+		top: 0.28rem;
+		bottom: 0.28rem;
+		opacity: 0.35;
 		border-style: dashed !important;
-		filter: grayscale(0.15);
+		border-radius: 1px;
+		filter: none;
 		box-shadow: none !important;
 		outline: none !important;
-		animation: clip-ghost-in var(--motion-fast) var(--motion-ease-out);
+		animation: none;
 	}
 
 	.timeline-clip-dragging {
 		z-index: 20 !important;
-		opacity: 0.98 !important;
-		filter: brightness(1.06) saturate(1.08);
-		transform: translateY(-5px) scale(1.04);
-		box-shadow:
-			0 16px 34px oklch(0 0 0 / 28%),
-			0 6px 14px oklch(0 0 0 / 14%),
-			0 0 0 1.5px color-mix(in oklab, var(--primary) 52%, transparent) !important;
-		outline-color: color-mix(in oklab, var(--primary) 45%, transparent);
-		outline-offset: 2px;
+		opacity: 0.95 !important;
+		filter: brightness(1.1);
+		transform: none;
+		box-shadow: none !important;
+		outline: 1px solid #e10600 !important;
+		outline-offset: 0;
 		cursor: grabbing;
 		transition: none !important;
-		will-change: left, transform;
+		will-change: left;
 	}
 
 	.timeline-clip-trimming {
 		z-index: 21 !important;
 		opacity: 1 !important;
-		filter: brightness(1.05);
-		transform: translateY(-2px) scaleY(1.04);
-		box-shadow:
-			0 10px 24px oklch(0 0 0 / 22%),
-			0 0 0 1.5px color-mix(in oklab, var(--primary) 55%, transparent) !important;
-		outline-color: color-mix(in oklab, var(--primary) 50%, transparent);
-		outline-offset: 1px;
+		filter: brightness(1.06);
+		transform: none;
+		box-shadow: none !important;
+		outline: 1px solid #e10600 !important;
+		outline-offset: 0;
 		cursor: ew-resize;
 		transition: none !important;
 		overflow: visible !important;
 		will-change: left, width;
 	}
 
-	:global(.dark) .timeline-clip-dragging {
-		box-shadow:
-			0 18px 40px oklch(0 0 0 / 48%),
-			0 0 24px color-mix(in oklab, var(--primary) 30%, transparent),
-			0 0 0 1.5px color-mix(in oklab, var(--primary) 58%, transparent) !important;
-	}
-
+	:global(.dark) .timeline-clip-dragging,
 	:global(.dark) .timeline-clip-trimming {
-		box-shadow:
-			0 12px 28px oklch(0 0 0 / 42%),
-			0 0 18px color-mix(in oklab, var(--primary) 26%, transparent),
-			0 0 0 1.5px color-mix(in oklab, var(--primary) 60%, transparent) !important;
+		box-shadow: none !important;
 	}
 
 	.timeline-trim-handle {
@@ -3036,25 +3220,53 @@
 	}
 
 	.timeline-clip-subs {
-		border-color: color-mix(in oklab, var(--track-subs) 55%, transparent);
-		background: var(--clip-subs-bg);
-		color: color-mix(in oklab, var(--track-subs) 72%, var(--foreground));
+		border-color: #2a5078;
+		background: var(--clip-subs-bg, #3d6f9c);
+		color: #f2f6fa;
+	}
+
+	.timeline-clip-title-liver {
+		border-color: color-mix(in oklab, var(--tl-accent, #6b4c9a) 65%, #111);
+		background: var(--tl-accent, var(--clip-title-liver-bg, #6b4c9a));
+		color: #f5f0ff;
+		box-shadow: none;
+	}
+
+	.timeline-clip-micro {
+		border-radius: 1px;
+		box-shadow: none;
+	}
+
+	.timeline-clip-micro .timeline-trim-handle {
+		width: 10px;
+		opacity: 0.55;
+	}
+
+	.timeline-clip-micro .timeline-trim-handle-start {
+		left: -4px;
+	}
+
+	.timeline-clip-micro .timeline-trim-handle-end {
+		right: -4px;
 	}
 
 	:global(.dark) .timeline-clip-subs {
-		/* Opaque mix against the card — transparent mixes vanish on dark lanes. */
-		border-color: color-mix(in oklab, var(--track-subs) 70%, transparent);
-		background: color-mix(in oklab, var(--track-subs) 38%, var(--card));
-		color: oklch(0.94 0.02 230);
-		box-shadow:
-			0 1px 3px oklch(0 0 0 / 35%),
-			inset 0 1px 0 oklch(1 0 0 / 10%);
+		border-color: #2a5078;
+		background: var(--clip-subs-bg, #3d6f9c);
+		color: #f2f6fa;
+		box-shadow: none;
+	}
+
+	:global(.dark) .timeline-clip-title-liver {
+		border-color: color-mix(in oklab, var(--tl-accent, #6b4c9a) 65%, #111);
+		background: var(--tl-accent, var(--clip-title-liver-bg, #6b4c9a));
+		color: #f5f0ff;
 	}
 
 	.timeline-clip-tts {
-		border-color: color-mix(in oklab, var(--track-tts) 50%, transparent);
-		background: var(--clip-tts-bg);
-		color: color-mix(in oklab, var(--track-tts) 70%, var(--foreground));
+		border-color: #4a3570;
+		background: var(--clip-tts-bg, #6b4f9a);
+		color: #f3ecff;
 	}
 
 	.timeline-clip-tts-enter {
@@ -3140,12 +3352,10 @@
 	}
 
 	:global(.dark) .timeline-clip-tts {
-		border-color: color-mix(in oklab, var(--track-tts) 68%, transparent);
-		background: color-mix(in oklab, var(--track-tts) 34%, var(--card));
-		color: oklch(0.94 0.02 292);
-		box-shadow:
-			0 1px 3px oklch(0 0 0 / 35%),
-			inset 0 1px 0 oklch(1 0 0 / 10%);
+		border-color: #4a3570;
+		background: var(--clip-tts-bg, #6b4f9a);
+		color: #f3ecff;
+		box-shadow: none;
 	}
 
 	.timeline-clip-label {
@@ -3153,70 +3363,53 @@
 		font-weight: 550;
 	}
 
-	/* Linked selection — matches subtitle table primary edge */
+	/* Resolve selection — red outline, keep clip fill */
 	.timeline-clip-selected {
 		z-index: 4;
 		opacity: 1 !important;
 		filter: none;
-		border-color: color-mix(in oklab, var(--primary) 78%, transparent) !important;
-		background: color-mix(in oklab, var(--primary) 18%, var(--card)) !important;
-		outline-color: color-mix(in oklab, var(--primary) 55%, transparent);
-		outline-offset: 1px;
-		box-shadow:
-			0 0 0 1px color-mix(in oklab, var(--primary) 42%, transparent),
-			0 4px 14px color-mix(in oklab, var(--primary) 24%, transparent),
-			inset 0 1px 0 oklch(1 0 0 / 12%);
+		border-color: #e10600 !important;
+		outline: 1px solid #e10600;
+		outline-offset: 0;
+		box-shadow: none;
 	}
 
 	.timeline-clip-selected:hover {
-		filter: brightness(1.04);
-		transform: translateY(-1px);
-		outline-offset: 2px;
+		filter: brightness(1.06);
+		transform: none;
+		outline-offset: 0;
 	}
 
 	:global(.dark) .timeline-clip-selected {
-		background: color-mix(in oklab, var(--primary) 28%, transparent) !important;
-		outline-color: color-mix(in oklab, var(--primary) 60%, transparent);
-		box-shadow:
-			0 0 0 1px color-mix(in oklab, var(--primary) 52%, transparent),
-			0 0 18px color-mix(in oklab, var(--primary) 28%, transparent),
-			inset 0 1px 0 oklch(1 0 0 / 8%);
+		outline: 1px solid #e10600;
+		box-shadow: none;
 	}
 
 	.timeline-clip-playing {
 		z-index: 5;
-		border-color: color-mix(in oklab, oklch(0.62 0.16 155) 70%, transparent) !important;
-		box-shadow:
-			0 0 0 1px color-mix(in oklab, oklch(0.62 0.16 155) 35%, transparent),
-			0 0 14px color-mix(in oklab, oklch(0.62 0.16 155) 28%, transparent);
+		border-color: #3dd68c !important;
+		box-shadow: none;
 	}
 
 	.timeline-clip-tts.timeline-clip-playing {
-		outline: 1px solid color-mix(in oklab, oklch(0.62 0.16 155) 55%, transparent);
-		animation: tts-clip-playing-glow 1.2s ease-in-out infinite;
+		outline: 1px solid #3dd68c;
+		animation: none;
 	}
 
 	@keyframes tts-clip-playing-glow {
 		0%,
 		100% {
-			box-shadow:
-				0 0 0 1px color-mix(in oklab, oklch(0.62 0.16 155) 30%, transparent),
-				0 0 10px color-mix(in oklab, oklch(0.62 0.16 155) 22%, transparent);
+			box-shadow: none;
 		}
 		50% {
-			box-shadow:
-				0 0 0 1px color-mix(in oklab, oklch(0.62 0.16 155) 50%, transparent),
-				0 0 18px color-mix(in oklab, oklch(0.62 0.16 155) 40%, transparent);
+			box-shadow: none;
 		}
 	}
 
 	.timeline-clip-selected.timeline-clip-playing {
 		z-index: 6;
-		border-color: color-mix(in oklab, var(--primary) 80%, transparent) !important;
-		outline-color: color-mix(in oklab, var(--primary) 50%, oklch(0.62 0.16 155));
-		box-shadow:
-			0 0 0 1px color-mix(in oklab, var(--primary) 45%, transparent),
-			0 0 16px color-mix(in oklab, var(--primary) 22%, transparent),
-			0 0 12px color-mix(in oklab, oklch(0.62 0.16 155) 22%, transparent);
+		border-color: #e10600 !important;
+		outline: 1px solid #e10600;
+		box-shadow: none;
 	}
 </style>

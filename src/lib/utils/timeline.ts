@@ -1,6 +1,6 @@
 import { formatClock } from '$lib/utils/time';
 
-export type TimelineTrackKind = 'video' | 'subtitles' | 'tts' | 'original';
+export type TimelineTrackKind = 'titleLiver' | 'video' | 'subtitles' | 'tts' | 'original';
 
 export interface TimelineTrackDef {
 	id: string;
@@ -14,41 +14,49 @@ export interface TimelineTrackDef {
 
 export const TIMELINE_TRACKS: TimelineTrackDef[] = [
 	{
+		id: 'trk-title-liver',
+		kind: 'titleLiver',
+		name: 'V2',
+		role: 'Title Liver',
+		color: 'var(--track-title-liver)',
+		height: 48
+	},
+	{
 		id: 'trk-subs',
 		kind: 'subtitles',
-		name: 'Subtitles',
-		role: 'Dialogue',
+		name: 'V1',
+		role: 'Subtitles',
 		color: 'var(--track-subs)',
-		height: 58
+		height: 48
 	},
 	{
 		id: 'trk-tts',
 		kind: 'tts',
-		name: 'TTS Audio',
-		role: 'Voice',
+		name: 'A2',
+		role: 'TTS Audio',
 		color: 'var(--track-tts)',
-		height: 80
+		height: 64
 	},
 	{
 		id: 'trk-video',
 		kind: 'video',
-		name: 'Original Video',
-		role: 'Picture',
+		name: 'V',
+		role: 'Original Video',
 		color: 'var(--track-video)',
-		height: 72
+		height: 56
 	},
 	{
 		id: 'trk-original',
 		kind: 'original',
-		name: 'Original Audio',
-		role: 'Source',
+		name: 'A1',
+		role: 'Original Audio',
 		color: 'var(--track-original)',
-		height: 78
+		height: 64
 	}
 ];
 
-export const LABEL_WIDTH = 176;
-export const RULER_HEIGHT = 30;
+export const LABEL_WIDTH = 152;
+export const RULER_HEIGHT = 26;
 export const BASE_PX_PER_SEC = 48;
 /** Absolute floor — real min zoom is usually “fit to viewport”. */
 export const MIN_ZOOM = 0.05;

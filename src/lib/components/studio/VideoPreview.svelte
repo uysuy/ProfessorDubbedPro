@@ -11,6 +11,9 @@
 	import { formatClock, formatTimecode } from '$lib/utils/time';
 	import { TtsPlaybackMixer } from '$lib/utils/tts-playback';
 	import { cuePreviewEndMs } from '$lib/utils/tts-fit';
+	import { titleLiverAtPlayhead } from '$lib/utils/title-liver';
+	import { studioUi } from '$lib/stores/studio-ui.svelte';
+	import TitleLiverOverlay from '$lib/components/studio/TitleLiverOverlay.svelte';
 	import { isTauriRuntime } from '$lib/utils/platform';
 	import {
 		FolderOpen,
@@ -140,6 +143,8 @@
 	 * ~100ms-throttled store playhead (that made text lag the picture).
 	 */
 	let overlayText = $state<string | null>(null);
+	/** Visual-clock ms for Title Liver (same source as subtitle burn-in). */
+	let titleLiverClockMs = $state(0);
 
 	function resolveOverlayText(ms: number): string | null {
 		const cues = projectStore.current.cues;
@@ -153,7 +158,12 @@
 	function paintOverlay(ms: number) {
 		const next = resolveOverlayText(ms);
 		if (next !== overlayText) overlayText = next;
+		titleLiverClockMs = ms;
 	}
+
+	const activeTitleLiver = $derived(
+		titleLiverAtPlayhead(projectStore.titleLiverClips, titleLiverClockMs)
+	);
 
 	const overlayUsesKhmer = $derived(
 		usesKhmerScript(normalizeDubLanguage(projectStore.current.targetLanguage))
@@ -1157,6 +1167,27 @@
 					style="left: {pictureBox.left * 100}%; top: {pictureBox.top * 100}%; width: {pictureBox.width *
 						100}%; height: {pictureBox.height * 100}%;"
 				>
+					{#if activeTitleLiver}
+						<TitleLiverOverlay
+							clip={activeTitleLiver}
+							playheadMs={titleLiverClockMs}
+							designScale={designScale}
+							selected={projectStore.selectedTitleLiverId === activeTitleLiver.id}
+							onSelect={() => {
+								projectStore.selectTitleLiver(activeTitleLiver.id);
+							}}
+							onOpen={() => studioUi.openTitleLiver()}
+							onMove={(x, y) => {
+								projectStore.updateTitleLiverClip(activeTitleLiver.id, { x, y });
+							}}
+						/>
+					{/if}
+					{#if studioUi.titleSafeGuides}
+						<div class="title-safe-guides" aria-hidden="true">
+							<div class="title-safe-action"></div>
+							<div class="title-safe-title"></div>
+						</div>
+					{/if}
 					{#if overlayText}
 						<div
 							class="video-subtitle-overlay"
@@ -1523,6 +1554,25 @@
 		position: absolute;
 		z-index: 20;
 		overflow: hidden;
+		container-type: size;
+		container-name: picture;
+	}
+
+	.title-safe-guides {
+		position: absolute;
+		inset: 0;
+		pointer-events: none;
+		z-index: 3;
+	}
+	.title-safe-action {
+		position: absolute;
+		inset: 5%;
+		border: 1px dashed color-mix(in oklab, #fbbf24 55%, transparent);
+	}
+	.title-safe-title {
+		position: absolute;
+		inset: 10%;
+		border: 1px solid color-mix(in oklab, #38bdf8 45%, transparent);
 	}
 
 	.video-subtitle-overlay {

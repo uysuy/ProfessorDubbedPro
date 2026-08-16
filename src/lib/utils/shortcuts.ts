@@ -77,14 +77,21 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
 	{
 		title: 'Editing',
 		items: [
-			{
-				id: 'delete',
-				chords: [{ keys: 'Delete / Backspace', description: 'Delete selected subtitle(s)' }]
-			},
-			{
-				id: 'duplicate',
-				chords: [{ keys: 'Ctrl+D', description: 'Duplicate selected subtitle' }]
-			},
+					{
+						id: 'delete',
+						chords: [
+							{
+								keys: 'Delete / Backspace',
+								description: 'Delete selected subtitle(s) or live title'
+							}
+						]
+					},
+					{
+						id: 'duplicate',
+						chords: [
+							{ keys: 'Ctrl+D', description: 'Duplicate selected subtitle or live title' }
+						]
+					},
 			{
 				id: 'undo',
 				chords: [{ keys: 'Ctrl+Z', description: 'Undo last change' }]
