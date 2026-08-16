@@ -317,20 +317,20 @@
 		dndStore.flash('End → playhead');
 	}
 
-	function splitAtPlayhead(cueId?: string | null) {
+	async function splitAtPlayhead(cueId?: string | null) {
 		closeContextMenu();
 		const id = cueId ?? primarySelectedId;
 		if (!id) {
 			dndStore.flash('Select a subtitle first');
 			return;
 		}
-		const newId = projectStore.splitCueAtPlayhead(id);
+		const newId = await projectStore.splitCueAtPlayhead(id);
 		if (!newId) {
 			dndStore.flash('Playhead must be inside the cue (min 200ms each side)');
 			return;
 		}
 		flashRows([id, newId]);
-		dndStore.flash('Split at playhead');
+		dndStore.flash('Split at playhead (subtitle + audio)');
 		focusCueRow(newId);
 	}
 

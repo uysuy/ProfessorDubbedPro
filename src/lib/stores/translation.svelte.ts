@@ -32,6 +32,14 @@ export function cueTranslationInput(cue: SubtitleCue): string | null {
 	return translation;
 }
 
+/** True when a "translation" is still Chinese (LLM echo) — must not keep as Khmer. */
+export function isChineseNotKhmer(text: string): boolean {
+	const t = text.trim();
+	if (!t) return false;
+	if (textContainsKhmer(t)) return false;
+	return /[\u4e00-\u9fff]/.test(t);
+}
+
 /**
  * Existing Khmer / edited dub text that must not be overwritten silently.
  * Chinese duplicated into both fields after Extract Subs is NOT protected.
@@ -157,6 +165,8 @@ async function runTranslation(items: WorkItem[], label: string): Promise<number>
 				const item = chunk[j]!;
 				const translated = String(result.translations[j] ?? '').trim();
 				if (!translated) continue;
+				// Never commit Chinese echo into the Khmer column.
+				if (isChineseNotKhmer(translated)) continue;
 				projectStore.updateCue(item.id, { translation: translated, status: 'ready' });
 				done += 1;
 			}

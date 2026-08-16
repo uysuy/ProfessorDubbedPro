@@ -6,8 +6,10 @@ use msedge_tts::tts::SpeechConfig;
 use msedge_tts::voice::get_voices_list;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use tauri::{AppHandle, Manager};
+use crate::export::{ffmpeg_fail_message, ffmpeg_path_arg, find_ffmpeg};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -352,6 +354,133 @@ fn probe_mp3_duration_ms(app: &AppHandle, path: &std::path::Path) -> Option<u64>
 	None
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SliceAudioArgs {
+	/// Absolute path to the source TTS file (mp3 / wav / …).
+	pub source_path: String,
+	/// Cue id — used in the output filename.
+	pub cue_id: String,
+	/// Inclusive start of the keep range in the source file (ms).
+	pub start_ms: u64,
+	/// Exclusive end of the keep range in the source file (ms).
+	pub end_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SliceAudioResult {
+	pub file_path: String,
+	pub duration_ms: u64,
+}
+
+fn slice_audio_blocking(app: &AppHandle, args: SliceAudioArgs) -> Result<SliceAudioResult, String> {
+	let src = PathBuf::from(args.source_path.trim());
+	if !src.is_file() {
+		return Err(format!("Audio file not found: {}", src.display()));
+	}
+	if args.end_ms <= args.start_ms + 40 {
+		return Err("Slice range too short.".to_string());
+	}
+
+	let ffmpeg = find_ffmpeg(app)?;
+	let ext = src
+		.extension()
+		.and_then(|e| e.to_str())
+		.unwrap_or("mp3")
+		.to_ascii_lowercase();
+	let out_ext = if matches!(ext.as_str(), "wav" | "mp3" | "m4a" | "aac" | "ogg" | "flac") {
+		ext
+	} else {
+		"mp3".to_string()
+	};
+
+	let dir = tts_dir(app)?;
+	let file_name = format!(
+		"{}_slice_{}.{}",
+		sanitize_filename(&args.cue_id),
+		uuid::Uuid::new_v4().simple(),
+		out_ext
+	);
+	let dest = dir.join(file_name);
+
+	let start_s = args.start_ms as f64 / 1000.0;
+	let dur_s = (args.end_ms - args.start_ms) as f64 / 1000.0;
+
+	// Accurate cut: -ss after -i, then re-encode (copy is unreliable for short TTS).
+	let mut args_cmd: Vec<String> = vec![
+		"-hide_banner".into(),
+		"-y".into(),
+		"-i".into(),
+		ffmpeg_path_arg(&src),
+		"-ss".into(),
+		format!("{start_s:.3}"),
+		"-t".into(),
+		format!("{dur_s:.3}"),
+		"-vn".into(),
+	];
+	match out_ext.as_str() {
+		"wav" => {
+			args_cmd.extend([
+				"-acodec".into(),
+				"pcm_s16le".into(),
+				"-ar".into(),
+				"24000".into(),
+				"-ac".into(),
+				"1".into(),
+			]);
+		}
+		"m4a" | "aac" => {
+			args_cmd.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "96k".into()]);
+		}
+		"ogg" => {
+			args_cmd.extend(["-c:a".into(), "libvorbis".into(), "-q:a".into(), "4".into()]);
+		}
+		"flac" => {
+			args_cmd.extend(["-c:a".into(), "flac".into()]);
+		}
+		_ => {
+			// mp3 (Edge-TTS default) and unknown → lame
+			args_cmd.extend([
+				"-c:a".into(),
+				"libmp3lame".into(),
+				"-b:a".into(),
+				"48k".into(),
+				"-ar".into(),
+				"24000".into(),
+				"-ac".into(),
+				"1".into(),
+			]);
+		}
+	}
+	args_cmd.push(ffmpeg_path_arg(&dest));
+
+	let status = Command::new(&ffmpeg)
+		.args(&args_cmd)
+		.output()
+		.map_err(|e| format!("FFmpeg slice failed to start: {e}"))?;
+	if !status.status.success() {
+		let _ = fs::remove_file(&dest);
+		return Err(ffmpeg_fail_message(&status));
+	}
+	if !dest.is_file() {
+		return Err("FFmpeg slice produced no output file.".to_string());
+	}
+
+	let duration_ms = probe_media_duration_ms(app, &dest)
+		.unwrap_or(args.end_ms.saturating_sub(args.start_ms))
+		.max(80);
+
+	Ok(SliceAudioResult {
+		file_path: dest.to_string_lossy().to_string(),
+		duration_ms,
+	})
+}
+
+fn probe_media_duration_ms(app: &AppHandle, path: &Path) -> Option<u64> {
+	probe_mp3_duration_ms(app, path)
+}
+
 /// List Edge Read Aloud voices (optionally filtered by locale prefix, e.g. `km`).
 #[tauri::command]
 pub async fn list_edge_voices(args: ListEdgeVoicesArgs) -> Result<Vec<EdgeVoiceInfo>, String> {
@@ -369,4 +498,15 @@ pub async fn synthesize_speech(
 	tauri::async_runtime::spawn_blocking(move || synthesize_blocking(&app, args))
 		.await
 		.map_err(|e| format!("TTS task failed: {e}"))?
+}
+
+/// Cut a region out of a TTS audio file (used when splitting subtitle + audio).
+#[tauri::command]
+pub async fn slice_audio(
+	app: AppHandle,
+	args: SliceAudioArgs,
+) -> Result<SliceAudioResult, String> {
+	tauri::async_runtime::spawn_blocking(move || slice_audio_blocking(&app, args))
+		.await
+		.map_err(|e| format!("Audio slice task failed: {e}"))?
 }

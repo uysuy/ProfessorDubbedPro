@@ -88,11 +88,17 @@ export const studioUi = {
 	set linkImportOpen(v: boolean) {
 		linkImportOpen = v;
 	},
-	/** Separate dialog — downloads into cache, then opens in the existing studio timeline. */
+	/** Separate dialog — curated gallery + download into the existing studio timeline. */
 	openLinkImport() {
 		linkImportOpen = true;
 	},
+	openVideoGallery() {
+		linkImportOpen = true;
+	},
 	closeLinkImport() {
+		linkImportOpen = false;
+	},
+	closeVideoGallery() {
 		linkImportOpen = false;
 	},
 

@@ -171,31 +171,117 @@ Never: 小三→ម្ចាស់ស្រី | 高手→ថ្នាក់អ�
 fn default_model_for(provider: &str) -> &'static str {
 	match provider {
 		"qwen" => "qwen-plus",
-		// Paid / Pro keys: prefer Pro for better ZH→KM quality.
-		"gemini" => "gemini-2.5-pro",
+		// Gemini 3.x Flash — 2.x IDs are 404 for many new Google AI Studio keys.
+		"gemini" => "gemini-3.5-flash",
 		_ => "deepseek-chat",
 	}
 }
 
-/// Ordered Gemini model candidates (preferred first, then quality fallbacks).
-fn gemini_model_candidates(preferred: &str) -> Vec<String> {
-	let preferred = preferred.trim();
-	let defaults = [
-		"gemini-2.5-pro",
-		"gemini-3.1-pro-preview",
+/// Static Gemini fallbacks when ListModels is unavailable (newest first).
+fn gemini_static_defaults() -> &'static [&'static str] {
+	&[
+		"gemini-3.7-flash",
+		"gemini-3.6-flash",
 		"gemini-3.5-flash",
+		"gemini-3.5-flash-lite",
 		"gemini-3.1-flash-lite",
+		"gemini-3-flash-preview",
+		"gemini-flash-latest",
 		"gemini-2.5-flash",
-		"gemini-2.0-flash",
-	];
+		"gemini-2.5-flash-lite",
+	]
+}
+
+/// Ordered Gemini model candidates (preferred → API-discovered → static).
+fn gemini_model_candidates(preferred: &str, discovered: &[String]) -> Vec<String> {
+	let preferred = preferred.trim();
 	let mut out: Vec<String> = Vec::new();
-	if !preferred.is_empty() {
-		out.push(preferred.to_string());
-	}
-	for m in defaults {
-		if !out.iter().any(|x| x == m) {
-			out.push(m.to_string());
+	let mut push = |m: &str| {
+		let t = m.trim();
+		if t.is_empty() {
+			return;
 		}
+		if !out.iter().any(|x| x.eq_ignore_ascii_case(t)) {
+			out.push(t.to_string());
+		}
+	};
+	if !preferred.is_empty() {
+		push(preferred);
+	}
+	// Prefer Flash / Lite for subtitle batches (cheaper + usually free-tier).
+	let mut flash: Vec<&String> = discovered
+		.iter()
+		.filter(|m| {
+			let l = m.to_ascii_lowercase();
+			(l.contains("flash") || l.contains("lite")) && !l.contains("image") && !l.contains("tts")
+		})
+		.collect();
+	flash.sort_by(|a, b| b.len().cmp(&a.len())); // stable-ish preference by specificity
+	for m in flash {
+		push(m);
+	}
+	for m in discovered {
+		let l = m.to_ascii_lowercase();
+		if l.contains("image") || l.contains("tts") || l.contains("embedding") {
+			continue;
+		}
+		push(m);
+	}
+	for m in gemini_static_defaults() {
+		push(m);
+	}
+	out
+}
+
+/// Ask Google which generateContent models this API key can use.
+fn list_gemini_generate_models(
+	client: &reqwest::blocking::Client,
+	api_key: &str,
+) -> Vec<String> {
+	let url = format!(
+		"https://generativelanguage.googleapis.com/v1beta/models?pageSize=100&key={}",
+		urlencoding_simple(api_key)
+	);
+	let Ok(resp) = client.get(&url).send() else {
+		return Vec::new();
+	};
+	if !resp.status().is_success() {
+		return Vec::new();
+	}
+	let Ok(text) = resp.text() else {
+		return Vec::new();
+	};
+	let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
+		return Vec::new();
+	};
+	let mut out = Vec::new();
+	let Some(models) = parsed.get("models").and_then(|m| m.as_array()) else {
+		return out;
+	};
+	for m in models {
+		let methods = m
+			.get("supportedGenerationMethods")
+			.and_then(|v| v.as_array())
+			.cloned()
+			.unwrap_or_default();
+		let supports = methods.iter().any(|x| {
+			x.as_str()
+				.map(|s| s.eq_ignore_ascii_case("generateContent"))
+				.unwrap_or(false)
+		});
+		if !supports {
+			continue;
+		}
+		let name = m
+			.get("name")
+			.and_then(|v| v.as_str())
+			.unwrap_or("")
+			.trim()
+			.trim_start_matches("models/");
+		if name.is_empty() {
+			continue;
+		}
+		out.push(name.to_string());
 	}
 	out
 }
@@ -207,6 +293,16 @@ fn is_model_unavailable(msg: &str) -> bool {
 		|| lower.contains("no longer available")
 		|| lower.contains("is not found")
 		|| lower.contains("not supported for generatecontent")
+}
+
+fn is_quota_exhausted(msg: &str) -> bool {
+	let lower = msg.to_ascii_lowercase();
+	lower.contains("quota")
+		|| lower.contains("resource_exhausted")
+		|| lower.contains("rate limit")
+		|| lower.contains("too many requests")
+		|| lower.contains("\"code\": 429")
+		|| lower.contains("code\":429")
 }
 
 fn build_numbered_user_prompt(texts: &[String]) -> String {
@@ -397,8 +493,53 @@ fn enforce_batch(sources: &[String], translations: Vec<String>) -> Vec<String> {
 		.collect()
 }
 
+fn text_has_khmer(s: &str) -> bool {
+	s.chars()
+		.any(|c| matches!(c, '\u{1780}'..='\u{17FF}' | '\u{19E0}'..='\u{19FF}'))
+}
+
+fn text_has_han(s: &str) -> bool {
+	s.chars().any(|c| matches!(c, '\u{4E00}'..='\u{9FFF}'))
+}
+
+/// True when a "Khmer" result is still Chinese (LLM echo) or identical to the source.
+fn is_bad_km_translation(source: &str, translated: &str) -> bool {
+	let t = translated.trim();
+	if t.is_empty() {
+		return true;
+	}
+	if text_has_khmer(t) {
+		return false;
+	}
+	if text_has_han(t) {
+		return true;
+	}
+	let s = source.trim();
+	!s.is_empty() && t == s
+}
+
 fn finalize_translations(sources: &[String], translations: Vec<String>) -> Vec<String> {
 	enforce_batch(sources, translations)
+}
+
+/// After MT/LLM, blank out Chinese-echo lines when target is Khmer (caller may Fast-retry).
+fn scrub_non_khmer_when_target_km(to: &str, sources: &[String], translations: Vec<String>) -> Vec<String> {
+	let to_l = to.trim().to_ascii_lowercase();
+	if !(to_l == "km" || to_l.starts_with("km-") || to_l == "khm" || to_l == "khmer") {
+		return translations;
+	}
+	translations
+		.into_iter()
+		.enumerate()
+		.map(|(i, km)| {
+			let zh = sources.get(i).map(|s| s.as_str()).unwrap_or("");
+			if is_bad_km_translation(zh, &km) {
+				String::new()
+			} else {
+				km
+			}
+		})
+		.collect()
 }
 
 fn parse_numbered_translations(raw: &str, expected: usize) -> Result<Vec<String>, String> {
@@ -651,8 +792,9 @@ fn translate_gemini_resolved(
 	api_key: &str,
 	preferred_model: &str,
 	texts: &[String],
+	discovered: &[String],
 ) -> Result<(Vec<String>, String), String> {
-	let candidates = gemini_model_candidates(preferred_model);
+	let candidates = gemini_model_candidates(preferred_model, discovered);
 	let mut last_err = String::new();
 	for model in &candidates {
 		match translate_gemini(client, api_key, model, texts) {
@@ -668,11 +810,19 @@ fn translate_gemini_resolved(
 					log::warn!("Gemini model `{model}` unavailable; trying next… ({last_err})");
 					continue;
 				}
+				// Free-tier quota applies across models — fail fast to Fast MT.
+				if is_quota_exhausted(&last_err) {
+					return Err(last_err);
+				}
 				return Err(last_err);
 			}
 		}
 	}
-	Err(last_err)
+	Err(if last_err.is_empty() {
+		"No Gemini generateContent models available for this API key. Use Fast mode, DeepSeek, or Qwen.".into()
+	} else {
+		last_err
+	})
 }
 
 fn translate_llm(
@@ -709,6 +859,18 @@ fn translate_llm(
 
 	let mut out = Vec::with_capacity(texts.len());
 	let mut used_gemini_model = model.clone();
+	let gemini_discovered = if provider == "gemini" {
+		let discovered = list_gemini_generate_models(&client, key);
+		if !discovered.is_empty() {
+			log::info!(
+				"Gemini ListModels returned {} generateContent model(s) for this key",
+				discovered.len()
+			);
+		}
+		discovered
+	} else {
+		Vec::new()
+	};
 	let chunks: Vec<&[String]> = texts.chunks(batch).collect();
 	for (idx, chunk) in chunks.iter().enumerate() {
 		if idx > 0 {
@@ -723,8 +885,13 @@ fn translate_llm(
 				chunk,
 			)?,
 			"gemini" => {
-				let (part, resolved) =
-					translate_gemini_resolved(&client, key, &used_gemini_model, chunk)?;
+				let (part, resolved) = translate_gemini_resolved(
+					&client,
+					key,
+					&used_gemini_model,
+					chunk,
+					&gemini_discovered,
+				)?;
 				used_gemini_model = resolved;
 				part
 			}
@@ -922,6 +1089,61 @@ fn translate_google(
 	Ok(out)
 }
 
+fn finalize_for_target(
+	to: &str,
+	sources: &[String],
+	translations: Vec<String>,
+) -> Vec<String> {
+	scrub_non_khmer_when_target_km(to, sources, finalize_translations(sources, translations))
+}
+
+/// Re-translate blanked (Chinese-echo) rows with Fast MT when target is Khmer.
+fn fill_bad_km_with_fast(
+	client: &reqwest::blocking::Client,
+	args: &TranslateTextsArgs,
+	sources: &[String],
+	mut translations: Vec<String>,
+) -> Result<(Vec<String>, usize), String> {
+	let bad: Vec<usize> = translations
+		.iter()
+		.enumerate()
+		.filter(|(_, t)| t.trim().is_empty())
+		.map(|(i, _)| i)
+		.collect();
+	if bad.is_empty() {
+		return Ok((translations, 0));
+	}
+
+	let subset: Vec<String> = bad.iter().map(|&i| sources[i].clone()).collect();
+	let fast_texts = expand_batch_for_fast_mt(&subset);
+	let key = args.azure_key.trim();
+	let filled = if !key.is_empty() {
+		match translate_azure(
+			client,
+			&fast_texts,
+			&args.from,
+			&args.to,
+			key,
+			&args.azure_region,
+		) {
+			Ok(t) => t,
+			Err(_) => translate_google(client, &fast_texts, &args.from, &args.to)?,
+		}
+	} else {
+		translate_google(client, &fast_texts, &args.from, &args.to)?
+	};
+	let filled = finalize_for_target(&args.to, &subset, filled);
+
+	for (k, &i) in bad.iter().enumerate() {
+		if let Some(t) = filled.get(k) {
+			if !t.trim().is_empty() {
+				translations[i] = t.clone();
+			}
+		}
+	}
+	Ok((translations, bad.len()))
+}
+
 fn translate_blocking(args: TranslateTextsArgs) -> Result<TranslateTextsResult, String> {
 	if args.texts.is_empty() {
 		return Ok(TranslateTextsResult {
@@ -942,10 +1164,25 @@ fn translate_blocking(args: TranslateTextsArgs) -> Result<TranslateTextsResult, 
 			&args.llm_model,
 		) {
 			Ok((translations, provider)) => {
+				let translations = finalize_for_target(&args.to, &sources, translations);
+				let client = http_client()?;
+				let (translations, repaired) =
+					fill_bad_km_with_fast(&client, &args, &sources, translations)?;
+				let warning = if repaired > 0 {
+					Some(format!(
+						"{repaired} line(s) came back as Chinese from High Quality — retranslated with Fast."
+					))
+				} else {
+					None
+				};
 				return Ok(TranslateTextsResult {
-					translations: finalize_translations(&sources, translations),
-					provider,
-					warning: None,
+					translations,
+					provider: if repaired > 0 {
+						format!("{provider}+fast")
+					} else {
+						provider
+					},
+					warning,
 				});
 			}
 			Err(llm_err) => {
@@ -967,7 +1204,7 @@ fn translate_blocking(args: TranslateTextsArgs) -> Result<TranslateTextsResult, 
 						&args.azure_region,
 					) {
 						return Ok(TranslateTextsResult {
-							translations: finalize_translations(&sources, translations),
+							translations: finalize_for_target(&args.to, &sources, translations),
 							provider: "azure".into(),
 							warning,
 						});
@@ -978,7 +1215,7 @@ fn translate_blocking(args: TranslateTextsArgs) -> Result<TranslateTextsResult, 
 						format!("{llm_err} — Fast fallback also failed: {fast_err}")
 					})?;
 				return Ok(TranslateTextsResult {
-					translations: finalize_translations(&sources, translations),
+					translations: finalize_for_target(&args.to, &sources, translations),
 					provider: "google".into(),
 					warning,
 				});
@@ -1001,7 +1238,7 @@ fn translate_blocking(args: TranslateTextsArgs) -> Result<TranslateTextsResult, 
 		) {
 			Ok(translations) => {
 				return Ok(TranslateTextsResult {
-					translations: finalize_translations(&sources, translations),
+					translations: finalize_for_target(&args.to, &sources, translations),
 					provider: "azure".into(),
 					warning: None,
 				});
@@ -1013,7 +1250,7 @@ fn translate_blocking(args: TranslateTextsArgs) -> Result<TranslateTextsResult, 
 						format!("{azure_err} — Google fallback also failed: {google_err}")
 					})?;
 				return Ok(TranslateTextsResult {
-					translations: finalize_translations(&sources, translations),
+					translations: finalize_for_target(&args.to, &sources, translations),
 					provider: "google".into(),
 					warning: Some(format!("Azure failed — used Google. {azure_err}")),
 				});
@@ -1023,7 +1260,7 @@ fn translate_blocking(args: TranslateTextsArgs) -> Result<TranslateTextsResult, 
 
 	let translations = translate_google(&client, &fast_texts, &args.from, &args.to)?;
 	Ok(TranslateTextsResult {
-		translations: finalize_translations(&sources, translations),
+		translations: finalize_for_target(&args.to, &sources, translations),
 		provider: "google".into(),
 		warning: None,
 	})

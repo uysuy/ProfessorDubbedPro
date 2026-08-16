@@ -269,6 +269,8 @@ fn classify_site(host: &str) -> &'static str {
 		"tencent"
 	} else if h.contains("douyin.com") || h.contains("tiktok.com") {
 		"short_video"
+	} else if h.contains("dailymotion.com") || h.contains("dai.ly") {
+		"dailymotion"
 	} else if h.contains("vimeo.com") {
 		"vimeo"
 	} else if h.contains("twitter.com") || h.contains("x.com") {
@@ -386,8 +388,18 @@ fn normalize_user_input(raw: &str) -> ResolvedInput {
 		};
 	}
 
-	// Channel / search name → ytsearch
-	let q = format!("ytsearch10:{trimmed}");
+	// Explicit ytsearchN:query (gallery pagination)
+	if trimmed.to_ascii_lowercase().starts_with("ytsearch") {
+		return ResolvedInput {
+			kind: "search".into(),
+			site: "youtube".into(),
+			query: trimmed.to_string(),
+			display: trimmed.to_string(),
+		};
+	}
+
+	// Channel / search name → ytsearch (24 results for gallery shelves)
+	let q = format!("ytsearch24:{trimmed}");
 	ResolvedInput {
 		kind: "search".into(),
 		site: "youtube".into(),
@@ -459,22 +471,65 @@ fn best_thumbnail(v: &serde_json::Value) -> Option<String> {
 	json_str(v, &["thumbnail"])
 }
 
+fn wetv_ids_from_play_url(url: &str) -> Option<(String, Option<String>)> {
+	// https://wetv.vip/en/play/SERIES or …/play/SERIES/EPISODE
+	let lower = url.to_lowercase();
+	let idx = lower.find("/play/")?;
+	let rest = url[idx + "/play/".len()..].trim_start_matches('/');
+	let mut parts = rest
+		.split(|c| c == '?' || c == '#' || c == '&')
+		.next()
+		.unwrap_or("")
+		.split('/')
+		.filter(|p| !p.is_empty());
+	let series = parts.next()?.to_string();
+	if series.is_empty() {
+		return None;
+	}
+	let episode = parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
+	Some((series, episode))
+}
+
 fn candidate_from_json(v: &serde_json::Value, fallback_site: &str) -> Option<MediaCandidate> {
-	let id = json_str(v, &["id"]).unwrap_or_else(|| "unknown".into());
-	let title = json_str(v, &["title", "fulltitle"]).unwrap_or_else(|| id.clone());
-	let webpage_url = json_str(v, &["webpage_url", "url", "original_url"])?;
+	let webpage_url_raw = json_str(v, &["webpage_url", "url", "original_url"])?;
+	let wetv_ids = wetv_ids_from_play_url(&webpage_url_raw);
+
+	let mut id = json_str(v, &["id"]).unwrap_or_default();
+	if id.is_empty() || id == "unknown" {
+		if let Some((_, Some(ep))) = wetv_ids.as_ref() {
+			id = ep.clone();
+		} else if let Some((series, None)) = wetv_ids.as_ref() {
+			id = series.clone();
+		} else if !webpage_url_raw.starts_with("http") {
+			id = webpage_url_raw.clone();
+		} else {
+			id = "unknown".into();
+		}
+	}
+
+	let mut title = json_str(v, &["title", "fulltitle"]).unwrap_or_default();
+	if title.is_empty() || title == "unknown" {
+		title = id.clone();
+	}
+
 	// Flat playlist entries sometimes only have `url` as an id — normalize YouTube / WeTV.
-	let webpage_url = if webpage_url.starts_with("http://") || webpage_url.starts_with("https://")
+	let webpage_url = if webpage_url_raw.starts_with("http://") || webpage_url_raw.starts_with("https://")
 	{
-		webpage_url
-	} else if fallback_site.contains("youtube") || webpage_url.len() == 11 {
+		if let Some((series, Some(ep))) = wetv_ids.as_ref() {
+			format!("https://wetv.vip/en/play/{series}/{ep}")
+		} else if let Some((series, None)) = wetv_ids.as_ref() {
+			format!("https://wetv.vip/en/play/{series}")
+		} else {
+			webpage_url_raw
+		}
+	} else if fallback_site.contains("youtube") || webpage_url_raw.len() == 11 {
 		format!("https://www.youtube.com/watch?v={id}")
 	} else if fallback_site.contains("wetv") {
-		// Episode under a series — prefer joining later; bare id becomes play URL.
 		format!("https://wetv.vip/en/play/{id}")
 	} else {
-		webpage_url
+		webpage_url_raw
 	};
+
 	let duration_s = v
 		.get("duration")
 		.and_then(|d| d.as_f64().or_else(|| d.as_u64().map(|u| u as f64)));
@@ -491,9 +546,18 @@ fn candidate_from_json(v: &serde_json::Value, fallback_site: &str) -> Option<Med
 		}
 	});
 	let uploader = json_str(v, &["uploader", "channel", "creator"]);
-	let extractor = json_str(v, &["extractor_key", "extractor"])
+	let extractor = json_str(v, &["extractor_key", "extractor", "ie_key"])
 		.map(|s| s.to_lowercase())
 		.unwrap_or_else(|| fallback_site.to_string());
+	let site = if extractor.contains("wetv") || webpage_url.contains("wetv.vip") {
+		"wetv".into()
+	} else if extractor.contains("youtube") {
+		"youtube".into()
+	} else if extractor.contains("dailymotion") {
+		"dailymotion".into()
+	} else {
+		extractor
+	};
 	let kind = if v.get("_type").and_then(|t| t.as_str()) == Some("playlist") {
 		"series"
 	} else {
@@ -506,7 +570,7 @@ fn candidate_from_json(v: &serde_json::Value, fallback_site: &str) -> Option<Med
 		webpage_url,
 		thumbnail,
 		uploader,
-		site: extractor,
+		site,
 		kind: kind.into(),
 	})
 }
@@ -582,14 +646,20 @@ fn resolve_wetv_channel(app: &AppHandle, channel_url: &str) -> Result<ResolveRes
 					.pointer("/mark_label_list/1/text")
 					.and_then(|t| t.as_str())
 					.map(|s| s.to_string());
-				let uploader = mark.or(Some(module_name.to_string()));
+				// Prefer EP mark over subtitle when subtitle duplicates the title.
+				let uploader = mark
+					.clone()
+					.or_else(|| {
+						subtitle.filter(|s| !s.eq_ignore_ascii_case(&title))
+					})
+					.or(Some(module_name.to_string()));
 				entries.push(MediaCandidate {
 					id: id.clone(),
 					title,
 					duration_s: None,
 					webpage_url: format!("https://wetv.vip/en/play/{id}"),
 					thumbnail: pic,
-					uploader: subtitle.or(uploader),
+					uploader,
 					site: "wetv".into(),
 					kind: "series".into(),
 				});
@@ -684,151 +754,128 @@ pub struct MediaPreviewInfo {
 	pub site: String,
 }
 
-#[tauri::command]
-pub fn get_media_preview(app: AppHandle, url: String) -> Result<MediaPreviewInfo, String> {
-	CANCEL.store(false, Ordering::SeqCst);
-	let url = url.trim().to_string();
-	if url.is_empty() {
-		return Err("URL is empty.".into());
+fn youtube_embed_preview(id: &str, title: String, duration_s: Option<f64>, thumbnail: Option<String>) -> MediaPreviewInfo {
+	MediaPreviewInfo {
+		kind: "embed".into(),
+		url: Some(format!("https://www.youtube.com/embed/{id}?rel=0&modestbranding=1")),
+		thumbnail: thumbnail.or(Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"))),
+		title,
+		duration_s,
+		webpage_url: format!("https://www.youtube.com/watch?v={id}"),
+		site: "youtube".into(),
 	}
-	emit_progress(&app, "preview", "Loading preview…", 10);
+}
 
-	// Prefer native embeds when we can — more reliable than raw stream URLs in WebView.
-	if let Some(id) = youtube_id_from_url(&url) {
-		emit_progress(&app, "preview", "YouTube embed ready", 100);
-		return Ok(MediaPreviewInfo {
-			kind: "embed".into(),
-			url: Some(format!("https://www.youtube.com/embed/{id}?rel=0&modestbranding=1")),
-			thumbnail: Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg")),
-			title: id.clone(),
-			duration_s: None,
-			webpage_url: format!("https://www.youtube.com/watch?v={id}"),
-			site: "youtube".into(),
-		});
+fn bilibili_embed_preview(bvid: &str, url: &str, title: String, duration_s: Option<f64>, thumbnail: Option<String>) -> MediaPreviewInfo {
+	MediaPreviewInfo {
+		kind: "embed".into(),
+		url: Some(format!(
+			"https://player.bilibili.com/player.html?bvid={bvid}&high_quality=1&danmaku=0"
+		)),
+		thumbnail,
+		title,
+		duration_s,
+		webpage_url: url.to_string(),
+		site: "bilibili".into(),
 	}
-	if let Some(bvid) = bilibili_bvid(&url) {
-		emit_progress(&app, "preview", "Bilibili embed ready", 100);
-		return Ok(MediaPreviewInfo {
-			kind: "embed".into(),
-			url: Some(format!(
-				"https://player.bilibili.com/player.html?bvid={bvid}&high_quality=1&danmaku=0"
-			)),
-			thumbnail: None,
-			title: bvid.clone(),
-			duration_s: None,
-			webpage_url: url.clone(),
-			site: "bilibili".into(),
-		});
-	}
+}
 
-	let ytdlp = find_ytdlp(&app)?;
-	let mut meta_cmd = Command::new(&ytdlp);
-	meta_cmd.args([
-		"--no-warnings",
-		"--skip-download",
-		"--dump-single-json",
-		"--no-playlist",
-		&url,
-	]);
-	#[cfg(windows)]
-	{
-		use std::os::windows::process::CommandExt;
-		meta_cmd.creation_flags(0x08000000);
-	}
-	let meta_out = meta_cmd
-		.output()
-		.map_err(|e| format!("Failed to probe media: {e}"))?;
-	if !meta_out.status.success() {
-		let err = String::from_utf8_lossy(&meta_out.stderr);
-		return Err(format!("Could not load preview.\n{}", err.trim()));
-	}
-	let meta: serde_json::Value = serde_json::from_str(
-		String::from_utf8_lossy(&meta_out.stdout).trim(),
-	)
-	.map_err(|e| format!("Invalid preview metadata: {e}"))?;
-
-	let title = json_str(&meta, &["title", "fulltitle"]).unwrap_or_else(|| "Preview".into());
-	let duration_s = meta
-		.get("duration")
-		.and_then(|d| d.as_f64().or_else(|| d.as_u64().map(|u| u as f64)));
-	let thumbnail = best_thumbnail(&meta);
-	let site = json_str(&meta, &["extractor_key", "extractor"])
-		.unwrap_or_else(|| "other".into())
-		.to_lowercase();
-	let webpage = json_str(&meta, &["webpage_url", "original_url"]).unwrap_or(url.clone());
-
-	if let Some(id) = youtube_id_from_url(&webpage).or_else(|| {
-		meta.get("id")
-			.and_then(|x| x.as_str())
-			.filter(|id| id.len() == 11)
-			.map(|s| s.to_string())
-	}) {
-		if site.contains("youtube") {
-			emit_progress(&app, "preview", "YouTube embed ready", 100);
-			return Ok(MediaPreviewInfo {
-				kind: "embed".into(),
-				url: Some(format!("https://www.youtube.com/embed/{id}?rel=0&modestbranding=1")),
-				thumbnail: thumbnail
-					.or(Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"))),
-				title,
-				duration_s,
-				webpage_url: webpage,
-				site: "youtube".into(),
-			});
-		}
-	}
-
-	emit_progress(&app, "preview", "Resolving stream URL…", 55);
-	let mut stream_cmd = Command::new(&ytdlp);
+/// Resolve a direct media URL via yt-dlp `-g` (skips site player ads when the CDN allows).
+fn resolve_preview_stream(ytdlp: &Path, url: &str) -> Option<String> {
+	let mut stream_cmd = Command::new(ytdlp);
 	stream_cmd.args([
 		"--no-warnings",
+		"--socket-timeout",
+		"20",
 		"-g",
 		"-f",
 		"b[height<=720]/best[height<=720]/best",
 		"--no-playlist",
-		&url,
+		url,
 	]);
 	#[cfg(windows)]
 	{
 		use std::os::windows::process::CommandExt;
 		stream_cmd.creation_flags(0x08000000);
 	}
-	let stream_out = stream_cmd
-		.output()
-		.map_err(|e| format!("Failed to resolve stream: {e}"))?;
+	let stream_out = stream_cmd.output().ok()?;
+	if !stream_out.status.success() {
+		return None;
+	}
+	String::from_utf8_lossy(&stream_out.stdout)
+		.lines()
+		.map(str::trim)
+		.find(|l| l.starts_with("http://") || l.starts_with("https://"))
+		.map(|s| s.to_string())
+}
+
+fn get_media_preview_blocking(app: &AppHandle, url: String) -> Result<MediaPreviewInfo, String> {
+	CANCEL.store(false, Ordering::SeqCst);
+	let url = url.trim().to_string();
+	if url.is_empty() {
+		return Err("URL is empty.".into());
+	}
+	emit_progress(app, "preview", "Loading preview…", 10);
+
+	// Fast path: native embeds (no yt-dlp) — keeps the gallery UI responsive.
+	if let Some(id) = youtube_id_from_url(&url) {
+		emit_progress(app, "preview", "YouTube embed ready", 100);
+		return Ok(youtube_embed_preview(&id, id.clone(), None, None));
+	}
+	if let Some(bvid) = bilibili_bvid(&url) {
+		emit_progress(app, "preview", "Bilibili embed ready", 100);
+		return Ok(bilibili_embed_preview(&bvid, &url, bvid.clone(), None, None));
+	}
+
 	if CANCEL.load(Ordering::SeqCst) {
 		return Err("Cancelled.".into());
 	}
 
-	let stream_url = String::from_utf8_lossy(&stream_out.stdout)
-		.lines()
-		.map(str::trim)
-		.find(|l| l.starts_with("http://") || l.starts_with("https://"))
-		.map(|s| s.to_string());
+	let ytdlp = find_ytdlp(app)?;
 
-	if let Some(stream) = stream_url {
-		emit_progress(&app, "preview", "Stream ready", 100);
+	// One yt-dlp call only (`-g`). Title/thumb come from the gallery list row on the frontend.
+	emit_progress(app, "preview", "Resolving stream URL…", 45);
+	if let Some(stream) = resolve_preview_stream(&ytdlp, &url) {
+		let site = if url.contains("wetv") {
+			"wetv".into()
+		} else if url.contains("dailymotion") {
+			"dailymotion".into()
+		} else {
+			"other".into()
+		};
+		emit_progress(app, "preview", "Stream ready (ad-light)", 100);
 		return Ok(MediaPreviewInfo {
 			kind: "stream".into(),
 			url: Some(stream),
-			thumbnail,
-			title,
-			duration_s,
-			webpage_url: webpage,
+			thumbnail: None,
+			title: "Preview".into(),
+			duration_s: None,
+			webpage_url: url,
 			site,
 		});
 	}
 
-	emit_progress(&app, "preview", "Preview unavailable — thumbnail only", 100);
+	if CANCEL.load(Ordering::SeqCst) {
+		return Err("Cancelled.".into());
+	}
+
+	emit_progress(app, "preview", "Preview unavailable — thumbnail only", 100);
 	Ok(MediaPreviewInfo {
 		kind: "none".into(),
 		url: None,
-		thumbnail,
-		title,
-		duration_s,
-		webpage_url: webpage,
-		site,
+		thumbnail: None,
+		title: "Preview".into(),
+		duration_s: None,
+		webpage_url: url,
+		site: "other".into(),
 	})
+}
+
+#[tauri::command]
+pub async fn get_media_preview(app: AppHandle, url: String) -> Result<MediaPreviewInfo, String> {
+	tauri::async_runtime::spawn_blocking(move || get_media_preview_blocking(&app, url))
+		.await
+		.map_err(|e| format!("Preview task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -837,19 +884,40 @@ pub fn normalize_link_input(raw: String) -> ResolvedInput {
 }
 
 #[tauri::command]
-pub fn resolve_media_link(app: AppHandle, raw: String) -> Result<ResolveResult, String> {
+pub async fn resolve_media_link(
+	app: AppHandle,
+	raw: String,
+	playlist_start: Option<u32>,
+	playlist_end: Option<u32>,
+) -> Result<ResolveResult, String> {
+	tauri::async_runtime::spawn_blocking(move || {
+		resolve_media_link_blocking(&app, raw, playlist_start, playlist_end)
+	})
+	.await
+	.map_err(|e| format!("Resolve task failed: {e}"))?
+}
+
+fn resolve_media_link_blocking(
+	app: &AppHandle,
+	raw: String,
+	playlist_start: Option<u32>,
+	playlist_end: Option<u32>,
+) -> Result<ResolveResult, String> {
 	CANCEL.store(false, Ordering::SeqCst);
 	let input = normalize_user_input(&raw);
-	emit_progress(&app, "resolve", "Looking up media…", 5);
+	emit_progress(app, "resolve", "Looking up media…", 5);
 
 	if input.kind == "wetv_channel" {
-		return resolve_wetv_channel(&app, &input.query);
+		return resolve_wetv_channel(app, &input.query);
 	}
 
-	let ytdlp = find_ytdlp(&app)?;
+	let ytdlp = find_ytdlp(app)?;
 
 	let mut cmd = Command::new(&ytdlp);
-	cmd.arg("--no-warnings").arg("--skip-download");
+	cmd.arg("--no-warnings")
+		.arg("--socket-timeout")
+		.arg("20")
+		.arg("--skip-download");
 	// Flat playlist keeps channel/search/series listings fast; single videos get full metadata.
 	if matches!(
 		input.kind.as_str(),
@@ -858,6 +926,12 @@ pub fn resolve_media_link(app: AppHandle, raw: String) -> Result<ResolveResult, 
 		cmd.arg("--flat-playlist");
 	} else {
 		cmd.arg("--no-playlist");
+	}
+	if let Some(start) = playlist_start.filter(|s| *s > 0) {
+		cmd.arg("--playlist-start").arg(start.to_string());
+	}
+	if let Some(end) = playlist_end.filter(|e| *e > 0) {
+		cmd.arg("--playlist-end").arg(end.to_string());
 	}
 	cmd.arg("--dump-single-json").arg(&input.query);
 	#[cfg(windows)]
@@ -911,17 +985,59 @@ pub fn resolve_media_link(app: AppHandle, raw: String) -> Result<ResolveResult, 
 	} else {
 		None
 	};
+	let series_title = if input.kind == "wetv_series" {
+		json_str(&v, &["title", "fulltitle", "playlist_title"])
+	} else {
+		None
+	};
+	let series_thumb = if input.kind == "wetv_series" {
+		best_thumbnail(&v)
+	} else {
+		None
+	};
 
 	let mut entries: Vec<MediaCandidate> = Vec::new();
-	let limit = if input.kind == "wetv_series" { 120 } else { 60 };
+	// Allow larger pages for gallery "load more" / episode lists.
+	let limit = if input.kind == "wetv_series" {
+		250
+	} else if input.kind == "search" {
+		100
+	} else {
+		80
+	};
 	if let Some(arr) = v.get("entries").and_then(|e| e.as_array()) {
-		for item in arr.iter().take(limit) {
+		for (idx, item) in arr.iter().take(limit).enumerate() {
 			if let Some(mut c) = candidate_from_json(item, &input.site) {
-				// WeTV flat episodes often need series/episode play path.
+				// WeTV flat episodes are URL-only — fill id / title / thumb from series + index.
 				if let Some(series_id) = series_id_for_eps.as_ref() {
+					if c.id == "unknown" || c.id.is_empty() {
+						if let Some((_, Some(ep))) = wetv_ids_from_play_url(&c.webpage_url) {
+							c.id = ep;
+						}
+					}
 					if !c.webpage_url.contains("/play/") || c.webpage_url.matches('/').count() < 5 {
 						c.webpage_url = format!("https://wetv.vip/en/play/{series_id}/{}", c.id);
+					} else if let Some((_, Some(ep))) = wetv_ids_from_play_url(&c.webpage_url) {
+						c.webpage_url = format!("https://wetv.vip/en/play/{series_id}/{ep}");
+						c.id = ep;
 					}
+					let ep_base = playlist_start.unwrap_or(1).saturating_sub(1) as usize;
+					let ep_num = ep_base + idx + 1;
+					if c.title == "unknown"
+						|| c.title.is_empty()
+						|| c.title == c.id
+						|| c.title.eq_ignore_ascii_case("null")
+					{
+						c.title = if let Some(st) = series_title.as_ref() {
+							format!("{st} · EP{ep_num}")
+						} else {
+							format!("Episode {ep_num}")
+						};
+					}
+					if c.thumbnail.is_none() {
+						c.thumbnail = series_thumb.clone();
+					}
+					c.uploader = Some(format!("EP{ep_num}"));
 					c.site = "wetv".into();
 					c.kind = "video".into();
 				}
@@ -949,7 +1065,7 @@ pub fn resolve_media_link(app: AppHandle, raw: String) -> Result<ResolveResult, 
 	};
 
 	emit_progress(
-		&app,
+		app,
 		"resolve",
 		&format!("Found {} item(s)", entries.len()),
 		100,
@@ -1213,7 +1329,19 @@ fn probe_duration_ms(ffmpeg: &Path, video: &Path) -> u64 {
 }
 
 #[tauri::command]
-pub fn download_media_link(app: AppHandle, args: DownloadLinkArgs) -> Result<DownloadLinkResult, String> {
+pub async fn download_media_link(
+	app: AppHandle,
+	args: DownloadLinkArgs,
+) -> Result<DownloadLinkResult, String> {
+	tauri::async_runtime::spawn_blocking(move || download_media_link_blocking(app, args))
+		.await
+		.map_err(|e| format!("Download task failed: {e}"))?
+}
+
+fn download_media_link_blocking(
+	app: AppHandle,
+	args: DownloadLinkArgs,
+) -> Result<DownloadLinkResult, String> {
 	CANCEL.store(false, Ordering::SeqCst);
 	let url = args.url.trim();
 	if url.is_empty() {

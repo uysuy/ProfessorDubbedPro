@@ -718,12 +718,15 @@
 			e.preventDefault();
 			seekFromClientX(e.clientX, true);
 			const cutMs = scrubMs ?? playback.playheadMs;
-			const n = projectStore.splitCuesAtMs(cutMs);
-			if (n > 0) {
-				dndStore.flash(n === 1 ? 'Split at playhead' : `Split ${n} cues at playhead`);
-			} else {
-				dndStore.flash('No cue covers this time (need ≥200ms on each side)');
-			}
+			void projectStore.splitCuesAtMs(cutMs).then((n) => {
+				if (n > 0) {
+					dndStore.flash(
+						n === 1 ? 'Split subtitle + audio' : `Split ${n} cues (subtitle + audio)`
+					);
+				} else {
+					dndStore.flash('No cue covers this time (need ≥200ms on each side)');
+				}
+			});
 			return;
 		}
 
@@ -926,14 +929,15 @@
 
 		if ((e.key === 'c' || e.key === 'C') && !e.ctrlKey && !e.metaKey) {
 			e.preventDefault();
-			const n = projectStore.splitCuesAtMs(playback.playheadMs);
-			dndStore.flash(
-				n > 0
-					? n === 1
-						? 'Split at playhead'
-						: `Split ${n} cues at playhead`
-					: 'Playhead must sit inside a cue (≥200ms padding)'
-			);
+			void projectStore.splitCuesAtMs(playback.playheadMs).then((n) => {
+				dndStore.flash(
+					n > 0
+						? n === 1
+							? 'Split subtitle + audio'
+							: `Split ${n} cues (subtitle + audio)`
+						: 'Playhead must sit inside a cue (≥200ms padding)'
+				);
+			});
 		}
 	}
 
@@ -1054,7 +1058,7 @@
 		e.stopPropagation();
 
 		// Blade tool: cut at the click time on this clip (Premiere-style razor).
-		if (activeTool === 'blade' && trackKind === 'subtitles') {
+		if (activeTool === 'blade' && (trackKind === 'subtitles' || trackKind === 'tts')) {
 			const cutMs = clientXToTimelineMs(e.clientX);
 			setVisualPlayheadMs(cutMs, { seekMedia: true });
 			projectStore.setPlayhead(cutMs);
@@ -1063,15 +1067,17 @@
 				projectStore.selectedCueIds.length > 1 &&
 				projectStore.selectedCueIds.includes(cueId)
 			) {
-				const n = projectStore.splitCuesAtMs(cutMs);
-				if (n > 0) dndStore.flash(n === 1 ? 'Split' : `Split ${n} cues`);
-				else dndStore.flash('Cut needs ≥200ms on each side of the click');
+				void projectStore.splitCuesAtMs(cutMs).then((n) => {
+					if (n > 0) dndStore.flash(n === 1 ? 'Split subtitle + audio' : `Split ${n} cues`);
+					else dndStore.flash('Cut needs ≥200ms on each side of the click');
+				});
 			} else {
 				projectStore.selectCue(cueId);
 				revealCueInTable(cueId);
-				const id = projectStore.splitCueAtMs(cueId, cutMs);
-				if (id) dndStore.flash('Split at click');
-				else dndStore.flash('Cut needs ≥200ms on each side of the click');
+				void projectStore.splitCueAtMs(cueId, cutMs).then((id) => {
+					if (id) dndStore.flash('Split subtitle + audio');
+					else dndStore.flash('Cut needs ≥200ms on each side of the click');
+				});
 			}
 			return;
 		}
@@ -2118,7 +2124,13 @@
 											.join(' ')}
 										style="left: {left}px; width: {width}px;"
 										onpointerdown={(e) =>
-											onClipPointerDown(e, cue.id, cue.startMs, cue.endMs, 'tts')}
+											onClipPointerDown(
+												e,
+												cue.id,
+												times.startMs,
+												times.endMs,
+												'tts'
+											)}
 										onpointermove={onClipPointerMove}
 										onpointerup={onClipPointerUp}
 										onpointercancel={onClipPointerUp}

@@ -46,6 +46,7 @@ import { matchVoxcpmVoiceToGender, resolveVoxcpmVoiceId } from '$lib/tts/voxcpm-
 import { peaksForClip } from '$lib/utils/timeline';
 import { isTauriRuntime } from '$lib/utils/platform';
 import { cueAudioEndMs, cuePreviewEndMs } from '$lib/utils/tts-fit';
+import { sliceAudioFile } from '$lib/utils/audio-slice';
 import { planTightenedCueGaps, estimateEdgeMp3DurationMs, ALIGN_BREATH_MS, ALIGN_HANG_PAD_MS, type TightenGapsOptions } from '$lib/utils/cue-gaps';
 import {
 	scaleCueTimesForTempo,
@@ -1581,22 +1582,16 @@ export const projectStore = {
 					const shortVoice =
 						result.providerVoice.split('-').slice(-1)[0] ?? result.providerVoice;
 					const label = `${engine.label} · ${voicesStore.find(usedVoiceId)?.name ?? shortVoice}`;
-					// Keep start; expand end so the full Khmer line can play (natural pitch).
-					// Later cues are pushed if needed so your breath gaps stay between lines.
-					const needEnd = Math.max(cue.startMs + 200, cue.startMs + naturalMs);
-					const nextEnd = Math.max(cue.endMs, needEnd);
-
+					// Keep cue timing + picture anchors frozen. Spoken length lives on
+					// assignedAudio (TTS track draws via cuePreviewEndMs). Expanding
+					// endMs/pictureEndMs and pushing neighbors broke Title Liver /
+					// subtitle alignment whenever Khmer speech was longer than the window.
 					project = touch({
 						...project,
 						cues: project.cues.map((c) => {
 							if (c.id !== cue.id) return c;
 							return {
 								...c,
-								endMs: nextEnd,
-								pictureEndMs:
-									typeof c.pictureEndMs === 'number'
-										? Math.max(c.pictureEndMs, nextEnd)
-										: nextEnd,
 								status: 'generated' as const,
 								voiceId: usedVoiceId,
 								pitch: basePitch,
@@ -1616,10 +1611,6 @@ export const projectStore = {
 							};
 						})
 					});
-					// Grow into / past the next cue → slide followers (keeps gaps, full speech).
-					if (nextEnd > cue.endMs) {
-						this.trimCuePushNeighbors(cue.id, 'end', cue.startMs, nextEnd, 200);
-					}
 					completed += 1;
 				} catch (err) {
 					const message =
@@ -1649,7 +1640,7 @@ export const projectStore = {
 				generateError = `${completed} generated, ${failures.length} failed. ${failures[0]}`;
 			}
 
-			// After Generate: cue ends cover full Khmer TTS; breath gaps stay between lines.
+			// After Generate: timing stays on picture; TTS may overhang until Align.
 			if (completed > 0) {
 				this.syncTimelineDuration();
 			}
@@ -2660,26 +2651,124 @@ export const projectStore = {
 	},
 
 	/**
-	 * Split a cue at `atMs` (default: playhead) into two segments.
+	 * Split a cue at `atMs` into two segments.
+	 * When generated TTS exists, both halves keep their audio slices (FFmpeg cut).
 	 * Left keeps original text; right duplicates text (editable). Returns new cue id.
 	 */
-	splitCueAtMs(id: string | undefined, atMs: number): string | null {
+	async splitCueAtMs(id: string | undefined, atMs: number): Promise<string | null> {
 		const cueId = id ?? selectedCueIds[0];
 		if (!cueId) return null;
 		const cue = project.cues.find((c) => c.id === cueId);
 		if (!cue) return null;
 		const minDur = 200;
 		const cut = Math.round(atMs);
-		if (cut < cue.startMs + minDur || cut > cue.endMs - minDur) return null;
+		const spanEnd = Math.max(cue.endMs, cuePreviewEndMs(cue));
+		if (cut < cue.startMs + minDur || cut > spanEnd - minDur) return null;
 
 		const idx = project.cues.findIndex((c) => c.id === cueId);
 		if (idx < 0) return null;
+
+		const audio = cue.assignedAudio;
+		const hasAudio =
+			Boolean(audio) &&
+			typeof audio?.durationMs === 'number' &&
+			audio.durationMs > 80 &&
+			Boolean(audio.filePath?.trim() || audio.url?.trim());
+
+		const rate =
+			typeof audio?.fitPlaybackRate === 'number' && audio.fitPlaybackRate > 0
+				? audio.fitPlaybackRate
+				: 1;
+		const naturalMs = hasAudio ? Math.round(audio!.durationMs!) : 0;
+		const wallFromStart = Math.max(0, cut - cue.startMs);
+		// Map timeline cut → position inside the natural TTS file.
+		const canSliceAudio = hasAudio && naturalMs >= 160;
+		const audioCutMs = canSliceAudio
+			? Math.max(40, Math.min(naturalMs - 40, Math.round(wallFromStart * rate)))
+			: 0;
+
+		type AudioHalf = NonNullable<SubtitleCue['assignedAudio']>;
+		let leftAudio: AudioHalf | null = null;
+		let rightAudio: AudioHalf | null = null;
+		let rightPeaks: number[] | undefined;
+		let audioSplitOk = false;
+
+		if (canSliceAudio && audio?.filePath?.trim() && isTauriRuntime()) {
+			const src = audio.filePath.trim();
+			try {
+				const [leftSlice, rightSlice] = await Promise.all([
+					sliceAudioFile({
+						sourcePath: src,
+						cueId: `${cue.id}-L`,
+						startMs: 0,
+						endMs: audioCutMs
+					}),
+					sliceAudioFile({
+						sourcePath: src,
+						cueId: `${cue.id}-R`,
+						startMs: audioCutMs,
+						endMs: naturalMs
+					})
+				]);
+				const { convertFileSrc } = await import('@tauri-apps/api/core');
+				const leftUrl = convertFileSrc(leftSlice.filePath);
+				const rightUrl = convertFileSrc(rightSlice.filePath);
+				const base = {
+					sourceCueId: cue.id,
+					label: audio.label,
+					generated: audio.generated ?? true,
+					engine: audio.engine,
+					fitPlaybackRate: 1,
+					sourceText: audio.sourceText
+				};
+				leftAudio = {
+					...base,
+					filePath: leftSlice.filePath,
+					url: leftUrl,
+					durationMs: leftSlice.durationMs
+				};
+				rightAudio = {
+					...base,
+					sourceCueId: '', // filled after right id known
+					filePath: rightSlice.filePath,
+					url: rightUrl,
+					durationMs: rightSlice.durationMs
+				};
+				audioSplitOk = true;
+
+				try {
+					const [lw, rw] = await Promise.all([
+						extractWaveformFromUrl(leftUrl, 120).catch(() => null),
+						extractWaveformFromUrl(rightUrl, 120).catch(() => null)
+					]);
+					if (lw?.peaks) ttsWaveforms = { ...ttsWaveforms, [cue.id]: lw.peaks };
+					if (rw?.peaks) rightPeaks = rw.peaks;
+				} catch {
+					/* waveform optional */
+				}
+			} catch {
+				audioSplitOk = false;
+				leftAudio = null;
+				rightAudio = null;
+				rightPeaks = undefined;
+			}
+		}
+
+		const rightEnd = Math.max(cue.endMs, spanEnd);
+		const picStart =
+			typeof cue.pictureStartMs === 'number' ? cue.pictureStartMs : undefined;
+		const picEnd = typeof cue.pictureEndMs === 'number' ? cue.pictureEndMs : undefined;
 
 		const right = createSubtitleCue(
 			cue.index + 1,
 			{
 				startMs: cut,
-				endMs: cue.endMs,
+				endMs: rightEnd,
+				pictureStartMs:
+					picStart != null || picEnd != null
+						? Math.max(cut, picStart ?? cut)
+						: undefined,
+				pictureEndMs: picEnd != null ? Math.max(cut + minDur, picEnd) : undefined,
 				source: cue.source,
 				translation: cue.translation,
 				speaker: cue.speaker,
@@ -2687,33 +2776,61 @@ export const projectStore = {
 				speed: cue.speed,
 				volume: cue.volume,
 				voiceId: cue.voiceId,
-				status: 'draft'
+				status: audioSplitOk ? ('generated' as const) : ('draft' as const),
+				assignedAudio: null
 			},
 			{ voiceId, speaker: cue.speaker }
 		);
+
+		if (audioSplitOk && rightAudio) {
+			right.assignedAudio = { ...rightAudio, sourceCueId: right.id };
+			right.status = 'generated';
+			if (rightPeaks?.length) {
+				ttsWaveforms = { ...ttsWaveforms, [right.id]: rightPeaks };
+			}
+		}
+
+		const leftPicEnd =
+			picEnd != null
+				? Math.min(picEnd, cut)
+				: picStart != null
+					? Math.min(cut, Math.max(picStart + minDur, cut))
+					: undefined;
 
 		const cues = [...project.cues];
 		cues[idx] = {
 			...cue,
 			endMs: cut,
-			// Split invalidates TTS for both halves — re-Generate after arrange.
-			assignedAudio: null,
-			status:
-				cue.status === 'generated' || cue.status === 'error' ? ('ready' as const) : cue.status
+			pictureEndMs:
+				picStart != null || picEnd != null
+					? Math.max((picStart ?? cue.startMs) + minDur, leftPicEnd ?? cut)
+					: cue.pictureEndMs,
+			assignedAudio: audioSplitOk ? leftAudio : null,
+			status: audioSplitOk
+				? ('generated' as const)
+				: cue.status === 'generated' || cue.status === 'error'
+					? ('ready' as const)
+					: cue.status
 		};
 		cues.splice(idx + 1, 0, right);
 		project = touch({
 			...project,
 			cues: cues.map((c, i) => ({ ...c, index: i + 1 }))
 		});
-		dropTtsWaveforms([cue.id]);
+		if (!audioSplitOk) {
+			dropTtsWaveforms([cue.id]);
+		} else {
+			notifyTtsInvalidate(cue.id);
+			notifyTtsInvalidate(right.id);
+		}
+		this.syncTimelineDuration();
 		selectedCueIds = [cue.id, right.id];
 		selectionAnchorId = right.id;
 		return right.id;
 	},
 
 	/** Split at playhead (legacy helper). */
-	splitCueAtPlayhead(id?: string): string | null {
+	async splitCueAtPlayhead(id?: string): Promise<string | null> {
 		return this.splitCueAtMs(id, playback.playheadMs);
 	},
 
@@ -2722,11 +2839,13 @@ export const projectStore = {
 	 * If nothing selected, split the cue under that time.
 	 * Returns number of successful cuts.
 	 */
-	splitCuesAtMs(atMs?: number): number {
+	async splitCuesAtMs(atMs?: number): Promise<number> {
 		const cut = Math.round(atMs ?? playback.playheadMs);
 		const minDur = 200;
-		const contains = (c: { startMs: number; endMs: number }) =>
-			cut >= c.startMs + minDur && cut <= c.endMs - minDur;
+		const contains = (c: SubtitleCue) => {
+			const spanEnd = Math.max(c.endMs, cuePreviewEndMs(c));
+			return cut >= c.startMs + minDur && cut <= spanEnd - minDur;
+		};
 
 		let targets = project.cues.filter(
 			(c) => selectedCueIds.includes(c.id) && contains(c)
@@ -2742,7 +2861,7 @@ export const projectStore = {
 		let n = 0;
 		const keepSelected: string[] = [];
 		for (const t of targets) {
-			const rightId = this.splitCueAtMs(t.id, cut);
+			const rightId = await this.splitCueAtMs(t.id, cut);
 			if (rightId) {
 				n += 1;
 				keepSelected.push(t.id, rightId);

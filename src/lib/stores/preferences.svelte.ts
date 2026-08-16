@@ -96,7 +96,7 @@ export const LLM_TRANSLATE_PROVIDER_OPTIONS: {
 }[] = [
 	{ value: 'deepseek', label: 'DeepSeek', hint: 'Recommended', defaultModel: 'deepseek-chat' },
 	{ value: 'qwen', label: 'Qwen', hint: 'DashScope', defaultModel: 'qwen-plus' },
-	{ value: 'gemini', label: 'Gemini', hint: 'Uses Pro by default', defaultModel: 'gemini-2.5-pro' }
+	{ value: 'gemini', label: 'Gemini', hint: '3.5 Flash by default', defaultModel: 'gemini-3.5-flash' }
 ];
 
 export const WHISPER_MODEL_OPTIONS: {
@@ -245,10 +245,16 @@ function parsePreferences(raw: unknown): AppPreferences {
 					: DEFAULTS.llmTranslateModel;
 			// Drop retired / new-user-blocked Gemini ids so the app default applies.
 			const blocked = new Set([
-				'gemini-2.5-flash-lite',
+				'gemini-2.5-pro',
+				'gemini-2.5-flash',
+				'gemini-2.0-flash',
+				'gemini-2.0-flash-001',
 				'gemini-2.0-flash-lite',
+				'gemini-2.5-flash-lite',
 				'gemini-1.5-flash',
-				'gemini-1.5-pro'
+				'gemini-1.5-pro',
+				'gemini-3.1-pro-preview',
+				'gemini-3-pro-preview'
 			]);
 			return blocked.has(model.toLowerCase()) ? '' : model;
 		})(),

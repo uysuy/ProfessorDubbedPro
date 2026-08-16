@@ -478,7 +478,8 @@
 			Active: <span class="text-foreground/85">{translatorHint}</span>. High Quality uses an expanded
 			ZH→KM slang glossary (relationship, sales, internet Mandarin) plus a post-check that blocks
 			known wrong senses. Fast mode expands slang before Azure/Google. Gemini defaults to
-			<span class="font-mono text-[10px]">gemini-2.5-pro</span>.
+			<span class="font-mono text-[10px]">gemini-3.5-flash</span>
+			and auto-picks a model your API key can use (2.x IDs are often blocked for new keys).
 		</p>
 	</section>
 </div>

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
 	import {
-		Link2,
+		LayoutGrid,
 		LoaderCircle,
 		Download,
 		Clapperboard,
@@ -11,7 +11,8 @@
 		Pause,
 		Film,
 		ExternalLink,
-		ChevronRight
+		ChevronRight,
+		Search
 	} from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
@@ -36,13 +37,23 @@
 		type MediaCandidate,
 		type MediaPreviewInfo
 	} from '$lib/utils/link-import';
+	import {
+		DEFAULT_GALLERY_SHELF_ID,
+		GALLERY_SITE_FILTERS,
+		gallerySearchQuery,
+		galleryShelfById,
+		galleryShelvesForSite,
+		type GalleryShelf,
+		type GallerySiteId
+	} from '$lib/utils/video-gallery';
 
 	const open = $derived(studioUi.linkImportOpen);
 
 	let query = $state('');
-	/** `browse` = search + list + preview (always). `options` = download settings. */
+	/** `browse` = gallery + list + preview. `options` = download settings. */
 	let step = $state<'browse' | 'options'>('browse');
 	let busy = $state(false);
+	let loadingMore = $state(false);
 	let error = $state<string | null>(null);
 	let status = $state<string | null>(null);
 	let percent = $state(0);
@@ -60,6 +71,18 @@
 	let toolsHint = $state('');
 	let ocrReady = $state(false);
 	let unlisten: (() => void) | null = null;
+	let siteFilter = $state<GallerySiteId>('all');
+	let activeShelfId = $state(DEFAULT_GALLERY_SHELF_ID);
+	let showCustomLookup = $state(false);
+	let autoLoadToken = 0;
+	/** Index into shelf.moreSeeds for catalog/DM pagination. */
+	let moreSeedIndex = $state(0);
+	/** Next 1-based playlist index for channel / episode pages. */
+	let nextPlaylistStart = $state(1);
+	let hasMore = $state(true);
+	/** Seed used for the current list (series URL when drilling episodes). */
+	let activeListSeed = $state('');
+	let episodeMode = $state(false);
 
 	/** Stack of previous lists so Back from episodes returns to movies. */
 	let listStack = $state<{ entries: MediaCandidate[]; listLabel: string; siteLabel: string }[]>(
@@ -72,6 +95,9 @@
 	let previewToken = 0;
 	let previewVideoEl: HTMLVideoElement | undefined = $state();
 	let previewPlaying = $state(false);
+
+	const visibleShelves = $derived(galleryShelvesForSite(siteFilter));
+	const activeShelf = $derived(galleryShelfById(activeShelfId) ?? visibleShelves[0] ?? null);
 
 	const filteredEntries = $derived.by(() => {
 		const q = listFilter.trim().toLowerCase();
@@ -90,7 +116,10 @@
 		if (!v) {
 			stopPreviewPlayback();
 			resetSoft();
-		} else void refreshTools();
+		} else {
+			void refreshTools();
+			void openDefaultShelf();
+		}
 	}
 
 	function resetSoft() {
@@ -108,6 +137,177 @@
 			listStack = [];
 			listLabel = 'results';
 			siteLabel = '';
+			showCustomLookup = false;
+			moreSeedIndex = 0;
+			nextPlaylistStart = 1;
+			hasMore = true;
+			activeListSeed = '';
+			episodeMode = false;
+			loadingMore = false;
+		}
+	}
+
+	function resetPagingForShelf(shelf: GalleryShelf) {
+		moreSeedIndex = 0;
+		nextPlaylistStart = 1;
+		hasMore = true;
+		activeListSeed = shelf.seed;
+		episodeMode = false;
+		const mode = shelf.mode ?? 'catalog';
+		if (mode === 'catalog') {
+			hasMore = (shelf.moreSeeds?.length ?? 0) > 0;
+		} else if (mode === 'search' || mode === 'playlist') {
+			hasMore = true;
+		}
+	}
+
+	async function openDefaultShelf() {
+		const shelves = galleryShelvesForSite(siteFilter);
+		const shelf =
+			shelves.find((s) => s.id === activeShelfId) ??
+			shelves.find((s) => s.id === DEFAULT_GALLERY_SHELF_ID) ??
+			shelves[0];
+		if (!shelf) return;
+		await loadShelf(shelf, false);
+	}
+
+	async function loadShelf(shelf: GalleryShelf, clearEpisodeStack = true) {
+		activeShelfId = shelf.id;
+		if (clearEpisodeStack) listStack = [];
+		resetPagingForShelf(shelf);
+		const token = ++autoLoadToken;
+		const pageSize = shelf.pageSize ?? 24;
+		const mode = shelf.mode ?? 'catalog';
+		if (mode === 'search') {
+			await runResolve(gallerySearchQuery(shelf.seed, pageSize), false, {
+				replace: true
+			});
+			nextPlaylistStart = pageSize + 1;
+		} else if (mode === 'playlist') {
+			await runResolve(shelf.seed, false, {
+				replace: true,
+				playlistStart: 1,
+				playlistEnd: pageSize
+			});
+			nextPlaylistStart = pageSize + 1;
+		} else {
+			await runResolve(shelf.seed, false, { replace: true });
+		}
+		if (token !== autoLoadToken) return;
+	}
+
+	function onSiteFilter(id: GallerySiteId) {
+		siteFilter = id;
+		const shelves = galleryShelvesForSite(id);
+		const next =
+			shelves.find((s) => s.id === activeShelfId) ??
+			shelves.find((s) => s.id === DEFAULT_GALLERY_SHELF_ID) ??
+			shelves[0];
+		if (next) void loadShelf(next, true);
+	}
+
+	function mergeEntries(incoming: MediaCandidate[]): number {
+		const seen = new Set(entries.map((e) => e.id + '|' + e.webpageUrl));
+		const added: MediaCandidate[] = [];
+		for (const e of incoming) {
+			const key = e.id + '|' + e.webpageUrl;
+			if (seen.has(key)) continue;
+			seen.add(key);
+			added.push({ ...e, kind: e.kind || 'video' });
+		}
+		if (added.length) entries = [...entries, ...added];
+		return added.length;
+	}
+
+	async function loadMore() {
+		if (!hasMore || loadingMore || busy) return;
+		const shelf = activeShelf;
+		if (!shelf && !episodeMode) return;
+
+		loadingMore = true;
+		error = null;
+		try {
+			if (episodeMode && activeListSeed) {
+				const pageSize = 40;
+				const start = Math.max(1, nextPlaylistStart);
+				const end = start + pageSize - 1;
+				const result = await resolveMediaLink(activeListSeed, {
+					playlistStart: start,
+					playlistEnd: end
+				});
+				const n = mergeEntries(result.entries);
+				nextPlaylistStart = end + 1;
+				if (n === 0 || result.entries.length < pageSize / 2) hasMore = false;
+				return;
+			}
+
+			if (!shelf) return;
+			const mode = shelf.mode ?? 'catalog';
+			const pageSize = shelf.pageSize ?? 24;
+
+			if (mode === 'catalog') {
+				const seeds = shelf.moreSeeds ?? [];
+				if (moreSeedIndex >= seeds.length) {
+					hasMore = false;
+					return;
+				}
+				const seed = seeds[moreSeedIndex]!;
+				moreSeedIndex += 1;
+				const result = await resolveMediaLink(seed);
+				mergeEntries(result.entries);
+				if (moreSeedIndex >= seeds.length) hasMore = false;
+				return;
+			}
+
+			if (mode === 'search') {
+				const total = nextPlaylistStart + pageSize - 1;
+				const result = await resolveMediaLink(gallerySearchQuery(shelf.seed, total));
+				const fresh = result.entries.slice(nextPlaylistStart - 1);
+				const n = mergeEntries(fresh);
+				nextPlaylistStart = total + 1;
+				if (n === 0 || fresh.length < pageSize / 2) hasMore = false;
+				return;
+			}
+
+			if (mode === 'playlist') {
+				const start = Math.max(1, nextPlaylistStart);
+				const end = start + pageSize - 1;
+				const result = await resolveMediaLink(shelf.seed, {
+					playlistStart: start,
+					playlistEnd: end
+				});
+				const n = mergeEntries(result.entries);
+				nextPlaylistStart = end + 1;
+				if (n === 0 || result.entries.length < pageSize / 2) {
+					// Try moreSeeds if playlist exhausted
+					const seeds = shelf.moreSeeds ?? [];
+					if (moreSeedIndex < seeds.length) {
+						const seed = seeds[moreSeedIndex]!;
+						moreSeedIndex += 1;
+						const extra = await resolveMediaLink(seed, {
+							playlistStart: 1,
+							playlistEnd: pageSize
+						});
+						mergeEntries(extra.entries);
+						nextPlaylistStart = pageSize + 1;
+						activeListSeed = seed;
+					} else {
+						hasMore = false;
+					}
+				}
+			}
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+			hasMore = false;
+		} finally {
+			loadingMore = false;
+		}
+	}
+
+	function onListScroll(e: Event & { currentTarget: HTMLDivElement }) {
+		const el = e.currentTarget;
+		if (el.scrollTop + el.clientHeight >= el.scrollHeight - 48) {
+			void loadMore();
 		}
 	}
 
@@ -127,14 +327,14 @@
 
 	async function refreshTools() {
 		if (!isTauriRuntime()) {
-			toolsHint = 'Import from Link requires the desktop app (`pnpm tauri:dev`).';
+			toolsHint = 'Video Gallery requires the desktop app (`pnpm tauri:dev`).';
 			return;
 		}
 		try {
 			const s = await getLinkImportToolsStatus();
 			ocrReady = s.ocrReady;
 			toolsHint = s.ytdlp
-				? 'yt-dlp ready · WeTV channel & play URLs supported'
+				? 'yt-dlp ready · gallery streams skip site ads when possible'
 				: 'yt-dlp missing — run `pnpm ytdlp:download` and restart';
 			if (runOcr && !ocrReady) {
 				toolsHint += ' · OCR needs `pnpm ocr:setup`';
@@ -160,32 +360,42 @@
 
 	async function loadPreview(entry: MediaCandidate) {
 		stopPreviewPlayback();
-		preview = null;
 		previewError = null;
 
-		// Series/album rows: show poster immediately (no stream probe).
+		// Instant poster from list row — never block the UI waiting on yt-dlp first.
+		preview = {
+			kind: 'none',
+			url: null,
+			thumbnail: entry.thumbnail,
+			title: entry.title,
+			durationS: entry.durationS,
+			webpageUrl: entry.webpageUrl,
+			site: entry.site
+		};
+
 		if ((entry.kind || 'video') === 'series') {
 			previewLoading = false;
-			preview = {
-				kind: 'none',
-				url: null,
-				thumbnail: entry.thumbnail,
-				title: entry.title,
-				durationS: entry.durationS,
-				webpageUrl: entry.webpageUrl,
-				site: entry.site
-			};
 			return;
 		}
 
-		previewLoading = true;
 		const token = ++previewToken;
+		previewLoading = true;
+		// Debounce so rapid list clicks don't queue many yt-dlp jobs.
+		const isFastEmbed =
+			/youtube\.com|youtu\.be|bilibili\.com|b23\.tv/i.test(entry.webpageUrl) ||
+			/youtube|bilibili/i.test(entry.site);
+		await new Promise((r) => setTimeout(r, isFastEmbed ? 120 : 400));
+		if (token !== previewToken) return;
+
 		try {
 			const info = await getMediaPreview(entry.webpageUrl);
 			if (token !== previewToken) return;
 			preview = {
 				...info,
-				title: info.title && info.title !== entry.id ? info.title : entry.title,
+				title:
+					info.title && info.title !== entry.id && info.title !== 'Preview'
+						? info.title
+						: entry.title,
 				durationS: info.durationS ?? entry.durationS,
 				thumbnail: info.thumbnail ?? entry.thumbnail
 			};
@@ -214,19 +424,32 @@
 		}
 	}
 
-	async function runResolve(raw: string, pushStack: boolean) {
+	async function runResolve(
+		raw: string,
+		pushStack: boolean,
+		opts?: {
+			replace?: boolean;
+			playlistStart?: number;
+			playlistEnd?: number;
+		}
+	) {
 		error = null;
 		if (!isTauriRuntime()) {
-			error = 'Import from Link requires the desktop app.';
+			error = 'Video Gallery requires the desktop app.';
 			return;
 		}
+		// Cancel any in-flight yt-dlp so shelf/episode switches stay responsive.
+		await cancelLinkImport().catch(() => undefined);
 		busy = true;
-		status = 'Resolving…';
+		status = 'Loading gallery…';
 		percent = 5;
 		stopPreviewPlayback();
 		await ensureProgressListener();
 		try {
-			const result = await resolveMediaLink(raw);
+			const result = await resolveMediaLink(raw, {
+				playlistStart: opts?.playlistStart,
+				playlistEnd: opts?.playlistEnd
+			});
 			if (pushStack && entries.length) {
 				listStack = [
 					...listStack,
@@ -235,17 +458,28 @@
 			}
 			siteLabel = result.input.site;
 			listLabel = result.listLabel || (result.entries.length > 1 ? 'results' : 'video');
-			entries = result.entries.map((e) => ({
+			const mapped = result.entries.map((e) => ({
 				...e,
 				kind: e.kind || 'video'
 			}));
+			if (opts?.replace === false) {
+				mergeEntries(mapped);
+			} else {
+				entries = mapped;
+			}
 			selected = entries[0] ?? null;
 			step = 'browse';
 			status = null;
 			listFilter = '';
+			// Poster only at first — stream preview resolves after debounce (non-blocking).
 			if (selected) void loadPreview(selected);
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
+			if (opts?.replace !== false) {
+				entries = [];
+				selected = null;
+				preview = null;
+			}
 		} finally {
 			busy = false;
 			percent = 0;
@@ -255,11 +489,16 @@
 	async function onLookup() {
 		const raw = query.trim();
 		if (!raw) {
-			error = 'Paste a video URL, WeTV channel / play link, or search name.';
+			error = 'Enter a search name or paste a supported URL.';
 			return;
 		}
 		listStack = [];
-		await runResolve(raw, false);
+		episodeMode = false;
+		moreSeedIndex = 0;
+		nextPlaylistStart = 1;
+		hasMore = true;
+		activeListSeed = raw;
+		await runResolve(raw, false, { replace: true });
 	}
 
 	function focusEntry(entry: MediaCandidate) {
@@ -271,7 +510,17 @@
 	async function openSeriesOrConfirm() {
 		if (!selected) return;
 		if ((selected.kind || 'video') === 'series') {
-			await runResolve(selected.webpageUrl, true);
+			activeListSeed = selected.webpageUrl;
+			episodeMode = true;
+			nextPlaylistStart = 1;
+			hasMore = true;
+			moreSeedIndex = 0;
+			await runResolve(selected.webpageUrl, true, {
+				replace: true,
+				playlistStart: 1,
+				playlistEnd: 24
+			});
+			nextPlaylistStart = 25;
 			return;
 		}
 		step = 'options';
@@ -286,6 +535,9 @@
 		entries = prev.entries;
 		listLabel = prev.listLabel;
 		siteLabel = prev.siteLabel;
+		episodeMode = false;
+		const shelf = activeShelf;
+		if (shelf) resetPagingForShelf(shelf);
 		selected = entries[0] ?? null;
 		if (selected) void loadPreview(selected);
 		else {
@@ -411,32 +663,119 @@
 </script>
 
 <Dialog.Root open={open} onOpenChange={onOpenChange}>
-	<Dialog.Content class="sm:max-w-4xl" showCloseButton={!busy}>
-		<Dialog.Header>
+	<Dialog.Content
+		class="flex max-h-[min(90vh,880px)] w-full max-w-[min(64rem,calc(100%-2rem))] flex-col gap-3 overflow-hidden p-4 sm:max-w-[min(64rem,calc(100%-2rem))]"
+		showCloseButton={!busy}
+	>
+		<Dialog.Header class="shrink-0 pr-8 text-left">
 			<Dialog.Title class="flex items-center gap-2">
-				<Link2 class="size-4 text-primary" />
-				Import from Link
+				<LayoutGrid class="size-4 text-primary" />
+				Video Gallery
 			</Dialog.Title>
 			<Dialog.Description>
-				Paste a WeTV channel / play URL, YouTube link, or search name. Browse the list, preview,
-				then download into the studio timeline.
+				Browse WeTV & YouTube drama shelves. Preview with yt-dlp streams, open episodes, then use a
+				video.
 			</Dialog.Description>
 		</Dialog.Header>
 
 		{#if toolsHint}
-			<p class="rounded-md border border-border/60 bg-muted/20 px-2.5 py-1.5 text-[11px] text-muted-foreground">
+			<p
+				class="shrink-0 rounded-md border border-border/60 bg-muted/20 px-2.5 py-1.5 text-[11px] text-muted-foreground"
+			>
 				{toolsHint}
 			</p>
 		{/if}
 
+		<div class="gallery-body min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto">
 		{#if step === 'browse'}
-			<div class="space-y-3 py-1">
-				<div class="flex flex-col gap-2 sm:flex-row sm:items-end">
-					<div class="min-w-0 flex-1 space-y-1.5">
-						<Label for="link-query">URL or search</Label>
+			<div class="min-w-0 space-y-3 py-1">
+				<!-- Site filter + list filter -->
+				<div class="flex min-w-0 flex-wrap items-center gap-2">
+					<div
+						class="inline-flex max-w-full flex-wrap gap-0.5 rounded-lg border border-border/60 bg-muted/20 p-0.5"
+						role="tablist"
+						aria-label="Gallery source"
+					>
+						{#each GALLERY_SITE_FILTERS as chip (chip.id)}
+							<button
+								type="button"
+								role="tab"
+								aria-selected={siteFilter === chip.id}
+								class="rounded-md px-3 py-1.5 text-[11px] transition-colors
+									{siteFilter === chip.id
+									? 'bg-background font-medium text-foreground shadow-sm'
+									: 'text-muted-foreground hover:text-foreground'}"
+								disabled={busy}
+								onclick={() => onSiteFilter(chip.id)}
+							>
+								{chip.label}
+							</button>
+						{/each}
+					</div>
+					<div class="min-w-0 flex-1 basis-[10rem]">
+						<Input
+							class="h-8 w-full min-w-0 text-[11px]"
+							placeholder="Filter titles…"
+							bind:value={listFilter}
+							disabled={busy || !entries.length}
+						/>
+					</div>
+				</div>
+
+				<!-- Shelves: compact single-line chips -->
+				<div class="gallery-shelves flex min-w-0 max-w-full gap-2 overflow-x-auto pb-1">
+					{#each visibleShelves as shelf (shelf.id)}
+						<button
+							type="button"
+							class="shrink-0 rounded-full border px-3.5 py-1.5 text-[11px] whitespace-nowrap transition-colors
+								{activeShelfId === shelf.id && !episodeMode
+								? 'border-primary/60 bg-primary/15 font-medium text-foreground'
+								: 'border-border/50 bg-background text-muted-foreground hover:border-border hover:text-foreground'}"
+							disabled={busy}
+							title={shelf.description}
+							onclick={() => void loadShelf(shelf, true)}
+						>
+							<span class="text-[10px] opacity-70">{shelf.site === 'wetv' ? 'WeTV' : shelf.site === 'youtube' ? 'YT' : 'DM'}</span>
+							· {shelf.label}
+						</button>
+					{/each}
+				</div>
+
+				<div class="flex min-w-0 flex-wrap items-center justify-between gap-2">
+					<p class="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
+						{#if episodeMode}
+							<span class="font-medium text-foreground">Episodes</span>
+							· Back returns to series
+						{:else if activeShelf}
+							<span class="font-medium text-foreground"
+								>{activeShelf.site === 'wetv' ? 'WeTV' : activeShelf.site === 'youtube' ? 'YouTube' : 'Dailymotion'}
+								· {activeShelf.label}</span
+							>
+						{/if}
+						{#if entries.length}
+							· <span class="font-medium text-foreground">{filteredEntries.length}</span>
+							{#if filteredEntries.length !== entries.length}
+								/ {entries.length}
+							{/if}
+							{listLabel}
+						{/if}
+					</p>
+					<button
+						type="button"
+						class="inline-flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+						onclick={() => (showCustomLookup = !showCustomLookup)}
+					>
+						<Search class="size-3" />
+						{showCustomLookup ? 'Hide search' : 'Custom search'}
+					</button>
+				</div>
+
+				{#if showCustomLookup}
+					<div class="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
 						<Input
 							id="link-query"
-							placeholder="https://wetv.vip/en/channel/…  or  /play/SERIES_ID  or search name"
+							class="h-8 min-w-0 flex-1 text-[12px]"
+							placeholder="Paste URL or type a search name"
 							bind:value={query}
 							disabled={busy}
 							onkeydown={(e) => {
@@ -446,55 +785,35 @@
 								}
 							}}
 						/>
-					</div>
-					<Button
-						size="sm"
-						class="shrink-0"
-						disabled={busy || !query.trim()}
-						onclick={() => void onLookup()}
-					>
-						{#if busy && !entries.length}
-							<LoaderCircle class="size-3.5 animate-spin" />
-						{:else}
-							<Clapperboard class="size-3.5" />
-						{/if}
-						Look up
-					</Button>
-				</div>
-
-				<!-- Always-visible list + preview so users know where results appear -->
-				<div class="grid gap-3 md:grid-cols-[minmax(0,1.05fr)_minmax(0,1fr)]">
-					<div class="flex min-h-0 flex-col gap-2">
-						<div class="flex items-center justify-between gap-2">
-							<p class="text-[11px] text-muted-foreground">
-								{#if entries.length}
-									<span class="font-medium text-foreground">{filteredEntries.length}</span>
-									of {entries.length} {listLabel}
-									{#if siteLabel}
-										· {siteLabel}
-									{/if}
-								{:else}
-									Media list
-								{/if}
-							</p>
-							{#if entries.length > 6}
-								<Input
-									class="h-7 max-w-[10rem] text-[11px]"
-									placeholder="Filter list…"
-									bind:value={listFilter}
-									disabled={busy}
-								/>
+						<Button
+							size="sm"
+							class="shrink-0"
+							disabled={busy || !query.trim()}
+							onclick={() => void onLookup()}
+						>
+							{#if busy && !entries.length}
+								<LoaderCircle class="size-3.5 animate-spin" />
+							{:else}
+								<Clapperboard class="size-3.5" />
 							{/if}
-						</div>
+							Look up
+						</Button>
+					</div>
+				{/if}
+
+				<!-- List + preview -->
+				<div class="grid min-w-0 gap-3 md:grid-cols-2">
+					<div class="flex min-h-0 min-w-0 flex-col gap-2">
 						<div
-							class="max-h-[22rem] min-h-[14rem] space-y-1 overflow-y-auto rounded-md border border-border/60 bg-muted/10 p-1.5 pr-1"
+							class="max-h-[min(24rem,42vh)] min-h-[12rem] space-y-1 overflow-y-auto rounded-lg border border-border/60 bg-muted/10 p-2"
 							role="listbox"
-							aria-label="Media list"
+							aria-label="Video gallery list"
+							onscroll={onListScroll}
 						>
 							{#if busy && !entries.length}
 								<div class="grid place-items-center gap-2 px-2 py-10 text-muted-foreground">
 									<LoaderCircle class="size-5 animate-spin text-primary" />
-									<span class="text-[11px]">Loading catalog…</span>
+									<span class="text-[11px]">Loading shelf…</span>
 								</div>
 							{:else if filteredEntries.length}
 								{#each filteredEntries as entry (entry.id + entry.webpageUrl)}
@@ -504,7 +823,7 @@
 										type="button"
 										role="option"
 										aria-selected={active}
-										class="flex w-full gap-2.5 rounded-md border px-2 py-2 text-left transition-colors
+										class="flex w-full gap-2.5 rounded-md border px-2.5 py-2 text-left transition-colors
 											{active
 											? 'border-primary/50 bg-primary/10'
 											: 'border-transparent bg-transparent hover:border-border/70 hover:bg-muted/40'}"
@@ -515,7 +834,7 @@
 										}}
 									>
 										<div
-											class="relative h-14 w-[5.5rem] shrink-0 overflow-hidden rounded bg-muted/50 ring-1 ring-border/50"
+											class="relative h-14 w-[5.5rem] shrink-0 overflow-hidden rounded-md bg-muted/50 ring-1 ring-border/50"
 										>
 											{#if entry.thumbnail}
 												<img
@@ -549,7 +868,11 @@
 												>{entry.title}</span
 											>
 											<span class="mt-0.5 flex items-center gap-1 truncate text-[10px] text-muted-foreground">
-												{#if entry.uploader}<span class="truncate">{entry.uploader}</span>{/if}
+												{#if entry.uploader && entry.uploader !== entry.title}
+													<span class="truncate">{entry.uploader}</span>
+												{:else}
+													<span class="truncate opacity-70">{entry.site}</span>
+												{/if}
 												{#if isSeries}
 													<span class="inline-flex items-center gap-0.5 text-primary"
 														>Episodes <ChevronRight class="size-3" /></span
@@ -559,23 +882,40 @@
 										</span>
 									</button>
 								{/each}
+								<div class="px-1 py-2 text-center">
+									{#if loadingMore}
+										<span class="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
+											<LoaderCircle class="size-3.5 animate-spin" /> Loading more…
+										</span>
+									{:else if hasMore}
+										<Button
+											variant="outline"
+											size="sm"
+											class="h-7 text-[11px]"
+											disabled={busy}
+											onclick={() => void loadMore()}
+										>
+											Load more
+										</Button>
+									{:else}
+										<span class="text-[10px] text-muted-foreground">End of list</span>
+									{/if}
+								</div>
 							{:else}
 								<div class="space-y-2 px-3 py-8 text-center text-[11px] text-muted-foreground">
-									<p class="font-medium text-foreground/80">No media loaded yet</p>
+									<p class="font-medium text-foreground/80">No titles on this shelf</p>
 									<p>
-										Try a WeTV channel URL (movie list), a
-										<code class="text-[10px]">/play/SERIES_ID</code> link (episodes), or a search
-										name — then click Look up.
+										Try another shelf, or use Custom search. Dailymotion can be empty by region.
 									</p>
 								</div>
 							{/if}
 						</div>
 					</div>
 
-					<div class="flex min-h-0 flex-col gap-2">
+					<div class="flex min-h-0 min-w-0 flex-col gap-2">
 						<p class="text-[11px] font-medium text-foreground">Preview</p>
 						<div
-							class="relative aspect-video w-full overflow-hidden rounded-md border border-border/70 bg-black/90"
+							class="relative aspect-video w-full max-w-full overflow-hidden rounded-md border border-border/70 bg-black/90"
 						>
 							{#if previewLoading}
 								<div class="absolute inset-0 grid place-items-center gap-2 text-muted-foreground">
@@ -621,12 +961,12 @@
 									<div
 										class="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent px-3 py-2 text-[10px] text-white/90"
 									>
-										Live preview unavailable — thumbnail only. You can still import.
+										Live preview unavailable — thumbnail only. You can still use the video.
 									</div>
 								{/if}
 							{:else}
 								<div class="absolute inset-0 grid place-items-center px-4 text-center text-[11px] text-muted-foreground">
-									Preview appears here after Look up
+									Pick a title from a shelf to preview
 								</div>
 							{/if}
 						</div>
@@ -656,6 +996,9 @@
 											<Play class="size-3.5" /> Play
 										{/if}
 									</Button>
+									<span class="self-center text-[10px] text-muted-foreground"
+										>Ad-light stream (yt-dlp)</span
+									>
 								{/if}
 								<Button
 									size="sm"
@@ -763,9 +1106,10 @@
 				</label>
 			</div>
 		{/if}
+		</div>
 
 		{#if busy || status}
-			<div class="space-y-1.5">
+			<div class="shrink-0 space-y-1.5">
 				<div class="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
 					<span class="truncate">{status || 'Working…'}</span>
 					<span class="font-mono">{percent}%</span>
@@ -776,13 +1120,13 @@
 
 		{#if error}
 			<p
-				class="max-h-40 overflow-y-auto rounded-md border border-destructive/30 bg-destructive/10 px-2.5 py-2 text-[11px] text-destructive whitespace-pre-wrap"
+				class="max-h-28 shrink-0 overflow-y-auto rounded-md border border-destructive/30 bg-destructive/10 px-2.5 py-2 text-[11px] text-destructive whitespace-pre-wrap"
 			>
 				{error}
 			</p>
 		{/if}
 
-		<Dialog.Footer class="gap-2 sm:justify-between">
+		<Dialog.Footer class="shrink-0 gap-2 sm:justify-between">
 			<div class="flex gap-2">
 				{#if step === 'options' || listStack.length > 0}
 					<Button
@@ -842,3 +1186,20 @@
 		</Dialog.Footer>
 	</Dialog.Content>
 </Dialog.Root>
+
+<style>
+	.gallery-body {
+		min-width: 0;
+	}
+	.gallery-shelves {
+		scrollbar-width: thin;
+		max-width: 100%;
+	}
+	.gallery-shelves::-webkit-scrollbar {
+		height: 6px;
+	}
+	.gallery-shelves::-webkit-scrollbar-thumb {
+		background: color-mix(in oklab, var(--muted-foreground) 35%, transparent);
+		border-radius: 999px;
+	}
+</style>

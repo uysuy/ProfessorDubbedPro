@@ -1130,7 +1130,7 @@
 						</p>
 						<p class="preview-title text-sm font-medium">Drop source video to begin</p>
 						<p class="max-w-[16rem] text-[11px] text-muted-foreground">
-							Drag a video onto this panel, open a file, or import from a link.
+							Drag a video onto this panel, open a file, or browse the Video Gallery.
 						</p>
 						<div class="mt-1 flex flex-wrap items-center justify-center gap-2">
 							<Button
@@ -1146,10 +1146,10 @@
 								variant="outline"
 								size="sm"
 								class="gap-1.5"
-								onclick={() => studioUi.openLinkImport()}
+								onclick={() => studioUi.openVideoGallery()}
 							>
 								<Link2 class="size-3.5" />
-								From link
+								Video Gallery
 							</Button>
 						</div>
 						<p class="font-mono text-[11px] text-primary">

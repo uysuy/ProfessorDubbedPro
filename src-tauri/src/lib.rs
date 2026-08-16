@@ -44,6 +44,7 @@ pub fn run() {
 			media_tempo::cancel_video_tempo,
 			tts::synthesize_speech,
 			tts::list_edge_voices,
+			tts::slice_audio,
 			tts_voxcpm::voxcpm_status,
 			tts_voxcpm::start_voxcpm_server,
 			tts_voxcpm::stop_voxcpm_server,

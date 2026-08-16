@@ -184,8 +184,11 @@
 			case 'split': {
 				const id = requireSelection();
 				if (!id) return;
-				const newId = projectStore.splitCueAtPlayhead(id);
-				dndStore.flash(newId ? 'Split at playhead' : 'Playhead must be inside the cue');
+				void projectStore.splitCueAtPlayhead(id).then((newId) => {
+					dndStore.flash(
+						newId ? 'Split at playhead (subtitle + audio)' : 'Playhead must be inside the cue'
+					);
+				});
 				return;
 			}
 			case 'merge': {

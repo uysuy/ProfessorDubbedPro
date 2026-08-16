@@ -106,8 +106,15 @@ export type MediaPreviewInfo = {
 	site: string;
 };
 
-export async function resolveMediaLink(raw: string): Promise<ResolveResult> {
-	return invoke<ResolveResult>('resolve_media_link', { raw });
+export async function resolveMediaLink(
+	raw: string,
+	opts?: { playlistStart?: number; playlistEnd?: number }
+): Promise<ResolveResult> {
+	return invoke<ResolveResult>('resolve_media_link', {
+		raw,
+		playlistStart: opts?.playlistStart ?? null,
+		playlistEnd: opts?.playlistEnd ?? null
+	});
 }
 
 export async function getMediaPreview(url: string): Promise<MediaPreviewInfo> {
