@@ -3,6 +3,7 @@ use tauri::Manager;
 mod asr_funasr;
 mod export;
 mod fonts;
+mod link_import;
 mod media_tempo;
 mod speakers;
 mod transcribe;
@@ -33,6 +34,12 @@ pub fn run() {
 			export::cleanup_staged_file,
 			export::probe_export_video_size,
 			fonts::list_system_fonts,
+			link_import::normalize_link_input,
+			link_import::resolve_media_link,
+			link_import::get_media_preview,
+			link_import::download_media_link,
+			link_import::cancel_link_import,
+			link_import::link_import_tools_status,
 			media_tempo::remaster_video_tempo,
 			media_tempo::cancel_video_tempo,
 			tts::synthesize_speech,

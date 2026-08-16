@@ -12,6 +12,8 @@
 		"tauri:build": "tauri build",
 		"ffmpeg:download": "node scripts/ensure-ffmpeg.mjs",
 		"whisper:download": "node scripts/ensure-whisper.mjs",
+		"ytdlp:download": "node scripts/ensure-ytdlp.mjs",
+		"ocr:setup": "node scripts/ensure-ocr.mjs",
 		"funasr:setup": "node scripts/ensure-funasr.mjs",
 		"voxcpm:setup": "node scripts/ensure-voxcpm.mjs",
 		"prepare": "svelte-kit sync || echo ''",

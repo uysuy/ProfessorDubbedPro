@@ -187,6 +187,9 @@
 				<DropdownMenu.Item onclick={() => onSave?.()}>Save</DropdownMenu.Item>
 				<DropdownMenu.Separator />
 				<DropdownMenu.Item onclick={() => onImportMedia?.()}>Import media…</DropdownMenu.Item>
+				<DropdownMenu.Item onclick={() => studioUi.openLinkImport()}
+					>Import from Link…</DropdownMenu.Item
+				>
 				<DropdownMenu.Item onclick={() => onExport?.()}>Export…</DropdownMenu.Item>
 				<DropdownMenu.Separator />
 				<DropdownMenu.Item onclick={() => onSettings?.()}>Settings…</DropdownMenu.Item>

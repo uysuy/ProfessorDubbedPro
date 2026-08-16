@@ -20,6 +20,8 @@ src-tauri/models/*
 .venv-funasr/
 # VoxCPM2 local venv (optional TTS)
 .venv-voxcpm/
+# Hardsub OCR venv (RapidOCR)
+.venv-ocr/
 
 # OS
 .DS_Store

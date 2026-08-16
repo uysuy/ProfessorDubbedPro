@@ -11,6 +11,7 @@
 	import CenterWorkspace from '$lib/components/studio/CenterWorkspace.svelte';
 	import { projectStore } from '$lib/stores/project.svelte';
 	import { dndStore } from '$lib/stores/dnd.svelte';
+	import { studioUi } from '$lib/stores/studio-ui.svelte';
 	import { PanelLeftOpen, PanelRightOpen } from '@lucide/svelte';
 	import ExportDialog from '$lib/components/studio/ExportDialog.svelte';
 	import ProjectSettingsDialog from '$lib/components/studio/ProjectSettingsDialog.svelte';
@@ -18,6 +19,7 @@
 	import TempoDialog from '$lib/components/studio/TempoDialog.svelte';
 	import VoiceEngineDialog from '$lib/components/studio/VoiceEngineDialog.svelte';
 	import ProsodyDialog from '$lib/components/studio/ProsodyDialog.svelte';
+	import ImportFromLinkDialog from '$lib/components/studio/ImportFromLinkDialog.svelte';
 	import TitleLiverPanel from '$lib/components/studio/TitleLiverPanel.svelte';
 	import { isTypingTarget, matchStudioShortcut, type StudioShortcutId } from '$lib/utils/shortcuts';
 	import { isTauriRuntime } from '$lib/utils/platform';
@@ -503,5 +505,6 @@
 <TempoDialog />
 <VoiceEngineDialog />
 <ProsodyDialog />
+<ImportFromLinkDialog />
 <TitleLiverPanel />
 <DragGhost />

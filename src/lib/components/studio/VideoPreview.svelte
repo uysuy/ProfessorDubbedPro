@@ -17,6 +17,7 @@
 	import { isTauriRuntime } from '$lib/utils/platform';
 	import {
 		FolderOpen,
+		Link2,
 		Maximize,
 		Minimize,
 		Pause,
@@ -1129,17 +1130,28 @@
 						</p>
 						<p class="preview-title text-sm font-medium">Drop source video to begin</p>
 						<p class="max-w-[16rem] text-[11px] text-muted-foreground">
-							Drag a video onto this panel, or open a file from disk.
+							Drag a video onto this panel, open a file, or import from a link.
 						</p>
-						<Button
-							variant="secondary"
-							size="sm"
-							class="mt-1 gap-1.5"
-							onclick={openFilePicker}
-						>
-							<FolderOpen class="size-3.5" />
-							Open video
-						</Button>
+						<div class="mt-1 flex flex-wrap items-center justify-center gap-2">
+							<Button
+								variant="secondary"
+								size="sm"
+								class="gap-1.5"
+								onclick={openFilePicker}
+							>
+								<FolderOpen class="size-3.5" />
+								Open video
+							</Button>
+							<Button
+								variant="outline"
+								size="sm"
+								class="gap-1.5"
+								onclick={() => studioUi.openLinkImport()}
+							>
+								<Link2 class="size-3.5" />
+								From link
+							</Button>
+						</div>
 						<p class="font-mono text-[11px] text-primary">
 							{formatTimecode(transportMs, projectStore.current.fps)}
 						</p>
