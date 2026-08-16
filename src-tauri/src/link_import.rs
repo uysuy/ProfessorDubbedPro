@@ -263,6 +263,10 @@ fn classify_site(host: &str) -> &'static str {
 		"youtube"
 	} else if h.contains("bilibili.com") || h.contains("b23.tv") {
 		"bilibili"
+	} else if h.contains("wetv.vip") || h.contains("wetvinfo.com") {
+		"wetv"
+	} else if h.contains("v.qq.com") || h == "v.qq.com" {
+		"tencent"
 	} else if h.contains("douyin.com") || h.contains("tiktok.com") {
 		"short_video"
 	} else if h.contains("vimeo.com") {
@@ -274,12 +278,80 @@ fn classify_site(host: &str) -> &'static str {
 	}
 }
 
+/// WeTV channel module pages are not yt-dlp URLs — they need `/play/{albumId}`.
+fn wetv_channel_id(url: &str) -> Option<String> {
+	let lower = url.to_lowercase();
+	if !lower.contains("wetv.vip") {
+		return None;
+	}
+	// /en/channel/10262 or ?id=10262
+	if let Some(idx) = lower.find("/channel/") {
+		let rest = &url[idx + "/channel/".len()..];
+		let id = rest
+			.split(|c| c == '?' || c == '/' || c == '#' || c == '&')
+			.next()
+			.unwrap_or("")
+			.trim();
+		if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+			return Some(id.to_string());
+		}
+	}
+	// query id=
+	for part in url.split(&['?', '&'][..]).skip(1) {
+		if let Some(v) = part.strip_prefix("id=") {
+			let id = v.split('#').next().unwrap_or(v).trim();
+			if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) {
+				return Some(id.to_string());
+			}
+		}
+	}
+	None
+}
+
+fn is_wetv_play_url(url: &str) -> bool {
+	let lower = url.to_lowercase();
+	lower.contains("wetv.vip") && lower.contains("/play/")
+}
+
 fn normalize_user_input(raw: &str) -> ResolvedInput {
 	let trimmed = raw.trim();
 	if let Some(u) = url_like::UrlLike::parse(trimmed) {
 		let host = host_of(&u);
-		let site = classify_site(&host).to_string();
+		let mut site = classify_site(&host).to_string();
 		let lower = trimmed.to_lowercase();
+
+		if site == "wetv" || lower.contains("wetv.vip") {
+			site = "wetv".into();
+			if wetv_channel_id(trimmed).is_some() {
+				return ResolvedInput {
+					kind: "wetv_channel".into(),
+					site,
+					query: trimmed.to_string(),
+					display: trimmed.to_string(),
+				};
+			}
+			if is_wetv_play_url(trimmed) {
+				// Series play URLs list episodes; episode URLs have two path ids.
+				let after = lower.split("/play/").nth(1).unwrap_or("");
+				let parts: Vec<&str> = after
+					.split('/')
+					.filter(|p| !p.is_empty())
+					.take(2)
+					.collect();
+				let kind = if parts.len() >= 2 {
+					"video"
+				} else {
+					"wetv_series"
+				};
+				return ResolvedInput {
+					kind: kind.into(),
+					site,
+					query: trimmed.to_string(),
+					display: trimmed.to_string(),
+				};
+			}
+		}
+
 		let kind = if lower.contains("/channel/")
 			|| lower.contains("/c/")
 			|| lower.contains("/@")
@@ -334,6 +406,13 @@ pub struct MediaCandidate {
 	pub thumbnail: Option<String>,
 	pub uploader: Option<String>,
 	pub site: String,
+	/// `video` | `series` — series rows drill into an episode list when selected.
+	#[serde(default = "default_candidate_kind")]
+	pub kind: String,
+}
+
+fn default_candidate_kind() -> String {
+	"video".into()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -341,6 +420,9 @@ pub struct MediaCandidate {
 pub struct ResolveResult {
 	pub input: ResolvedInput,
 	pub entries: Vec<MediaCandidate>,
+	/// Human label for the list pane, e.g. "movies", "episodes".
+	#[serde(default)]
+	pub list_label: String,
 }
 
 fn json_str(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -381,12 +463,15 @@ fn candidate_from_json(v: &serde_json::Value, fallback_site: &str) -> Option<Med
 	let id = json_str(v, &["id"]).unwrap_or_else(|| "unknown".into());
 	let title = json_str(v, &["title", "fulltitle"]).unwrap_or_else(|| id.clone());
 	let webpage_url = json_str(v, &["webpage_url", "url", "original_url"])?;
-	// Flat playlist entries sometimes only have `url` as an id — normalize YouTube.
+	// Flat playlist entries sometimes only have `url` as an id — normalize YouTube / WeTV.
 	let webpage_url = if webpage_url.starts_with("http://") || webpage_url.starts_with("https://")
 	{
 		webpage_url
 	} else if fallback_site.contains("youtube") || webpage_url.len() == 11 {
 		format!("https://www.youtube.com/watch?v={id}")
+	} else if fallback_site.contains("wetv") {
+		// Episode under a series — prefer joining later; bare id becomes play URL.
+		format!("https://wetv.vip/en/play/{id}")
 	} else {
 		webpage_url
 	};
@@ -409,6 +494,11 @@ fn candidate_from_json(v: &serde_json::Value, fallback_site: &str) -> Option<Med
 	let extractor = json_str(v, &["extractor_key", "extractor"])
 		.map(|s| s.to_lowercase())
 		.unwrap_or_else(|| fallback_site.to_string());
+	let kind = if v.get("_type").and_then(|t| t.as_str()) == Some("playlist") {
+		"series"
+	} else {
+		"video"
+	};
 	Some(MediaCandidate {
 		id,
 		title,
@@ -417,7 +507,139 @@ fn candidate_from_json(v: &serde_json::Value, fallback_site: &str) -> Option<Med
 		thumbnail,
 		uploader,
 		site: extractor,
+		kind: kind.into(),
 	})
+}
+
+fn resolve_wetv_channel(app: &AppHandle, channel_url: &str) -> Result<ResolveResult, String> {
+	let channel_id = wetv_channel_id(channel_url).ok_or_else(|| {
+		"Not a WeTV channel URL. Use a channel link, or a play URL like https://wetv.vip/en/play/SERIES_ID".to_string()
+	})?;
+	emit_progress(app, "resolve", "Loading WeTV channel catalog…", 15);
+
+	let api = format!("https://wetv.vip/api/channel?id={channel_id}");
+	let client = reqwest::blocking::Client::builder()
+		.user_agent("Mozilla/5.0 (compatible; ProfessorDubbedPro/0.2)")
+		.timeout(std::time::Duration::from_secs(25))
+		.build()
+		.map_err(|e| format!("HTTP client error: {e}"))?;
+	let resp = client
+		.get(&api)
+		.header("Accept", "application/json")
+		.send()
+		.map_err(|e| format!("Could not reach WeTV channel API: {e}"))?;
+	if !resp.status().is_success() {
+		return Err(format!(
+			"WeTV channel API returned HTTP {}.\nTip: open a series play page instead, e.g. https://wetv.vip/en/play/SERIES_ID",
+			resp.status()
+		));
+	}
+	let body: serde_json::Value = resp
+		.json()
+		.map_err(|e| format!("Invalid WeTV channel JSON: {e}"))?;
+	if body.get("retCode").and_then(|c| c.as_i64()).unwrap_or(-1) != 0 {
+		return Err("WeTV channel API error — try a /play/ series URL instead.".into());
+	}
+
+	let mut entries: Vec<MediaCandidate> = Vec::new();
+	let mut seen = std::collections::HashSet::<String>::new();
+	if let Some(modules) = body
+		.pointer("/response/modules")
+		.and_then(|m| m.as_array())
+	{
+		for module in modules {
+			let module_name = module
+				.get("name")
+				.and_then(|n| n.as_str())
+				.unwrap_or("WeTV");
+			let items = module.get("items").and_then(|i| i.as_array());
+			let Some(items) = items else { continue };
+			for item in items {
+				if item.get("type").and_then(|t| t.as_str()) != Some("ITEM_TYPE_ALBUM") {
+					continue;
+				}
+				let id = match item.get("id").and_then(|x| x.as_str()) {
+					Some(s) if !s.is_empty() => s.to_string(),
+					_ => continue,
+				};
+				if !seen.insert(id.clone()) {
+					continue;
+				}
+				let title = item
+					.get("title")
+					.and_then(|t| t.as_str())
+					.unwrap_or(id.as_str())
+					.to_string();
+				let subtitle = item
+					.get("subtitle")
+					.and_then(|t| t.as_str())
+					.map(|s| s.to_string());
+				let pic = item
+					.get("pic")
+					.and_then(|t| t.as_str())
+					.map(|s| s.to_string());
+				let mark = item
+					.pointer("/mark_label_list/1/text")
+					.and_then(|t| t.as_str())
+					.map(|s| s.to_string());
+				let uploader = mark.or(Some(module_name.to_string()));
+				entries.push(MediaCandidate {
+					id: id.clone(),
+					title,
+					duration_s: None,
+					webpage_url: format!("https://wetv.vip/en/play/{id}"),
+					thumbnail: pic,
+					uploader: subtitle.or(uploader),
+					site: "wetv".into(),
+					kind: "series".into(),
+				});
+			}
+		}
+	}
+
+	if entries.is_empty() {
+		return Err(
+			"No titles found on that WeTV channel.\nOpen a series instead: https://wetv.vip/en/play/SERIES_ID"
+				.into(),
+		);
+	}
+
+	emit_progress(
+		app,
+		"resolve",
+		&format!("Found {} WeTV titles", entries.len()),
+		100,
+	);
+	Ok(ResolveResult {
+		input: ResolvedInput {
+			kind: "wetv_channel".into(),
+			site: "wetv".into(),
+			query: channel_url.to_string(),
+			display: channel_url.to_string(),
+		},
+		entries,
+		list_label: "movies / series".into(),
+	})
+}
+
+fn friendly_resolve_error(raw_err: &str, input: &ResolvedInput) -> String {
+	let e = raw_err.trim();
+	if input.site == "wetv" || e.to_lowercase().contains("wetv") {
+		return format!(
+			"{e}\n\nWeTV tips:\n• Channel pages like /channel/10262 now load a movie list in-app.\n• For episodes, use a play URL: https://wetv.vip/en/play/SERIES_ID\n• Or pick a title from the channel list, then choose an episode."
+		);
+	}
+	if e.contains("Unsupported URL") {
+		return format!(
+			"{e}\n\nThat page is not a supported media URL for yt-dlp.\nTry a direct video/series play link, or a search name."
+		);
+	}
+	if e.contains("Sign in to confirm") || e.contains("not a bot") {
+		return format!(
+			"{e}\n\nYouTube is blocking this network. On your PC, try again (or export browser cookies for yt-dlp)."
+		);
+	}
+	format!("Could not resolve link.\n{e}")
 }
 
 fn youtube_id_from_url(url: &str) -> Option<String> {
@@ -619,12 +841,20 @@ pub fn resolve_media_link(app: AppHandle, raw: String) -> Result<ResolveResult, 
 	CANCEL.store(false, Ordering::SeqCst);
 	let input = normalize_user_input(&raw);
 	emit_progress(&app, "resolve", "Looking up media…", 5);
+
+	if input.kind == "wetv_channel" {
+		return resolve_wetv_channel(&app, &input.query);
+	}
+
 	let ytdlp = find_ytdlp(&app)?;
 
 	let mut cmd = Command::new(&ytdlp);
 	cmd.arg("--no-warnings").arg("--skip-download");
-	// Flat playlist keeps channel/search listings fast; single videos get full metadata (thumbs).
-	if input.kind == "channel_or_playlist" || input.kind == "search" {
+	// Flat playlist keeps channel/search/series listings fast; single videos get full metadata.
+	if matches!(
+		input.kind.as_str(),
+		"channel_or_playlist" | "search" | "wetv_series"
+	) {
 		cmd.arg("--flat-playlist");
 	} else {
 		cmd.arg("--no-playlist");
@@ -645,25 +875,56 @@ pub fn resolve_media_link(app: AppHandle, raw: String) -> Result<ResolveResult, 
 	if !output.status.success() {
 		let err = String::from_utf8_lossy(&output.stderr);
 		let out = String::from_utf8_lossy(&output.stdout);
-		return Err(format!(
-			"Could not resolve link.\n{}",
-			if err.trim().is_empty() {
-				out.trim()
-			} else {
-				err.trim()
-			}
-		));
+		let raw_err = if err.trim().is_empty() {
+			out.trim()
+		} else {
+			err.trim()
+		};
+		return Err(friendly_resolve_error(raw_err, &input));
 	}
 
 	let stdout = String::from_utf8_lossy(&output.stdout);
 	let v: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|e| {
-		format!("yt-dlp returned invalid JSON: {e}\n{}", stdout.chars().take(400).collect::<String>())
+		format!(
+			"yt-dlp returned invalid JSON: {e}\n{}",
+			stdout.chars().take(400).collect::<String>()
+		)
 	})?;
 
+	let series_id_for_eps = if input.kind == "wetv_series" {
+		v.get("id")
+			.and_then(|x| x.as_str())
+			.map(|s| s.to_string())
+			.or_else(|| {
+				input
+					.query
+					.split("/play/")
+					.nth(1)
+					.map(|rest| {
+						rest.split(['/', '?', '-', '#'])
+							.next()
+							.unwrap_or("")
+							.to_string()
+					})
+					.filter(|s| !s.is_empty())
+			})
+	} else {
+		None
+	};
+
 	let mut entries: Vec<MediaCandidate> = Vec::new();
+	let limit = if input.kind == "wetv_series" { 120 } else { 60 };
 	if let Some(arr) = v.get("entries").and_then(|e| e.as_array()) {
-		for item in arr.iter().take(40) {
-			if let Some(c) = candidate_from_json(item, &input.site) {
+		for item in arr.iter().take(limit) {
+			if let Some(mut c) = candidate_from_json(item, &input.site) {
+				// WeTV flat episodes often need series/episode play path.
+				if let Some(series_id) = series_id_for_eps.as_ref() {
+					if !c.webpage_url.contains("/play/") || c.webpage_url.matches('/').count() < 5 {
+						c.webpage_url = format!("https://wetv.vip/en/play/{series_id}/{}", c.id);
+					}
+					c.site = "wetv".into();
+					c.kind = "video".into();
+				}
 				entries.push(c);
 			}
 		}
@@ -677,13 +938,27 @@ pub fn resolve_media_link(app: AppHandle, raw: String) -> Result<ResolveResult, 
 		return Err("No videos found for that link or search.".into());
 	}
 
+	let list_label = if input.kind == "wetv_series" {
+		"episodes".into()
+	} else if input.kind == "search" {
+		"search results".into()
+	} else if entries.len() > 1 {
+		"videos".into()
+	} else {
+		"video".into()
+	};
+
 	emit_progress(
 		&app,
 		"resolve",
 		&format!("Found {} item(s)", entries.len()),
 		100,
 	);
-	Ok(ResolveResult { input, entries })
+	Ok(ResolveResult {
+		input,
+		entries,
+		list_label,
+	})
 }
 
 #[derive(Debug, Deserialize)]

@@ -23,11 +23,14 @@ export type MediaCandidate = {
 	thumbnail: string | null;
 	uploader: string | null;
 	site: string;
+	/** `video` | `series` — series opens an episode list. */
+	kind?: string;
 };
 
 export type ResolveResult = {
 	input: ResolvedInput;
 	entries: MediaCandidate[];
+	listLabel?: string;
 };
 
 export type DownloadLinkResult = {
