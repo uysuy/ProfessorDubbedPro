@@ -36,6 +36,7 @@ pub fn run() {
 			fonts::list_system_fonts,
 			link_import::normalize_link_input,
 			link_import::resolve_media_link,
+			link_import::get_media_preview,
 			link_import::download_media_link,
 			link_import::cancel_link_import,
 			link_import::link_import_tools_status,

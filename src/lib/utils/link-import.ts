@@ -93,8 +93,22 @@ export async function getLinkImportToolsStatus(): Promise<LinkImportToolsStatus>
 	return invoke<LinkImportToolsStatus>('link_import_tools_status');
 }
 
+export type MediaPreviewInfo = {
+	kind: 'embed' | 'stream' | 'none' | string;
+	url: string | null;
+	thumbnail: string | null;
+	title: string;
+	durationS: number | null;
+	webpageUrl: string;
+	site: string;
+};
+
 export async function resolveMediaLink(raw: string): Promise<ResolveResult> {
 	return invoke<ResolveResult>('resolve_media_link', { raw });
+}
+
+export async function getMediaPreview(url: string): Promise<MediaPreviewInfo> {
+	return invoke<MediaPreviewInfo>('get_media_preview', { url });
 }
 
 export async function downloadMediaLink(opts: DownloadLinkOptions): Promise<DownloadLinkResult> {

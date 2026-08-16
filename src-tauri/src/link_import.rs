@@ -355,14 +355,56 @@ fn json_str(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
 	None
 }
 
+fn best_thumbnail(v: &serde_json::Value) -> Option<String> {
+	if let Some(arr) = v.get("thumbnails").and_then(|t| t.as_array()) {
+		let mut best: Option<(i64, String)> = None;
+		for item in arr {
+			let url = item.get("url").and_then(|u| u.as_str()).unwrap_or("").trim();
+			if url.is_empty() {
+				continue;
+			}
+			let w = item.get("width").and_then(|x| x.as_i64()).unwrap_or(0);
+			let h = item.get("height").and_then(|x| x.as_i64()).unwrap_or(0);
+			let score = w.saturating_mul(h).max(w).max(h);
+			if best.as_ref().map(|(s, _)| score >= *s).unwrap_or(true) {
+				best = Some((score, url.to_string()));
+			}
+		}
+		if let Some((_, url)) = best {
+			return Some(url);
+		}
+	}
+	json_str(v, &["thumbnail"])
+}
+
 fn candidate_from_json(v: &serde_json::Value, fallback_site: &str) -> Option<MediaCandidate> {
 	let id = json_str(v, &["id"]).unwrap_or_else(|| "unknown".into());
 	let title = json_str(v, &["title", "fulltitle"]).unwrap_or_else(|| id.clone());
 	let webpage_url = json_str(v, &["webpage_url", "url", "original_url"])?;
+	// Flat playlist entries sometimes only have `url` as an id — normalize YouTube.
+	let webpage_url = if webpage_url.starts_with("http://") || webpage_url.starts_with("https://")
+	{
+		webpage_url
+	} else if fallback_site.contains("youtube") || webpage_url.len() == 11 {
+		format!("https://www.youtube.com/watch?v={id}")
+	} else {
+		webpage_url
+	};
 	let duration_s = v
 		.get("duration")
 		.and_then(|d| d.as_f64().or_else(|| d.as_u64().map(|u| u as f64)));
-	let thumbnail = json_str(v, &["thumbnail"]);
+	let thumbnail = best_thumbnail(v).or_else(|| {
+		// YouTube hqdefault fallback when flat playlist omits thumbs.
+		if id.len() == 11
+			&& (fallback_site.contains("youtube")
+				|| webpage_url.contains("youtube.com")
+				|| webpage_url.contains("youtu.be"))
+		{
+			Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"))
+		} else {
+			None
+		}
+	});
 	let uploader = json_str(v, &["uploader", "channel", "creator"]);
 	let extractor = json_str(v, &["extractor_key", "extractor"])
 		.map(|s| s.to_lowercase())
@@ -375,6 +417,195 @@ fn candidate_from_json(v: &serde_json::Value, fallback_site: &str) -> Option<Med
 		thumbnail,
 		uploader,
 		site: extractor,
+	})
+}
+
+fn youtube_id_from_url(url: &str) -> Option<String> {
+	let u = url.trim();
+	if let Some(rest) = u.strip_prefix("https://youtu.be/") {
+		let id = rest.split(['?', '&', '/']).next().unwrap_or("");
+		if id.len() == 11 {
+			return Some(id.to_string());
+		}
+	}
+	for marker in ["v=", "/embed/", "/shorts/", "/live/"] {
+		if let Some(idx) = u.find(marker) {
+			let rest = &u[idx + marker.len()..];
+			let id = rest.split(['?', '&', '/']).next().unwrap_or("");
+			if id.len() == 11 {
+				return Some(id.to_string());
+			}
+		}
+	}
+	None
+}
+
+fn bilibili_bvid(url: &str) -> Option<String> {
+	for part in url.split('/') {
+		if part.starts_with("BV") && part.len() >= 10 {
+			return Some(part.split(['?', '&']).next().unwrap_or(part).to_string());
+		}
+	}
+	None
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaPreviewInfo {
+	/// `embed` | `stream` | `none`
+	pub kind: String,
+	pub url: Option<String>,
+	pub thumbnail: Option<String>,
+	pub title: String,
+	pub duration_s: Option<f64>,
+	pub webpage_url: String,
+	pub site: String,
+}
+
+#[tauri::command]
+pub fn get_media_preview(app: AppHandle, url: String) -> Result<MediaPreviewInfo, String> {
+	CANCEL.store(false, Ordering::SeqCst);
+	let url = url.trim().to_string();
+	if url.is_empty() {
+		return Err("URL is empty.".into());
+	}
+	emit_progress(&app, "preview", "Loading preview…", 10);
+
+	// Prefer native embeds when we can — more reliable than raw stream URLs in WebView.
+	if let Some(id) = youtube_id_from_url(&url) {
+		emit_progress(&app, "preview", "YouTube embed ready", 100);
+		return Ok(MediaPreviewInfo {
+			kind: "embed".into(),
+			url: Some(format!("https://www.youtube.com/embed/{id}?rel=0&modestbranding=1")),
+			thumbnail: Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg")),
+			title: id.clone(),
+			duration_s: None,
+			webpage_url: format!("https://www.youtube.com/watch?v={id}"),
+			site: "youtube".into(),
+		});
+	}
+	if let Some(bvid) = bilibili_bvid(&url) {
+		emit_progress(&app, "preview", "Bilibili embed ready", 100);
+		return Ok(MediaPreviewInfo {
+			kind: "embed".into(),
+			url: Some(format!(
+				"https://player.bilibili.com/player.html?bvid={bvid}&high_quality=1&danmaku=0"
+			)),
+			thumbnail: None,
+			title: bvid.clone(),
+			duration_s: None,
+			webpage_url: url.clone(),
+			site: "bilibili".into(),
+		});
+	}
+
+	let ytdlp = find_ytdlp(&app)?;
+	let mut meta_cmd = Command::new(&ytdlp);
+	meta_cmd.args([
+		"--no-warnings",
+		"--skip-download",
+		"--dump-single-json",
+		"--no-playlist",
+		&url,
+	]);
+	#[cfg(windows)]
+	{
+		use std::os::windows::process::CommandExt;
+		meta_cmd.creation_flags(0x08000000);
+	}
+	let meta_out = meta_cmd
+		.output()
+		.map_err(|e| format!("Failed to probe media: {e}"))?;
+	if !meta_out.status.success() {
+		let err = String::from_utf8_lossy(&meta_out.stderr);
+		return Err(format!("Could not load preview.\n{}", err.trim()));
+	}
+	let meta: serde_json::Value = serde_json::from_str(
+		String::from_utf8_lossy(&meta_out.stdout).trim(),
+	)
+	.map_err(|e| format!("Invalid preview metadata: {e}"))?;
+
+	let title = json_str(&meta, &["title", "fulltitle"]).unwrap_or_else(|| "Preview".into());
+	let duration_s = meta
+		.get("duration")
+		.and_then(|d| d.as_f64().or_else(|| d.as_u64().map(|u| u as f64)));
+	let thumbnail = best_thumbnail(&meta);
+	let site = json_str(&meta, &["extractor_key", "extractor"])
+		.unwrap_or_else(|| "other".into())
+		.to_lowercase();
+	let webpage = json_str(&meta, &["webpage_url", "original_url"]).unwrap_or(url.clone());
+
+	if let Some(id) = youtube_id_from_url(&webpage).or_else(|| {
+		meta.get("id")
+			.and_then(|x| x.as_str())
+			.filter(|id| id.len() == 11)
+			.map(|s| s.to_string())
+	}) {
+		if site.contains("youtube") {
+			emit_progress(&app, "preview", "YouTube embed ready", 100);
+			return Ok(MediaPreviewInfo {
+				kind: "embed".into(),
+				url: Some(format!("https://www.youtube.com/embed/{id}?rel=0&modestbranding=1")),
+				thumbnail: thumbnail
+					.or(Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"))),
+				title,
+				duration_s,
+				webpage_url: webpage,
+				site: "youtube".into(),
+			});
+		}
+	}
+
+	emit_progress(&app, "preview", "Resolving stream URL…", 55);
+	let mut stream_cmd = Command::new(&ytdlp);
+	stream_cmd.args([
+		"--no-warnings",
+		"-g",
+		"-f",
+		"b[height<=720]/best[height<=720]/best",
+		"--no-playlist",
+		&url,
+	]);
+	#[cfg(windows)]
+	{
+		use std::os::windows::process::CommandExt;
+		stream_cmd.creation_flags(0x08000000);
+	}
+	let stream_out = stream_cmd
+		.output()
+		.map_err(|e| format!("Failed to resolve stream: {e}"))?;
+	if CANCEL.load(Ordering::SeqCst) {
+		return Err("Cancelled.".into());
+	}
+
+	let stream_url = String::from_utf8_lossy(&stream_out.stdout)
+		.lines()
+		.map(str::trim)
+		.find(|l| l.starts_with("http://") || l.starts_with("https://"))
+		.map(|s| s.to_string());
+
+	if let Some(stream) = stream_url {
+		emit_progress(&app, "preview", "Stream ready", 100);
+		return Ok(MediaPreviewInfo {
+			kind: "stream".into(),
+			url: Some(stream),
+			thumbnail,
+			title,
+			duration_s,
+			webpage_url: webpage,
+			site,
+		});
+	}
+
+	emit_progress(&app, "preview", "Preview unavailable — thumbnail only", 100);
+	Ok(MediaPreviewInfo {
+		kind: "none".into(),
+		url: None,
+		thumbnail,
+		title,
+		duration_s,
+		webpage_url: webpage,
+		site,
 	})
 }
 
@@ -391,13 +622,14 @@ pub fn resolve_media_link(app: AppHandle, raw: String) -> Result<ResolveResult, 
 	let ytdlp = find_ytdlp(&app)?;
 
 	let mut cmd = Command::new(&ytdlp);
-	cmd.args([
-		"--no-warnings",
-		"--skip-download",
-		"--flat-playlist",
-		"--dump-single-json",
-		&input.query,
-	]);
+	cmd.arg("--no-warnings").arg("--skip-download");
+	// Flat playlist keeps channel/search listings fast; single videos get full metadata (thumbs).
+	if input.kind == "channel_or_playlist" || input.kind == "search" {
+		cmd.arg("--flat-playlist");
+	} else {
+		cmd.arg("--no-playlist");
+	}
+	cmd.arg("--dump-single-json").arg(&input.query);
 	#[cfg(windows)]
 	{
 		use std::os::windows::process::CommandExt;
